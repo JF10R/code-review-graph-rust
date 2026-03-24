@@ -50,11 +50,11 @@ Language-specific extraction rules are defined in declarative [`.scm` query file
 
 | Repo | Files | Python build | Rust build | Speedup |
 |------|------:|:-------------|:-----------|--------:|
-| [httpx](https://github.com/encode/httpx) | 60 | 0.96s | **0.29s** | **3.3x** |
-| [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **1.79s** | **3.7x** |
-| [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **19.4s** | **15.7x** |
+| [httpx](https://github.com/encode/httpx) | 60 | 0.96s | **0.47s** | **2.0x** |
+| [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **0.90s** | **7.3x** |
+| [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **3.97s** | **76.8x** |
 
-Build speedup scales with repo size — tree-sitter parsing dominates on small repos (both call the same C core), but Rust's bincode+zstd persistence and in-memory graph avoid SQLite overhead that compounds on large codebases.
+Build speedup scales with repo size thanks to rayon parallel parsing — all CPU cores parse files concurrently while the graph store writes sequentially. On small repos the thread pool startup overhead slightly reduces the speedup, but on large codebases the parallelism dominates.
 
 ### Micro-benchmarks (criterion, 1000-node synthetic graph)
 
