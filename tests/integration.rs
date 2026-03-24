@@ -286,8 +286,8 @@ fn impact_radius_flags_callers_of_changed_function() {
         .unwrap();
 
     // There should be some impacted nodes (callers of functions in utils.py)
-    // At minimum the algorithm should return "weighted_bfs" for this small graph
-    assert_eq!(impact.algorithm, "weighted_bfs");
+    // Algorithm is always personalized_pagerank
+    assert_eq!(impact.algorithm, "personalized_pagerank");
     // changed_nodes should include the nodes from utils.py
     assert!(!impact.changed_nodes.is_empty(), "changed_nodes should be populated");
 }
