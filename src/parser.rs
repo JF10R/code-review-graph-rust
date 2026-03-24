@@ -227,7 +227,7 @@ fn is_test_file(path: &str) -> bool {
 }
 
 fn is_test_function(name: &str, file_path: &str) -> bool {
-    if name.starts_with("test_") || name.starts_with("Test") || name.ends_with("_test") {
+    if name.starts_with("test_") || name.starts_with("Test") {
         return true;
     }
     if is_test_file(file_path) && TEST_RUNNER_NAMES.contains(&name) {
@@ -272,6 +272,7 @@ fn get_name(node: &Node, language: &str, kind: &str, source: &[u8]) -> Option<St
     }
 
     // Most languages: first identifier child
+    // field_identifier is used by tree-sitter-go 0.25 for method names in method_declaration
     let name_kinds = &[
         "identifier",
         "name",
@@ -279,6 +280,7 @@ fn get_name(node: &Node, language: &str, kind: &str, source: &[u8]) -> Option<St
         "property_identifier",
         "simple_identifier",
         "constant",
+        "field_identifier",
     ];
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
@@ -427,7 +429,7 @@ fn get_bases(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
         }
         "javascript" | "typescript" | "tsx" => {
             for child in node.children(&mut cur) {
-                if matches!(child.kind(), "extends_clause" | "implements_clause") {
+                if matches!(child.kind(), "extends_clause" | "implements_clause" | "class_heritage") {
                     let mut c2 = child.walk();
                     for sub in child.children(&mut c2) {
                         if matches!(
@@ -1807,4 +1809,5 @@ def run():
         let file_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::File).collect();
         assert_eq!(file_nodes.len(), 1, "should have exactly one File node");
     }
+
 }
