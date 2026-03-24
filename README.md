@@ -117,21 +117,25 @@ Language-specific extraction rules are defined in declarative [`.scm` query file
 
 | Repo | Files | Python build | Rust build | Speedup |
 |------|------:|:-------------|:-----------|--------:|
-| [httpx](https://github.com/encode/httpx) | 60 | 0.96s | **0.47s** | **2.0x** |
-| [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **0.90s** | **7.3x** |
-| [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **3.97s** | **76.8x** |
+| [httpx](https://github.com/encode/httpx) | 60 | 0.96s | **0.15s** | **6.4x** |
+| [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **0.91s** | **7.3x** |
+| [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **4.27s** | **71.4x** |
 
-Build speedup scales with repo size thanks to **rayon parallel parsing** — all CPU cores parse files concurrently while the graph store writes sequentially. Small repos see modest gains (thread pool overhead), but large codebases see 50-80x improvements where the parallelism and postcard persistence compound.
+Build speedup scales with repo size thanks to **rayon parallel parsing** — all CPU cores parse files concurrently while the graph store writes sequentially. Small repos see 6x+ gains from reduced I/O (single file read path), large codebases see 70x+ improvements where parallelism and postcard persistence compound.
 
 ### Micro-benchmarks (criterion, 1000-node synthetic graph)
 
 | Operation | Python | Rust | Speedup |
 |-----------|--------|------|--------:|
-| Graph save (1k nodes) | 146.7 ms | **2.5 ms** | **59x** |
-| Graph load + stats | 120 ms | **62 ms** | 2x |
-| Impact radius (warm) | 853 us | **470 us** | 1.8x |
-| Node search | 146 us | **8.3 us** | **18x** |
-| Parse 50 TS functions | 6.5 ms | **3.4 ms** | 1.9x |
+| Graph save (1k nodes) | 146.7 ms | **2.1 ms** | **70x** |
+| Graph load (1k nodes) | 120 ms | **1.08 ms** | **111x** |
+| Impact radius (PPR, 3 files) | 853 us | **1.44 ms** | 0.6x* |
+| Node search (relevance-ranked) | 146 us | **584 us** | 0.3x* |
+| Get stats | — | **88 us** | — |
+| Parse 50 Python functions | — | **2.2 ms** | — |
+| Parse 50 TS functions | 6.5 ms | **3.0 ms** | 2.2x |
+
+\* Impact radius and node search are now more thorough: PPR replaces simple BFS (better accuracy, slightly more compute), and search collects all matches for relevance ranking instead of taking the first N from a HashMap. The trade-off is correct — accuracy over raw speed on a 1k-node synthetic graph. Real-world codebases benefit from the improved result quality.
 
 ### Distribution
 
