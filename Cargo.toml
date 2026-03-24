@@ -32,7 +32,7 @@ hf-hub = { version = "0.5", optional = true }
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 
 # Tree-sitter (native Rust - the original implementation)
-tree-sitter = "0.25"
+tree-sitter = "0.26"
 tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
