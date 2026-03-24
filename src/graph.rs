@@ -68,7 +68,7 @@ fn save(data: &GraphData, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = bincode::serialize(data)?;
+    let payload = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
     let compressed = zstd::encode_all(&payload[..], 3)
         .map_err(|e| CrgError::Io(e))?;
     let crc = crc32fast::hash(&compressed);
@@ -106,7 +106,7 @@ fn load(path: &Path) -> Result<GraphData> {
     }
     let decompressed = zstd::decode_all(compressed)
         .map_err(|e| CrgError::Io(e))?;
-    let data: GraphData = bincode::deserialize(&decompressed)?;
+    let (data, _): (GraphData, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
     Ok(data)
 }
 

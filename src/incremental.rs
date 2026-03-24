@@ -11,10 +11,13 @@ use std::process::Command;
 use std::time::Duration;
 
 use chrono::Utc;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{error, info, warn};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::io::IsTerminal as _;
 use walkdir::WalkDir;
 
 use crate::error::Result;
@@ -344,9 +347,38 @@ pub struct BuildError {
     pub error: String,
 }
 
+/// Parse result from a single file (CPU-bound, no store access).
+type ParseResult = std::result::Result<
+    (String, Vec<crate::types::NodeInfo>, Vec<crate::types::EdgeInfo>, String),
+    BuildError,
+>;
+
+/// Parse `rel_path` (relative to `repo_root`) without touching the store.
+///
+/// This is the parallel-safe half: `CodeParser` is a unit struct that creates a
+/// fresh `tree_sitter::Parser` per call, so it is safe to invoke from multiple
+/// rayon threads simultaneously.
+fn parse_file_parallel(parser: &CodeParser, repo_root: &Path, rel_path: &str) -> ParseResult {
+    let full_path = repo_root.join(rel_path);
+    let source = std::fs::read(&full_path).map_err(|e| BuildError {
+        file: rel_path.to_owned(),
+        error: e.to_string(),
+    })?;
+    let fhash = sha256_bytes(&source);
+    let (nodes, edges) = parser.parse_bytes(&full_path, &source).map_err(|e| {
+        warn!("Error parsing {}: {}", rel_path, e);
+        BuildError {
+            file: rel_path.to_owned(),
+            error: e.to_string(),
+        }
+    })?;
+    Ok((rel_path.to_owned(), nodes, edges, fhash))
+}
+
 /// Parse `rel_path` (relative to `repo_root`) and store its nodes/edges.
 ///
 /// Returns `(node_count, edge_count)` on success, or a `BuildError` on failure.
+/// Used by `incremental_update` (sequential, store access required per file).
 fn parse_and_store_file(
     parser: &CodeParser,
     repo_root: &Path,
@@ -395,23 +427,65 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
         }
     }
 
+    // Progress bar — shown only when stderr is a terminal.
+    let pb = if std::io::stderr().is_terminal() {
+        let bar = ProgressBar::new(file_count as u64);
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+                     {pos}/{len} files ({eta})",
+                )
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        bar
+    } else {
+        ProgressBar::hidden()
+    };
+
+    // --- Phase 1: parse in parallel (CPU-bound tree-sitter work) ---
+    let parse_results: Vec<ParseResult> = files
+        .par_iter()
+        .map(|rel_path| {
+            let result = parse_file_parallel(&parser, repo_root, rel_path);
+            pb.inc(1);
+            result
+        })
+        .collect();
+
+    pb.finish_with_message("parsed");
+
+    // --- Phase 2: apply results to store sequentially (store is not Send) ---
     let mut total_nodes = 0usize;
     let mut total_edges = 0usize;
     let mut errors = Vec::new();
 
-    for (i, rel_path) in files.iter().enumerate() {
-        match parse_and_store_file(&parser, repo_root, rel_path, store) {
-            Ok((n, e)) => {
-                total_nodes += n;
-                total_edges += e;
+    for result in parse_results {
+        match result {
+            Ok((rel_path, nodes, edges, fhash)) => {
+                let full_path = repo_root.join(&rel_path);
+                match store.store_file_nodes_edges(
+                    &full_path.to_string_lossy(),
+                    &nodes,
+                    &edges,
+                    &fhash,
+                ) {
+                    Ok(()) => {
+                        total_nodes += nodes.len();
+                        total_edges += edges.len();
+                    }
+                    Err(err) => errors.push(BuildError {
+                        file: rel_path,
+                        error: err.to_string(),
+                    }),
+                }
             }
             Err(err) => errors.push(err),
         }
-        let idx = i + 1;
-        if idx % 50 == 0 || idx == file_count {
-            info!("Progress: {}/{} files parsed", idx, file_count);
-        }
     }
+
+    info!("Parsed {}/{} files", file_count - errors.len(), file_count);
 
     store.set_metadata("last_updated", &now_iso())?;
     store.set_metadata("last_build_type", "full")?;

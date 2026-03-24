@@ -52,7 +52,7 @@ fn save_embedding_data(data: &EmbeddingData, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = bincode::serialize(data)?;
+    let payload = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
     let compressed = zstd::encode_all(&payload[..], 3).map_err(CrgError::Io)?;
     let crc = crc32fast::hash(&compressed);
 
@@ -90,7 +90,7 @@ fn load_embedding_data(path: &Path) -> Result<EmbeddingData> {
     }
     let decompressed =
         zstd::decode_all(compressed).map_err(CrgError::Io)?;
-    let data: EmbeddingData = bincode::deserialize(&decompressed)?;
+    let (data, _): (EmbeddingData, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
     Ok(data)
 }
 
