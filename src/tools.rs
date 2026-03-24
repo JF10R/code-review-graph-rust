@@ -211,6 +211,7 @@ pub fn get_impact_radius(
     max_depth: usize,
     repo_root: Option<&str>,
     base: &str,
+    compact: bool,
 ) -> Result<Value> {
     const MAX_RESULTS: usize = 500;
     let (mut store, root) = get_store(repo_root)?;
@@ -237,8 +238,8 @@ pub fn get_impact_radius(
 
     let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS, None)?;
 
-    let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(node_to_dict).collect();
-    let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(node_to_dict).collect();
+    let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(|n| node_to_dict(n, compact)).collect();
+    let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_to_dict(n, compact)).collect();
     let edge_dicts: Vec<Value> = impact.edges.iter().map(edge_to_dict).collect();
 
     let mut summary_parts = vec![
@@ -350,6 +351,7 @@ pub fn query_graph(
     pattern: &str,
     target: &str,
     repo_root: Option<&str>,
+    compact: bool,
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
@@ -423,7 +425,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(caller) = store.get_node(&e.source_qualified)? {
-                        results.push(node_to_dict(&caller));
+                        results.push(node_to_dict(&caller, compact));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -433,7 +435,7 @@ pub fn query_graph(
                 if let Some(ref n) = node {
                     for e in store.search_edges_by_target_name(&n.name)? {
                         if let Some(caller) = store.get_node(&e.source_qualified)? {
-                            results.push(node_to_dict(&caller));
+                            results.push(node_to_dict(&caller, compact));
                         }
                         edges_out.push(edge_to_dict(&e));
                     }
@@ -444,7 +446,7 @@ pub fn query_graph(
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(callee) = store.get_node(&e.target_qualified)? {
-                        results.push(node_to_dict(&callee));
+                        results.push(node_to_dict(&callee, compact));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -473,7 +475,7 @@ pub fn query_graph(
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Contains {
                     if let Some(child) = store.get_node(&e.target_qualified)? {
-                        results.push(node_to_dict(&child));
+                        results.push(node_to_dict(&child, compact));
                     }
                 }
             }
@@ -482,7 +484,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::TestedBy {
                     if let Some(t) = store.get_node(&e.source_qualified)? {
-                        results.push(node_to_dict(&t));
+                        results.push(node_to_dict(&t, compact));
                     }
                 }
             }
@@ -494,7 +496,7 @@ pub fn query_graph(
             for prefix in &[format!("test_{name}"), format!("Test{name}")] {
                 for t in store.search_nodes(prefix, 10)? {
                     if !seen.contains(&t.qualified_name) && t.is_test {
-                        results.push(node_to_dict(&t));
+                        results.push(node_to_dict(&t, compact));
                     }
                 }
             }
@@ -503,7 +505,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if matches!(e.kind, EdgeKind::Inherits | EdgeKind::Implements) {
                     if let Some(child) = store.get_node(&e.source_qualified)? {
-                        results.push(node_to_dict(&child));
+                        results.push(node_to_dict(&child, compact));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -512,7 +514,7 @@ pub fn query_graph(
         QueryPattern::FileSummary => {
             let abs_path = root.join(target).to_string_lossy().into_owned();
             for n in store.get_nodes_by_file(&abs_path)? {
-                results.push(node_to_dict(&n));
+                results.push(node_to_dict(&n, compact));
             }
         }
     }
@@ -540,6 +542,7 @@ pub fn get_review_context(
     max_lines_per_file: usize,
     repo_root: Option<&str>,
     base: &str,
+    compact: bool,
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
@@ -565,8 +568,8 @@ pub fn get_review_context(
         "changed_files": files,
         "impacted_files": impact.impacted_files,
         "graph": {
-            "changed_nodes": impact.changed_nodes.iter().map(node_to_dict).collect::<Vec<_>>(),
-            "impacted_nodes": impact.impacted_nodes.iter().map(node_to_dict).collect::<Vec<_>>(),
+            "changed_nodes": impact.changed_nodes.iter().map(|n| node_to_dict(n, compact)).collect::<Vec<_>>(),
+            "impacted_nodes": impact.impacted_nodes.iter().map(|n| node_to_dict(n, compact)).collect::<Vec<_>>(),
             "edges": impact.edges.iter().map(edge_to_dict).collect::<Vec<_>>(),
         },
     });
@@ -629,6 +632,7 @@ pub fn semantic_search_nodes(
     kind: Option<&str>,
     limit: usize,
     repo_root: Option<&str>,
+    compact: bool,
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
@@ -638,7 +642,7 @@ pub fn semantic_search_nodes(
 
     let results: Vec<Value> = if emb_store.available() && emb_store.count()? > 0 {
         search_mode = "semantic";
-        let mut raw = semantic_search(query, &store, &mut emb_store, limit * 2)?;
+        let mut raw = semantic_search(query, &store, &mut emb_store, limit * 2, compact)?;
         if let Some(k) = kind {
             raw.retain(|r| r.get("kind").and_then(|v| v.as_str()) == Some(k));
         }
@@ -658,7 +662,7 @@ pub fn semantic_search_nodes(
             else { 2 }
         });
         nodes.truncate(limit);
-        nodes.iter().map(node_to_dict).collect()
+        nodes.iter().map(|n| node_to_dict(n, compact)).collect()
     };
 
     let kind_suffix = kind.map(|k| format!(" (kind={k})")).unwrap_or_default();
@@ -844,6 +848,7 @@ pub fn hybrid_query(
     query: &str,
     limit: usize,
     repo_root: Option<&str>,
+    compact: bool,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -877,7 +882,7 @@ pub fn hybrid_query(
     // Semantic ranks (if available)
     if emb_store.available() && emb_store.count().unwrap_or(0) > 0 {
         method = "hybrid_rrf";
-        let semantic_hits = crate::embeddings::semantic_search(query, &store, &mut emb_store, limit * 2)?;
+        let semantic_hits = crate::embeddings::semantic_search(query, &store, &mut emb_store, limit * 2, compact)?;
         for (rank, hit) in semantic_hits.iter().enumerate() {
             if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
                 let score = 1.0 / (RRF_K + rank as f64 + 1.0);
@@ -897,7 +902,7 @@ pub fn hybrid_query(
         .iter()
         .filter_map(|(qn, score)| {
             store.get_node(qn).ok().flatten().map(|node| {
-                let mut d = node_to_dict(&node);
+                let mut d = node_to_dict(&node, compact);
                 d["rrf_score"] = json!(score);
                 d
             })
@@ -995,6 +1000,7 @@ pub fn find_large_functions(
     file_path_pattern: Option<&str>,
     limit: usize,
     repo_root: Option<&str>,
+    compact: bool,
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
@@ -1011,7 +1017,7 @@ pub fn find_large_functions(
             .strip_prefix(&root)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| n.file_path.clone());
-        let mut d = node_to_dict(n);
+        let mut d = node_to_dict(n, compact);
         d["line_count"] = json!(line_count);
         d["relative_path"] = json!(relative_path);
         d
@@ -1184,7 +1190,7 @@ fn resolve_target_node(
         0 => Ok(ResolveResult::NotFound),
         1 => Ok(ResolveResult::Found(candidates.into_iter().next().unwrap())),
         _ => Ok(ResolveResult::Ambiguous(
-            candidates.iter().map(node_to_dict).collect(),
+            candidates.iter().map(|n| node_to_dict(n, false)).collect(),
         )),
     }
 }
@@ -1415,7 +1421,7 @@ mod tests {
         let (_dir, path) = make_git_repo();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = query_graph("totally_unknown_pattern", "some_target", Some(&path));
+        let result = query_graph("totally_unknown_pattern", "some_target", Some(&path), false);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "error");
@@ -1427,7 +1433,7 @@ mod tests {
         let (_dir, path) = make_git_repo();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = query_graph("callers_of", "definitely_not_a_real_function_xyz", Some(&path));
+        let result = query_graph("callers_of", "definitely_not_a_real_function_xyz", Some(&path), false);
         assert!(result.is_ok());
         let val = result.unwrap();
         // Could be "not_found" or "ok" with empty results
@@ -1462,7 +1468,7 @@ mod tests {
         fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("", 10, Some(&path));
+        let result = hybrid_query("", 10, Some(&path), false);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1480,7 +1486,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("add", 5, Some(&path));
+        let result = hybrid_query("add", 5, Some(&path), false);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1501,7 +1507,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("square", 5, Some(&path));
+        let result = hybrid_query("square", 5, Some(&path), false);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");

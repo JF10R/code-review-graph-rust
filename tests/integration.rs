@@ -123,11 +123,11 @@ fn query_graph_callers_and_callees() {
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
     // callees_of "run" should include add and subtract (called inside run)
-    let callees_result = query_graph("callees_of", "run", Some(&root_str)).unwrap();
+    let callees_result = query_graph("callees_of", "run", Some(&root_str), false).unwrap();
     assert_eq!(callees_result["status"], "ok", "callees_of should succeed");
 
     // callers_of "add" should include run (which calls add)
-    let callers_result = query_graph("callers_of", "add", Some(&root_str)).unwrap();
+    let callers_result = query_graph("callers_of", "add", Some(&root_str), false).unwrap();
     assert_eq!(callers_result["status"], "ok", "callers_of should succeed");
 }
 
@@ -305,7 +305,7 @@ fn query_graph_file_summary_returns_nodes() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = query_graph("file_summary", "utils.py", Some(&root_str)).unwrap();
+    let result = query_graph("file_summary", "utils.py", Some(&root_str), false).unwrap();
     let status = result["status"].as_str().unwrap();
     // file_summary may return "ok" with results, or "ambiguous" when the short
     // name matches multiple recorded paths — both are valid non-error outcomes.
@@ -333,7 +333,7 @@ fn query_graph_imports_of_does_not_error() {
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
     // main.py imports from utils — query imports_of main.py
-    let result = query_graph("imports_of", "main.py", Some(&root_str)).unwrap();
+    let result = query_graph("imports_of", "main.py", Some(&root_str), false).unwrap();
     let status = result["status"].as_str().unwrap();
     assert!(
         status == "ok" || status == "not_found" || status == "ambiguous",
@@ -355,7 +355,7 @@ fn query_graph_importers_of_does_not_error() {
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
     // utils.py is imported by main.py — query importers_of utils.py
-    let result = query_graph("importers_of", "utils.py", Some(&root_str)).unwrap();
+    let result = query_graph("importers_of", "utils.py", Some(&root_str), false).unwrap();
     let status = result["status"].as_str().unwrap();
     assert!(
         status == "ok" || status == "not_found" || status == "ambiguous",
@@ -376,7 +376,7 @@ fn query_graph_children_of_does_not_error() {
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
     // utils.py should contain add and subtract
-    let result = query_graph("children_of", "utils.py", Some(&root_str)).unwrap();
+    let result = query_graph("children_of", "utils.py", Some(&root_str), false).unwrap();
     let status = result["status"].as_str().unwrap();
     assert!(
         status == "ok" || status == "not_found" || status == "ambiguous",
@@ -411,7 +411,7 @@ fn query_graph_tests_for_does_not_error() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = query_graph("tests_for", "add", Some(&root_str)).unwrap();
+    let result = query_graph("tests_for", "add", Some(&root_str), false).unwrap();
     let status = result["status"].as_str().unwrap();
     assert!(
         status == "ok" || status == "not_found" || status == "ambiguous",
@@ -440,7 +440,7 @@ fn query_graph_inheritors_of_does_not_error() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = query_graph("inheritors_of", "Animal", Some(&root_str)).unwrap();
+    let result = query_graph("inheritors_of", "Animal", Some(&root_str), false).unwrap();
     let status = result["status"].as_str().unwrap();
     assert!(
         status == "ok" || status == "not_found" || status == "ambiguous",
@@ -460,7 +460,7 @@ fn hybrid_query_returns_ok_with_method_field() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("add", 5, Some(&root_str)).unwrap();
+    let result = hybrid_query("add", 5, Some(&root_str), false).unwrap();
     assert_eq!(result["status"], "ok");
     // No embeddings in temp test repos — should fall back to keyword_only
     assert_eq!(
@@ -477,7 +477,7 @@ fn hybrid_query_empty_query_returns_empty() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("", 10, Some(&root_str)).unwrap();
+    let result = hybrid_query("", 10, Some(&root_str), false).unwrap();
     assert_eq!(result["status"], "ok");
     assert!(result["results"].as_array().unwrap().is_empty());
 }
@@ -489,7 +489,7 @@ fn hybrid_query_results_include_rrf_score() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("subtract", 5, Some(&root_str)).unwrap();
+    let result = hybrid_query("subtract", 5, Some(&root_str), false).unwrap();
     assert_eq!(result["status"], "ok");
     let arr = result["results"].as_array().unwrap();
     if !arr.is_empty() {
