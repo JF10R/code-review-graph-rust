@@ -786,54 +786,56 @@ fn pagerank_impact(
 
     let seed_score = 1.0 / seeds.len() as f64;
 
-    // Precompute weighted in-degree for each node.
-    // Used to normalise contributions from outgoing successors so that
-    // popular (highly-depended-upon) nodes don't dominate unfairly.
-    let in_degree: HashMap<NodeIndex, f64> = data
-        .graph
-        .node_indices()
-        .map(|idx| {
-            let w_sum: f64 = data
-                .graph
-                .edges_directed(idx, Direction::Incoming)
-                .map(|e| edge_impact_weight(*e.weight()))
-                .sum();
-            (idx, w_sum)
-        })
-        .collect();
-
     // Precompute seed node indices for O(1) teleport lookup.
     let seed_indices: HashSet<NodeIndex> = seeds
         .iter()
         .filter_map(|qn| data.node_index.get(qn).copied())
         .collect();
 
-    // Initialize scores: seeds get seed_score, others get 0.0.
+    // Initialize scores and active frontier.
+    // Only nodes with non-zero scores + their incoming neighbors need processing.
     let mut scores: HashMap<NodeIndex, f64> = HashMap::new();
+    let mut active: HashSet<NodeIndex> = HashSet::new();
     for &idx in &seed_indices {
         scores.insert(idx, seed_score);
+        active.insert(idx);
+        // Seed's incoming neighbors (callers) will receive impact next iteration
+        for pred in data.graph.neighbors_directed(idx, Direction::Incoming) {
+            active.insert(pred);
+        }
     }
+
+    // Cache weighted in-degree only for nodes we actually visit (lazy).
+    let mut in_degree_cache: HashMap<NodeIndex, f64> = HashMap::new();
+    let mut get_in_degree = |idx: NodeIndex| -> f64 {
+        *in_degree_cache.entry(idx).or_insert_with(|| {
+            data.graph
+                .edges_directed(idx, Direction::Incoming)
+                .map(|e| edge_impact_weight(*e.weight()))
+                .sum()
+        })
+    };
 
     for _ in 0..max_iterations {
         let mut new_scores: HashMap<NodeIndex, f64> = HashMap::new();
+        let mut next_active: HashSet<NodeIndex> = HashSet::new();
         let mut max_diff: f64 = 0.0;
 
-        for idx in data.graph.node_indices() {
-            // Personalized teleport: only seed nodes receive the teleport boost.
+        // Process only active nodes (seeds + nodes reachable from scored nodes)
+        for &idx in &active {
             let teleport = if seed_indices.contains(&idx) {
                 (1.0 - damping) * seed_score
             } else {
                 0.0
             };
 
-            // Accumulate impact from outgoing successors (nodes this node depends on).
             let mut dep_sum: f64 = 0.0;
             for succ_idx in data.graph.neighbors_directed(idx, Direction::Outgoing) {
                 let succ_score = scores.get(&succ_idx).copied().unwrap_or(0.0);
                 if succ_score == 0.0 {
                     continue;
                 }
-                let d = in_degree[&succ_idx];
+                let d = get_in_degree(succ_idx);
                 if d > 0.0 {
                     for edge_ref in data.graph.edges_connecting(idx, succ_idx) {
                         let w = edge_impact_weight(*edge_ref.weight());
@@ -847,11 +849,21 @@ fn pagerank_impact(
             max_diff = max_diff.max((new_score - old_score).abs());
             if new_score > epsilon {
                 new_scores.insert(idx, new_score);
+                // Newly scored nodes' predecessors become active next iteration
+                for pred in data.graph.neighbors_directed(idx, Direction::Incoming) {
+                    next_active.insert(pred);
+                }
             }
         }
 
+        // Seeds always stay active (they receive teleportation)
+        for &idx in &seed_indices {
+            next_active.insert(idx);
+        }
+
         scores = new_scores;
-        if max_diff < epsilon {
+        active = next_active;
+        if max_diff < epsilon || active.is_empty() {
             break;
         }
     }
