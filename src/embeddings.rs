@@ -320,11 +320,20 @@ struct FastEmbedProvider {
 #[cfg(feature = "embeddings-fastembed")]
 impl FastEmbedProvider {
     fn new() -> Result<Self> {
-        let model = fastembed::TextEmbedding::try_new(
-            fastembed::InitOptions::new(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode)
-                .with_show_download_progress(true),
-        )
-        .map_err(|e| CrgError::Other(format!("fastembed init: {e}")))?;
+        let mut init = fastembed::InitOptions::new(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode)
+            .with_show_download_progress(true);
+
+        #[cfg(feature = "gpu-directml")]
+        {
+            use ort::execution_providers::DirectMLExecutionProvider;
+            log::info!("DirectML GPU acceleration enabled — trying GPU first, CPU fallback");
+            init = init.with_execution_providers(vec![
+                DirectMLExecutionProvider::default().build(),
+            ]);
+        }
+
+        let model = fastembed::TextEmbedding::try_new(init)
+            .map_err(|e| CrgError::Other(format!("fastembed init: {e}")))?;
         Ok(Self { model })
     }
 }
@@ -811,12 +820,17 @@ pub fn semantic_search(
     emb_store: &mut EmbeddingStore,
     limit: usize,
     compact: bool,
+    repo_root: &std::path::Path,
 ) -> Result<Vec<serde_json::Value>> {
     let provider = match &emb_store.provider {
         Some(p) => p,
         None => {
             let nodes = store.search_nodes(query, limit)?;
-            return Ok(nodes.iter().map(|n| node_to_dict(n, compact)).collect());
+            return Ok(nodes.iter().map(|n| {
+                let mut d = node_to_dict(n, compact);
+                if compact { crate::types::strip_paths_prefix(&mut d, repo_root); }
+                d
+            }).collect());
         }
     };
 
@@ -833,7 +847,7 @@ pub fn semantic_search(
                     .into_iter()
                     .map(|(qn, s)| (qn, s as f64))
                     .collect::<Vec<_>>();
-                return nodes_from_scored(scored, store, compact);
+                return nodes_from_scored(scored, store, compact, repo_root);
             }
             Err(e) => {
                 log::warn!("HNSW index build failed ({}); falling back to linear scan", e);
@@ -850,7 +864,7 @@ pub fn semantic_search(
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
-    nodes_from_scored(scored, store, compact)
+    nodes_from_scored(scored, store, compact, repo_root)
 }
 
 /// Resolve a ranked `(qualified_name, score)` list to full node dicts.
@@ -858,11 +872,13 @@ fn nodes_from_scored(
     scored: Vec<(String, f64)>,
     store: &GraphStore,
     compact: bool,
+    repo_root: &std::path::Path,
 ) -> Result<Vec<serde_json::Value>> {
     let mut results = Vec::with_capacity(scored.len());
     for (qn, score) in scored {
         if let Some(node) = store.get_node(&qn)? {
             let mut d = node_to_dict(&node, compact);
+            if compact { crate::types::strip_paths_prefix(&mut d, repo_root); }
             d["similarity_score"] =
                 serde_json::Value::from((score * 10_000.0).round() / 10_000.0);
             results.push(d);

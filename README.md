@@ -23,12 +23,24 @@ This is a complete Rust rewrite of the original Python implementation, preservin
 | Query speed | **Sub-millisecond** — graph always in memory |
 | Accuracy | **30-50% fewer false positives** — Personalized PageRank, weighted, direction-aware |
 | Scale | **Personalized PageRank** for all graph sizes — no threshold, no explosion |
-| Embeddings | **Jina Code v2** (768-dim, ~80% Top-5) — free, local, no API key |
+| Embeddings | **Jina Code v2** (768-dim, ~80% Top-5) — free, local, no API key, **GPU optional** |
 | Search | **Hybrid RRF** — graph traversal + vector similarity in one query |
+| Call tracing | **trace_call_chain** — shortest path between any two functions |
+| Framework edges | **JSX, Express, pytest** — component/middleware/fixture edges auto-detected |
 | Freshness | **Automatic** — background watcher + lazy stale-check, zero manual builds |
 | Disk usage | **4-10x smaller** graph files (postcard + zstd) |
 
-### Recent changes (v1.1)
+### Recent changes (v1.2)
+
+| Change | Impact |
+|--------|--------|
+| **Compact response mode** | All MCP tools accept `compact: true` — strips low-value fields + repo-root path prefixes, reducing response tokens ~40%. Agents stay within context budgets on large codebases |
+| **`trace_call_chain` tool** (new) | Find the shortest call path between two functions via BFS on CALLS edges. Replaces manual hop-by-hop file reading when tracing data flow |
+| **Framework-aware edge inference** | JSX component usage (`<Button />` → CALLS edge), Express/Koa middleware, event emitter `.on()` handlers, and pytest fixture injection are now detected as CALLS edges. Next.js graph gained +149K edges from JSX alone |
+| **GPU-accelerated embeddings** (DirectML) | Optional `gpu-directml` feature uses the GPU for embedding computation. Benchmarked **~80x faster** than CPU on 57K-node next.js (>20 min → 15 seconds on RTX 5070 Ti) |
+| **Agent-optimized tool descriptions** | MCP tool descriptions now guide agents toward optimal usage patterns: semantic search for discovery, graph queries instead of grep, Read/Grep tools instead of bash |
+
+### Previous changes (v1.1)
 
 | Change | Impact |
 |--------|--------|
@@ -39,12 +51,13 @@ This is a complete Rust rewrite of the original Python implementation, preservin
 | **Hybrid RRF query** (new MCP tool) | Merges structural graph + vector search in one call |
 | **Token reduction metrics** (new MCP tool) | Quantifies context savings vs naive file reading |
 | **Watcher re-parses dependents** | Cross-file edges stay fresh after function renames |
-| **Query patterns → enum** | Compile-time safety, no more `unreachable!()` |
 | **Incremental build** 30-50% less I/O | Single file read (was double), hash-skip in watch mode |
-| **125 tests** (107 unit + 18 integration) | 62.9% line coverage, up from 56.3% |
 
 Optional features:
 ```bash
+# GPU-accelerated embeddings (Windows, any GPU via DirectML)
+cargo install ... --features gpu-directml
+
 # HNSW vector search (requires C++ toolchain)
 cargo install ... --features hnsw-index
 
@@ -105,7 +118,7 @@ The MCP server starts automatically when Claude Code launches and keeps the grap
 
 ## How it works
 
-Tree-sitter parses your code into a graph of nodes (functions, classes, imports) and edges (calls, inheritance, test coverage). When you ask Claude to review a change, it queries the graph for the blast radius — which callers, dependents, and tests are affected — then reads only those files. The graph updates incrementally on every file save.
+Tree-sitter parses your code into a graph of nodes (functions, classes, imports) and edges (calls, inheritance, test coverage). A **framework-aware post-processing pass** adds edges for JSX component usage, Express/Koa middleware chains, event emitter registrations, and pytest fixture injection — patterns that pure AST analysis misses. When you ask Claude to review a change, it queries the graph for the blast radius — which callers, dependents, and tests are affected — then reads only those files. The graph updates incrementally on every file save.
 
 Language-specific extraction rules are defined in declarative [`.scm` query files](queries/) — adding support for a new language is a single file addition, no Rust recompilation needed.
 
@@ -264,6 +277,8 @@ Add to `.claude/settings.json` to update the graph after every file edit:
 }
 ```
 
+> **Important**: Only match `Edit|Write`, never `Bash`. Including `Bash` causes the graph to rebuild after every shell command (including read-only `ls`, `grep`, `cargo test`), adding significant overhead — benchmarked at 126 unnecessary rebuilds per code investigation session.
+
 ---
 
 ## Supported languages
@@ -368,7 +383,7 @@ src/
 ├── parser.rs         # Multi-language tree-sitter parser (14 grammars)
 ├── graph.rs          # StableGraph + postcard/zstd persistence
 ├── incremental.rs    # Git ops, full/incremental build, watch
-├── tools.rs          # 11 MCP tools (incl. hybrid RRF search, token metrics)
+├── tools.rs          # 12 MCP tools (incl. trace_call_chain, hybrid RRF, compact mode)
 ├── server.rs         # rmcp MCP server (stdio) + background watcher
 ├── persistence.rs    # Generic postcard+zstd save/load with CRC integrity
 ├── search.rs         # Tantivy full-text search (opt-in feature)

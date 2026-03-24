@@ -21,7 +21,16 @@ use crate::embeddings::{embed_all_nodes, semantic_search, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
-use crate::types::{edge_to_dict, node_to_dict, EdgeKind};
+use crate::types::{edge_to_dict, node_to_dict, strip_paths_prefix, EdgeKind};
+
+/// Wrapper: build a node dict, then strip repo-root prefix if compact.
+fn node_dict(node: &crate::types::GraphNode, compact: bool, root: &Path) -> Value {
+    let mut d = node_to_dict(node, compact);
+    if compact {
+        strip_paths_prefix(&mut d, root);
+    }
+    d
+}
 
 /// Common JS/TS builtin method names filtered from callers_of results.
 /// "Who calls .map()?" returns hundreds of hits and is never useful.
@@ -238,8 +247,8 @@ pub fn get_impact_radius(
 
     let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS, None)?;
 
-    let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(|n| node_to_dict(n, compact)).collect();
-    let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_to_dict(n, compact)).collect();
+    let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(|n| node_dict(n, compact, &root)).collect();
+    let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_dict(n, compact, &root)).collect();
     let edge_dicts: Vec<Value> = impact.edges.iter().map(edge_to_dict).collect();
 
     let mut summary_parts = vec![
@@ -425,7 +434,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(caller) = store.get_node(&e.source_qualified)? {
-                        results.push(node_to_dict(&caller, compact));
+                        results.push(node_dict(&caller, compact, &root));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -435,7 +444,7 @@ pub fn query_graph(
                 if let Some(ref n) = node {
                     for e in store.search_edges_by_target_name(&n.name)? {
                         if let Some(caller) = store.get_node(&e.source_qualified)? {
-                            results.push(node_to_dict(&caller, compact));
+                            results.push(node_dict(&caller, compact, &root));
                         }
                         edges_out.push(edge_to_dict(&e));
                     }
@@ -446,7 +455,7 @@ pub fn query_graph(
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(callee) = store.get_node(&e.target_qualified)? {
-                        results.push(node_to_dict(&callee, compact));
+                        results.push(node_dict(&callee, compact, &root));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -475,7 +484,7 @@ pub fn query_graph(
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Contains {
                     if let Some(child) = store.get_node(&e.target_qualified)? {
-                        results.push(node_to_dict(&child, compact));
+                        results.push(node_dict(&child, compact, &root));
                     }
                 }
             }
@@ -484,7 +493,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::TestedBy {
                     if let Some(t) = store.get_node(&e.source_qualified)? {
-                        results.push(node_to_dict(&t, compact));
+                        results.push(node_dict(&t, compact, &root));
                     }
                 }
             }
@@ -496,7 +505,7 @@ pub fn query_graph(
             for prefix in &[format!("test_{name}"), format!("Test{name}")] {
                 for t in store.search_nodes(prefix, 10)? {
                     if !seen.contains(&t.qualified_name) && t.is_test {
-                        results.push(node_to_dict(&t, compact));
+                        results.push(node_dict(&t, compact, &root));
                     }
                 }
             }
@@ -505,7 +514,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if matches!(e.kind, EdgeKind::Inherits | EdgeKind::Implements) {
                     if let Some(child) = store.get_node(&e.source_qualified)? {
-                        results.push(node_to_dict(&child, compact));
+                        results.push(node_dict(&child, compact, &root));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -514,7 +523,7 @@ pub fn query_graph(
         QueryPattern::FileSummary => {
             let abs_path = root.join(target).to_string_lossy().into_owned();
             for n in store.get_nodes_by_file(&abs_path)? {
-                results.push(node_to_dict(&n, compact));
+                results.push(node_dict(&n, compact, &root));
             }
         }
     }
@@ -642,7 +651,7 @@ pub fn semantic_search_nodes(
 
     let results: Vec<Value> = if emb_store.available() && emb_store.count()? > 0 {
         search_mode = "semantic";
-        let mut raw = semantic_search(query, &store, &mut emb_store, limit * 2, compact)?;
+        let mut raw = semantic_search(query, &store, &mut emb_store, limit * 2, compact, &root)?;
         if let Some(k) = kind {
             raw.retain(|r| r.get("kind").and_then(|v| v.as_str()) == Some(k));
         }
@@ -662,7 +671,7 @@ pub fn semantic_search_nodes(
             else { 2 }
         });
         nodes.truncate(limit);
-        nodes.iter().map(|n| node_to_dict(n, compact)).collect()
+        nodes.iter().map(|n| node_dict(n, compact, &root)).collect()
     };
 
     let kind_suffix = kind.map(|k| format!(" (kind={k})")).unwrap_or_default();
@@ -882,7 +891,7 @@ pub fn hybrid_query(
     // Semantic ranks (if available)
     if emb_store.available() && emb_store.count().unwrap_or(0) > 0 {
         method = "hybrid_rrf";
-        let semantic_hits = crate::embeddings::semantic_search(query, &store, &mut emb_store, limit * 2, compact)?;
+        let semantic_hits = crate::embeddings::semantic_search(query, &store, &mut emb_store, limit * 2, compact, &root)?;
         for (rank, hit) in semantic_hits.iter().enumerate() {
             if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
                 let score = 1.0 / (RRF_K + rank as f64 + 1.0);
@@ -902,7 +911,7 @@ pub fn hybrid_query(
         .iter()
         .filter_map(|(qn, score)| {
             store.get_node(qn).ok().flatten().map(|node| {
-                let mut d = node_to_dict(&node, compact);
+                let mut d = node_dict(&node, compact, &root);
                 d["rrf_score"] = json!(score);
                 d
             })
@@ -1017,7 +1026,7 @@ pub fn find_large_functions(
             .strip_prefix(&root)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| n.file_path.clone());
-        let mut d = node_to_dict(n, compact);
+        let mut d = node_dict(n, compact, &root);
         d["line_count"] = json!(line_count);
         d["relative_path"] = json!(relative_path);
         d
@@ -1062,10 +1071,9 @@ pub fn trace_call_chain(
     from: &str,
     to: &str,
     max_depth: usize,
-    _compact: bool,
+    compact: bool,
     repo_root: Option<&str>,
 ) -> Result<Value> {
-    // TODO: pass compact flag when compact mode merges (node_to_dict currently takes 1 arg)
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
 
@@ -1120,7 +1128,7 @@ pub fn trace_call_chain(
             let hops = path.len().saturating_sub(1);
             let path_json: Vec<Value> = path.iter().map(|(node, edge)| {
                 json!({
-                    "node": node_to_dict(node),
+                    "node": node_dict(node, compact, &root),
                     "edge_to_next": edge.is_some().then_some("CALLS"),
                 })
             }).collect();

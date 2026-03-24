@@ -252,6 +252,26 @@ pub fn node_to_dict(node: &GraphNode, compact: bool) -> serde_json::Value {
     }
 }
 
+/// Strip the repo root prefix from `file_path` and `qualified_name` fields
+/// in a node dict, producing shorter paths like `src/main.rs` instead of
+/// `D:/GitHub/project/src/main.rs`. Only applies in compact mode.
+pub fn strip_paths_prefix(dict: &mut serde_json::Value, repo_root: &std::path::Path) {
+    let prefix = repo_root.to_string_lossy();
+    // Normalize separators for comparison
+    let prefix_fwd = prefix.replace('\\', "/");
+    for key in &["file_path", "qualified_name"] {
+        if let Some(val) = dict.get_mut(*key).and_then(|v| v.as_str().map(|s| s.to_string())) {
+            let normalized = val.replace('\\', "/");
+            let stripped = normalized
+                .strip_prefix(&prefix_fwd)
+                .or_else(|| normalized.strip_prefix(&format!("//?/{}", prefix_fwd)))
+                .map(|s| s.trim_start_matches('/').to_string())
+                .unwrap_or(val);
+            dict[*key] = serde_json::Value::String(stripped);
+        }
+    }
+}
+
 /// Convert a GraphEdge to a JSON-serializable map.
 pub fn edge_to_dict(edge: &GraphEdge) -> serde_json::Value {
     serde_json::json!({

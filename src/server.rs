@@ -252,10 +252,10 @@ impl CodeReviewServer {
         .map_err(|e| e.to_string())?
     }
 
-    /// Analyze the blast radius of changed files in the codebase.
-    ///
-    /// Shows which functions, classes, and files are impacted by changes.
-    /// Auto-detects changed files from git if not specified.
+    /// Analyze the blast radius of code changes — shows which functions,
+    /// classes, and files are affected. Use during code review to understand
+    /// what a change impacts. Pass changed file paths, or let it auto-detect
+    /// from git diff. Follow up with Read tool on impacted files.
     #[tool(name = "get_impact_radius")]
     async fn get_impact_radius_tool(
         &self,
@@ -277,10 +277,12 @@ impl CodeReviewServer {
         .map_err(|e| e.to_string())?
     }
 
-    /// Run a predefined graph query to explore code relationships.
-    ///
-    /// Available patterns: callers_of, callees_of, imports_of, importers_of,
-    /// children_of, tests_for, inheritors_of, file_summary.
+    /// Explore structural code relationships — use INSTEAD of grepping for
+    /// function names. callers_of: who calls this? callees_of: what does it
+    /// call? children_of: what's in this file/class? file_summary: overview.
+    /// Use callers_of/callees_of to navigate between functions instead of
+    /// running grep in bash. After finding connected functions, use the
+    /// Read tool to examine their logic.
     #[tool(name = "query_graph")]
     async fn query_graph_tool(
         &self,
@@ -330,8 +332,12 @@ impl CodeReviewServer {
 
     /// Search for code entities by name, keyword, or semantic similarity.
     ///
-    /// Uses vector embeddings for semantic search when available (run
-    /// embed_graph_tool first). Falls back to keyword matching otherwise.
+    /// Faster and more precise than grep for discovering WHERE code lives.
+    /// Use as your FIRST tool when investigating a new concept (e.g.,
+    /// "CSS chunk splitting", "auth middleware", "database connection pool").
+    /// Returns ranked results with similarity scores. After finding targets,
+    /// use the Read tool (not bash cat) to examine their source code.
+    /// Always pass compact: true to reduce response size.
     #[tool(name = "semantic_search_nodes")]
     async fn semantic_search_nodes_tool(
         &self,
@@ -412,10 +418,10 @@ impl CodeReviewServer {
         .map_err(|e| e.to_string())?
     }
 
-    /// Find functions, classes, or files exceeding a line-count threshold.
-    ///
-    /// Useful for decomposition audits, code quality checks, and enforcing
-    /// size limits during code review. Results are ordered by line count.
+    /// Find complex functions by line count — useful for identifying where
+    /// business logic concentrates and finding likely bug locations.
+    /// Use for decomposition audits and code quality checks.
+    /// Results ordered by size, largest first.
     #[tool(name = "find_large_functions")]
     async fn find_large_functions_tool(
         &self,
@@ -438,11 +444,13 @@ impl CodeReviewServer {
         .map_err(|e| e.to_string())?
     }
 
-    /// Find the shortest call chain between two functions.
-    /// Traverses CALLS edges to show how function A connects to function B
-    /// through intermediate calls. Useful for understanding data flow,
-    /// tracing bug propagation, and mapping dependency chains.
-    /// Try outgoing (callee) direction first, then incoming (caller) direction.
+    /// Find the shortest call path between two functions — use AFTER
+    /// semantic_search identifies two related functions to understand HOW
+    /// they connect. Returns the complete chain of intermediate function
+    /// calls. Example: after finding 'mergeManifest' and 'getLinkAndScriptTags'
+    /// via search, use this to map the full call flow between them.
+    /// Replaces manual hop-by-hop file reading. Tries callee direction first,
+    /// then caller direction.
     #[tool(name = "trace_call_chain")]
     async fn trace_call_chain_tool(
         &self,
@@ -478,9 +486,14 @@ impl ServerHandler for CodeReviewServer {
                 .build(),
         )
         .with_instructions(
-            "Persistent incremental knowledge graph for token-efficient, \
-             context-aware code reviews. Parses your codebase with Tree-sitter, \
-             builds a structural graph, and provides smart impact analysis.",
+            "Persistent incremental knowledge graph for token-efficient code reviews.\n\n\
+             RECOMMENDED WORKFLOW:\n\
+             1. semantic_search_nodes — find code by concept (faster than grep for discovery)\n\
+             2. query_graph(callers_of/callees_of) — explore relationships (replaces grepping for function names)\n\
+             3. trace_call_chain — map call paths between distant functions (replaces manual hop-by-hop tracing)\n\
+             4. Use Read tool (not bash cat) and Grep tool (not bash grep) for examining file contents\n\n\
+             Always pass compact: true to reduce response size. \
+             Use these tools for discovery, then switch to Read/Grep for detailed analysis.",
         )
     }
 }
