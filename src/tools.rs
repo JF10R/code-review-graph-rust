@@ -101,6 +101,34 @@ fn get_store(repo_root: Option<&str>) -> Result<(GraphStore, PathBuf)> {
 }
 
 // ---------------------------------------------------------------------------
+// Lazy staleness check
+// ---------------------------------------------------------------------------
+
+/// Check if the graph is stale and run a quick incremental update if needed.
+/// Only checks git status (fast, ~10-50ms) — doesn't re-hash all files.
+/// Skipped if the graph was updated less than 2 seconds ago.
+fn maybe_auto_update(store: &mut GraphStore, repo_root: &Path) {
+    // Skip if graph was updated less than 2 seconds ago
+    if let Ok(Some(last)) = store.get_metadata("last_updated") {
+        if let Ok(last_time) = chrono::NaiveDateTime::parse_from_str(&last, "%Y-%m-%dT%H:%M:%S") {
+            let now = chrono::Utc::now().naive_utc();
+            if (now - last_time).num_seconds() < 2 {
+                return;
+            }
+        }
+    }
+
+    let changed = crate::incremental::get_staged_and_unstaged(repo_root);
+    if changed.is_empty() {
+        return;
+    }
+    // Only update if there are actually changed files not yet in the graph
+    let _ = crate::incremental::incremental_update(
+        repo_root, store, "HEAD", Some(changed),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tool 1: build_or_update_graph
 // ---------------------------------------------------------------------------
 
@@ -174,7 +202,8 @@ pub fn get_impact_radius(
     base: &str,
 ) -> Result<Value> {
     const MAX_RESULTS: usize = 500;
-    let (store, root) = get_store(repo_root)?;
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
 
     let files = resolve_changed_files(changed_files, &root, base);
 
@@ -260,7 +289,8 @@ pub fn query_graph(
     target: &str,
     repo_root: Option<&str>,
 ) -> Result<Value> {
-    let (store, root) = get_store(repo_root)?;
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
 
     let description = match pattern_description(pattern) {
         Some(d) => d,
@@ -445,7 +475,8 @@ pub fn get_review_context(
     repo_root: Option<&str>,
     base: &str,
 ) -> Result<Value> {
-    let (store, root) = get_store(repo_root)?;
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
 
     let files = resolve_changed_files(changed_files, &root, base);
 
@@ -533,7 +564,8 @@ pub fn semantic_search_nodes(
     limit: usize,
     repo_root: Option<&str>,
 ) -> Result<Value> {
-    let (store, root) = get_store(repo_root)?;
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let emb_store = EmbeddingStore::new(&emb_db_path)?;
     let search_mode;
@@ -580,7 +612,8 @@ pub fn semantic_search_nodes(
 // ---------------------------------------------------------------------------
 
 pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
-    let (store, root) = get_store(repo_root)?;
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
     let stats = store.get_stats()?;
 
     let root_name = root.file_name()
@@ -739,7 +772,8 @@ pub fn find_large_functions(
     limit: usize,
     repo_root: Option<&str>,
 ) -> Result<Value> {
-    let (store, root) = get_store(repo_root)?;
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
 
     let nodes = store.get_nodes_by_size(min_lines, kind, file_path_pattern, limit)?;
 
