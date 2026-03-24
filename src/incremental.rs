@@ -22,6 +22,7 @@ use walkdir::WalkDir;
 
 use crate::error::Result;
 use crate::graph::GraphStore;
+use crate::types::EdgeInfo;
 use crate::parser::CodeParser;
 use crate::types::EdgeKind;
 
@@ -456,24 +457,29 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
 
     pb.finish_with_message("parsed");
 
-    // --- Phase 2: apply results to store sequentially (store is not Send) ---
+    // --- Phase 2: two-phase store (nodes first, then edges) ---
+    // Phase 2a inserts all nodes so that node_index is fully populated.
+    // Phase 2b inserts all edges — cross-file targets are now resolvable.
     let mut total_nodes = 0usize;
     let mut total_edges = 0usize;
     let mut errors = Vec::new();
+
+    // Separate successes from errors, keep edges for phase 2b.
+    let mut successes: Vec<(String, Vec<EdgeInfo>)> = Vec::new();
 
     for result in parse_results {
         match result {
             Ok((rel_path, nodes, edges, fhash)) => {
                 let full_path = repo_root.join(&rel_path);
-                match store.store_file_nodes_edges(
+                match store.store_file_nodes_only(
                     &full_path.to_string_lossy(),
                     &nodes,
-                    &edges,
                     &fhash,
                 ) {
                     Ok(()) => {
                         total_nodes += nodes.len();
                         total_edges += edges.len();
+                        successes.push((rel_path, edges));
                     }
                     Err(err) => errors.push(BuildError {
                         file: rel_path,
@@ -483,6 +489,11 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
             }
             Err(err) => errors.push(err),
         }
+    }
+
+    // Phase 2b: insert all edges (all nodes now in node_index, skip dedup)
+    for (_rel_path, edges) in &successes {
+        store.insert_edges(edges, true);
     }
 
     info!("Parsed {}/{} files", file_count - errors.len(), file_count);

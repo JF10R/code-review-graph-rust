@@ -110,6 +110,10 @@ impl GraphStore {
     // -- Write operations --
 
     /// Replace all nodes and edges for a file with the freshly-parsed data.
+    ///
+    /// Cross-file edges whose target is not yet in the graph are silently
+    /// dropped.  For full builds, use [`store_file_nodes_only`] +
+    /// [`insert_edges`] (two-phase) to guarantee all cross-file edges resolve.
     pub fn store_file_nodes_edges(
         &mut self,
         file_path: &str,
@@ -117,9 +121,22 @@ impl GraphStore {
         edges: &[EdgeInfo],
         file_hash: &str,
     ) -> Result<()> {
+        self.store_file_nodes_only(file_path, nodes, file_hash)?;
+        self.insert_edges(edges, false);
+        Ok(())
+    }
+
+    /// Insert only nodes for a file (no edges).  Used as phase 1 of the
+    /// two-phase full-build path so that all nodes are in `node_index`
+    /// before any edges are resolved.
+    pub fn store_file_nodes_only(
+        &mut self,
+        file_path: &str,
+        nodes: &[NodeInfo],
+        file_hash: &str,
+    ) -> Result<()> {
         self.remove_file_data_inner(file_path);
 
-        // Insert new nodes
         let mut new_idxs: Vec<NodeIndex> = Vec::with_capacity(nodes.len());
         for node_info in nodes {
             let graph_node = GraphNode {
@@ -148,28 +165,32 @@ impl GraphStore {
         self.data
             .file_hashes
             .insert(file_path.to_string(), file_hash.to_string());
+        Ok(())
+    }
 
-        // Insert new edges (resolve endpoints via node_index)
+    /// Resolve and insert edges into the graph.
+    ///
+    /// When `skip_dedup` is true, the O(degree) duplicate-edge check is
+    /// skipped — safe when the graph was just cleared (full-build phase 2).
+    pub fn insert_edges(&mut self, edges: &[EdgeInfo], skip_dedup: bool) {
         for edge_info in edges {
             let src_idx = self.data.node_index.get(&edge_info.source_qualified).copied();
             let tgt_idx = self.data.node_index.get(&edge_info.target_qualified).copied();
             if let (Some(src), Some(tgt)) = (src_idx, tgt_idx) {
-                // Avoid duplicate edges at the same call site
-                let already_exists = self
-                    .data
-                    .graph
-                    .edges_connecting(src, tgt)
-                    .any(|e| *e.weight() == edge_info.kind);
-                if !already_exists {
+                if skip_dedup {
                     self.data.graph.add_edge(src, tgt, edge_info.kind);
+                } else {
+                    let already_exists = self
+                        .data
+                        .graph
+                        .edges_connecting(src, tgt)
+                        .any(|e| *e.weight() == edge_info.kind);
+                    if !already_exists {
+                        self.data.graph.add_edge(src, tgt, edge_info.kind);
+                    }
                 }
             }
-            // Unresolved edges (target not in graph yet) are silently dropped —
-            // cross-file edges will be re-added on the next build that touches
-            // the target file.
         }
-
-        Ok(())
     }
 
     /// Remove all nodes and edges associated with a file.
