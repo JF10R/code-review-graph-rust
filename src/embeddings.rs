@@ -16,7 +16,6 @@
 //! postcard/zstd pattern as `graph.rs`.
 
 use std::collections::HashMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -24,13 +23,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental::sha256_bytes_pub;
+use crate::persistence;
 use crate::types::{GraphNode, node_to_dict};
-
-// ---------------------------------------------------------------------------
-// File format (same magic as graph.rs)
-// ---------------------------------------------------------------------------
-
-const MAGIC: &[u8; 4] = b"CRG\x01";
 
 // ---------------------------------------------------------------------------
 // Serialisable data
@@ -44,54 +38,15 @@ struct EmbeddingData {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence helpers
+// Persistence helpers (delegates to crate::persistence)
 // ---------------------------------------------------------------------------
 
 fn save_embedding_data(data: &EmbeddingData, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let payload = postcard::to_allocvec(data)?;
-    let compressed = zstd::encode_all(&payload[..], 3).map_err(CrgError::Io)?;
-    let crc = crc32fast::hash(&compressed);
-
-    let tmp =
-        tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
-    {
-        let mut f = tmp.as_file();
-        f.write_all(MAGIC)?;
-        f.write_all(&crc.to_le_bytes())?;
-        f.write_all(&compressed)?;
-        f.flush()?;
-    }
-    tmp.persist(path).map_err(|e| CrgError::Io(e.error))?;
-    Ok(())
+    persistence::save_blob(data, path, "embeddings")
 }
 
 fn load_embedding_data(path: &Path) -> Result<EmbeddingData> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 8 {
-        return Err(CrgError::Other("embeddings file too short".into()));
-    }
-    if &bytes[0..4] != MAGIC {
-        return Err(CrgError::Other(
-            "corrupt embeddings file (bad magic)".into(),
-        ));
-    }
-    let stored_crc = u32::from_le_bytes(
-        bytes[4..8]
-            .try_into()
-            .map_err(|_| CrgError::Other("corrupt embeddings file (bad crc field)".into()))?,
-    );
-    let compressed = &bytes[8..];
-    if crc32fast::hash(compressed) != stored_crc {
-        return Err(CrgError::Other("embeddings file CRC mismatch".into()));
-    }
-    let decompressed =
-        zstd::decode_all(compressed).map_err(CrgError::Io)?;
-    let data: EmbeddingData = postcard::from_bytes(&decompressed)?;
-    Ok(data)
+    persistence::load_blob(path, "embeddings")
 }
 
 fn text_hash(text: &str) -> String {

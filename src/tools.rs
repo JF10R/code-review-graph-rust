@@ -340,12 +340,15 @@ pub fn query_graph(
             Some(n)
         }
         ResolveResult::Ambiguous(candidates) => {
-            store.close()?;
-            return Ok(json!({
-                "status": "ambiguous",
-                "summary": format!("Multiple matches for '{}'. Please use a qualified name.", target),
-                "candidates": candidates,
-            }));
+            if pattern != "file_summary" {
+                store.close()?;
+                return Ok(json!({
+                    "status": "ambiguous",
+                    "summary": format!("Multiple matches for '{}'. Please use a qualified name.", target),
+                    "candidates": candidates,
+                }));
+            }
+            None
         }
         ResolveResult::NotFound => None,
     };

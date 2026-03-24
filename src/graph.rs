@@ -7,7 +7,6 @@
 //! SQLite is no longer used here — see `embeddings.rs` for the embeddings DB.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::io::Write as _;
 use std::path::Path;
 
 use petgraph::stable_graph::StableGraph;
@@ -17,17 +16,11 @@ use serde::{Deserialize, Serialize};
 
 pub use petgraph::stable_graph::NodeIndex;
 
-use crate::error::{CrgError, Result};
+use crate::error::Result;
+use crate::persistence;
 use crate::types::{
     EdgeInfo, EdgeKind, GraphEdge, GraphNode, GraphStats, ImpactResult, NodeInfo, NodeKind,
 };
-
-// ---------------------------------------------------------------------------
-// File format constants
-// ---------------------------------------------------------------------------
-
-/// Magic bytes at the start of every `.bin.zst` file.
-const MAGIC: &[u8; 4] = b"CRG\x01";
 
 // ---------------------------------------------------------------------------
 // Serializable graph data
@@ -59,55 +52,15 @@ impl GraphData {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence helpers
+// Persistence helpers (delegates to crate::persistence)
 // ---------------------------------------------------------------------------
 
-/// Serialize, compress, and atomically write `data` to `path`.
 fn save(data: &GraphData, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let payload = postcard::to_allocvec(data)?;
-    let compressed = zstd::encode_all(&payload[..], 3)
-        .map_err(|e| CrgError::Io(e))?;
-    let crc = crc32fast::hash(&compressed);
-
-    let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
-    {
-        let mut f = tmp.as_file();
-        f.write_all(MAGIC)?;
-        f.write_all(&crc.to_le_bytes())?;
-        f.write_all(&compressed)?;
-        f.flush()?;
-    }
-    tmp.persist(path)
-        .map_err(|e| CrgError::Io(e.error))?;
-    Ok(())
+    persistence::save_blob(data, path, "graph")
 }
 
-/// Load `GraphData` from a `graph.bin.zst` file.
 fn load(path: &Path) -> Result<GraphData> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 8 {
-        return Err(CrgError::Other("graph file too short".into()));
-    }
-    if &bytes[0..4] != MAGIC {
-        return Err(CrgError::Other("corrupt graph file (bad magic)".into()));
-    }
-    let stored_crc = u32::from_le_bytes(
-        bytes[4..8]
-            .try_into()
-            .map_err(|_| CrgError::Other("corrupt graph file (bad crc field)".into()))?,
-    );
-    let compressed = &bytes[8..];
-    if crc32fast::hash(compressed) != stored_crc {
-        return Err(CrgError::Other("graph file CRC mismatch".into()));
-    }
-    let decompressed = zstd::decode_all(compressed)
-        .map_err(|e| CrgError::Io(e))?;
-    let data: GraphData = postcard::from_bytes(&decompressed)?;
-    Ok(data)
+    persistence::load_blob(path, "graph")
 }
 
 // ---------------------------------------------------------------------------

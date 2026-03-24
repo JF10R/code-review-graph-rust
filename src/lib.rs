@@ -9,6 +9,7 @@ pub mod error;
 pub mod graph;
 pub mod incremental;
 pub mod parser;
+pub mod persistence;
 pub mod server;
 pub mod tools;
 pub mod tsconfig;
