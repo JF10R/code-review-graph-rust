@@ -14,3 +14,6 @@ pub mod tools;
 pub mod tsconfig;
 pub mod types;
 pub mod visualization;
+
+#[cfg(feature = "tantivy-search")]
+pub mod search;

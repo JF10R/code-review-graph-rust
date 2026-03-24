@@ -19,8 +19,12 @@ embeddings-local = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+tantivy-search = ["dep:tantivy"]
 
 [dependencies]
+# Full-text search (opt-in)
+tantivy = { version = "0.22", optional = true }
+
 # Local embeddings (default — free, no API key needed)
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
