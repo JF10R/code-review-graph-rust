@@ -6,7 +6,7 @@
 //!
 //! SQLite is no longer used here — see `embeddings.rs` for the embeddings DB.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 
@@ -417,32 +417,82 @@ impl GraphStore {
 
     // -- Impact analysis --
 
-    /// Compute the blast radius of changed files using BFS on the in-memory graph.
+    /// Get body_hashes for all nodes in a file.
+    /// Returns a map of qualified_name → body_hash.
+    pub fn get_body_hashes(&self, file_path: &str) -> HashMap<String, String> {
+        self.data
+            .file_index
+            .get(file_path)
+            .map(|idxs| {
+                idxs.iter()
+                    .map(|&idx| {
+                        let node = &self.data.graph[idx];
+                        (node.qualified_name.clone(), node.body_hash.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Compute the blast radius of changed files.
+    ///
+    /// Uses weighted directed BFS for graphs < 10k nodes, personalized PageRank
+    /// for larger graphs. Automatically selects algorithm based on graph size.
+    ///
+    /// If `changed_nodes` is provided, those qualified names are used as seeds
+    /// directly (node-level diff seeding). Otherwise seeds are all nodes in
+    /// `changed_files`.
     pub fn get_impact_radius(
         &self,
         changed_files: &[String],
         max_depth: usize,
         max_nodes: usize,
+        changed_nodes: Option<&[String]>,
     ) -> Result<ImpactResult> {
+        // Build seed set
         let mut seeds: HashSet<String> = HashSet::new();
-        for f in changed_files {
-            for node in self.get_nodes_by_file(f)? {
-                seeds.insert(node.qualified_name.clone());
+        if let Some(specific_nodes) = changed_nodes {
+            // Node-level seeding: only actually-changed nodes
+            for qn in specific_nodes {
+                seeds.insert(qn.clone());
+            }
+        }
+        // Fall back to (or supplement with) all nodes in changed files if no
+        // specific nodes provided or seeds are still empty
+        if seeds.is_empty() {
+            for f in changed_files {
+                for node in self.get_nodes_by_file(f)? {
+                    seeds.insert(node.qualified_name.clone());
+                }
             }
         }
 
-        let impacted = bfs_impact(&seeds, &self.data, max_depth, max_nodes);
-
-        let changed_nodes: Vec<GraphNode> = seeds
+        let changed_nodes_vec: Vec<GraphNode> = seeds
             .iter()
             .filter_map(|qn| self.get_node(qn).ok().flatten())
             .collect();
 
-        let mut impacted_nodes: Vec<GraphNode> = impacted
-            .iter()
-            .filter(|qn| !seeds.contains(*qn))
-            .filter_map(|qn| self.get_node(qn).ok().flatten())
-            .collect();
+        let (ranked, algorithm) = if self.data.graph.node_count() >= 10_000 {
+            let r = pagerank_impact(&seeds, &self.data, max_nodes);
+            (r, "pagerank".to_string())
+        } else {
+            let r = weighted_bfs_impact(&seeds, &self.data, max_depth, max_nodes);
+            (r, "weighted_bfs".to_string())
+        };
+
+        // Build impact_scores map and collect impacted nodes (exclude seeds)
+        let mut impact_scores: HashMap<String, f64> = HashMap::new();
+        let mut impacted_nodes: Vec<GraphNode> = Vec::new();
+
+        for (qn, score) in &ranked {
+            if seeds.contains(qn) {
+                continue;
+            }
+            impact_scores.insert(qn.clone(), *score);
+            if let Some(node) = self.get_node(qn).ok().flatten() {
+                impacted_nodes.push(node);
+            }
+        }
 
         let total_impacted = impacted_nodes.len();
         let truncated = total_impacted > max_nodes;
@@ -465,12 +515,14 @@ impl GraphStore {
         let edges = self.get_edges_among(&all_qns);
 
         Ok(ImpactResult {
-            changed_nodes,
+            changed_nodes: changed_nodes_vec,
             impacted_nodes,
+            impact_scores,
             impacted_files,
             edges,
             truncated,
             total_impacted,
+            algorithm,
         })
     }
 
@@ -582,57 +634,220 @@ impl GraphStore {
 }
 
 // ---------------------------------------------------------------------------
-// BFS traversal (pure function, operates on GraphData)
+// Impact analysis helpers (pure functions, operate on GraphData)
 // ---------------------------------------------------------------------------
 
-fn bfs_impact(
+/// Weight assigned to each edge kind for impact propagation.
+/// Higher = more impactful relationship.
+fn edge_impact_weight(kind: EdgeKind) -> f64 {
+    match kind {
+        EdgeKind::Calls => 1.0,
+        EdgeKind::Inherits => 1.2,
+        EdgeKind::Implements => 1.0,
+        EdgeKind::ImportsFrom => 0.5,
+        EdgeKind::TestedBy => 0.8,
+        EdgeKind::Contains => 0.1,
+    }
+}
+
+/// Wrapper for `f64` that implements `Ord` so it can live in a `BinaryHeap`.
+/// NaN is treated as less than any finite value.
+#[derive(PartialEq)]
+struct OrdF64(f64);
+
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Less)
+    }
+}
+
+/// Direction-aware, weighted BFS (Dijkstra-style) for impact analysis.
+///
+/// Rules:
+/// - INCOMING edges to a changed node → high impact (callers/inheritors depend on me).
+///   Multiplier: weight × 1.0
+/// - OUTGOING edges from a changed node → negligible (my deps didn't change).
+///   Exception: TestedBy outgoing edges DO propagate (the test should be flagged).
+///   Multiplier: weight × 0.0 for all except TestedBy (weight × 1.0)
+///
+/// Each node accumulates a score = parent_score × edge_weight × decay_factor.
+/// Traversal continues only for nodes with score > threshold.
+///
+/// Returns (qualified_name, score) pairs sorted by score descending.
+fn weighted_bfs_impact(
     seeds: &HashSet<String>,
     data: &GraphData,
     max_depth: usize,
-    max_nodes: usize,
-) -> HashSet<String> {
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut frontier: VecDeque<String> = seeds.iter().cloned().collect();
-    let mut impacted: HashSet<String> = HashSet::new();
+    max_results: usize,
+) -> Vec<(String, f64)> {
+    const DECAY: f64 = 0.7;
+    const THRESHOLD: f64 = 0.01;
 
-    for _ in 0..max_depth {
-        if frontier.is_empty() {
-            break;
-        }
-        let mut next_frontier: Vec<String> = Vec::new();
+    // Max-heap: (score, depth, qualified_name)
+    let mut heap: BinaryHeap<(OrdF64, std::cmp::Reverse<usize>, String)> = BinaryHeap::new();
+    let mut best_score: HashMap<String, f64> = HashMap::new();
 
-        while let Some(qn) = frontier.pop_front() {
-            if visited.contains(&qn) {
-                continue;
-            }
-            visited.insert(qn.clone());
-
-            if let Some(&idx) = data.node_index.get(&qn) {
-                // Outgoing neighbours
-                for nb_idx in data.graph.neighbors_directed(idx, Direction::Outgoing) {
-                    let nb = data.graph[nb_idx].qualified_name.clone();
-                    if !visited.contains(&nb) {
-                        impacted.insert(nb.clone());
-                        next_frontier.push(nb);
-                    }
-                }
-                // Incoming neighbours (reverse edges)
-                for pred_idx in data.graph.neighbors_directed(idx, Direction::Incoming) {
-                    let pred = data.graph[pred_idx].qualified_name.clone();
-                    if !visited.contains(&pred) {
-                        impacted.insert(pred.clone());
-                        next_frontier.push(pred);
-                    }
-                }
-            }
-
-            if visited.len() + next_frontier.len() > max_nodes {
-                return impacted;
-            }
-        }
-
-        frontier.extend(next_frontier);
+    // Seed nodes start at score 1.0, depth 0
+    for qn in seeds {
+        best_score.insert(qn.clone(), 1.0);
+        heap.push((OrdF64(1.0), std::cmp::Reverse(0), qn.clone()));
     }
 
-    impacted
+    while let Some((OrdF64(score), std::cmp::Reverse(depth), qn)) = heap.pop() {
+        // Skip if we've already processed this node at a higher score
+        if best_score.get(&qn).copied().unwrap_or(0.0) > score + f64::EPSILON {
+            continue;
+        }
+        if depth >= max_depth {
+            continue;
+        }
+
+        let Some(&idx) = data.node_index.get(&qn) else { continue };
+
+        // --- INCOMING edges: who depends on me? ---
+        for edge_ref in data.graph.edges_directed(idx, Direction::Incoming) {
+            let kind = *edge_ref.weight();
+            let weight = edge_impact_weight(kind);
+            let new_score = score * weight * DECAY;
+            if new_score < THRESHOLD {
+                continue;
+            }
+            let nb_qn = data.graph[edge_ref.source()].qualified_name.clone();
+            let prev = best_score.get(&nb_qn).copied().unwrap_or(0.0);
+            if new_score > prev {
+                best_score.insert(nb_qn.clone(), new_score);
+                heap.push((OrdF64(new_score), std::cmp::Reverse(depth + 1), nb_qn));
+            }
+        }
+
+        // --- OUTGOING edges: only propagate TestedBy ---
+        for edge_ref in data.graph.edges_directed(idx, Direction::Outgoing) {
+            let kind = *edge_ref.weight();
+            if kind != EdgeKind::TestedBy {
+                continue;
+            }
+            let weight = edge_impact_weight(kind);
+            let new_score = score * weight * DECAY;
+            if new_score < THRESHOLD {
+                continue;
+            }
+            let nb_qn = data.graph[edge_ref.target()].qualified_name.clone();
+            let prev = best_score.get(&nb_qn).copied().unwrap_or(0.0);
+            if new_score > prev {
+                best_score.insert(nb_qn.clone(), new_score);
+                heap.push((OrdF64(new_score), std::cmp::Reverse(depth + 1), nb_qn));
+            }
+        }
+    }
+
+    let mut results: Vec<(String, f64)> = best_score
+        .into_iter()
+        .filter(|(qn, _)| !seeds.contains(qn))
+        .collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(max_results);
+    results
+}
+
+/// Personalized PageRank for large graphs (>= 10k nodes).
+///
+/// Propagates scores through INCOMING edges (reverse direction) with edge weights.
+/// Seeds receive a teleport component that keeps scores anchored to the changed nodes.
+///
+/// Returns (qualified_name, score) pairs sorted by score descending (seeds excluded).
+fn pagerank_impact(
+    seeds: &HashSet<String>,
+    data: &GraphData,
+    max_results: usize,
+) -> Vec<(String, f64)> {
+    let damping: f64 = 0.85;
+    let max_iterations: usize = 20;
+    let epsilon: f64 = 1e-6;
+    let n = data.graph.node_count();
+    if n == 0 || seeds.is_empty() {
+        return vec![];
+    }
+
+    let seed_score = 1.0 / seeds.len() as f64;
+
+    // Precompute out-degree for each node (used in every iteration).
+    let out_degree: HashMap<NodeIndex, f64> = data
+        .graph
+        .node_indices()
+        .map(|idx| {
+            let d = data.graph.neighbors_directed(idx, Direction::Outgoing).count() as f64;
+            (idx, d)
+        })
+        .collect();
+
+    // Precompute seed node indices for O(1) teleport lookup.
+    let seed_indices: HashSet<NodeIndex> = seeds
+        .iter()
+        .filter_map(|qn| data.node_index.get(qn).copied())
+        .collect();
+
+    // Initialize scores: seeds get seed_score, others get 0.0
+    let mut scores: HashMap<NodeIndex, f64> = HashMap::new();
+    for &idx in &seed_indices {
+        scores.insert(idx, seed_score);
+    }
+
+    for _ in 0..max_iterations {
+        let mut new_scores: HashMap<NodeIndex, f64> = HashMap::new();
+        let mut max_diff: f64 = 0.0;
+
+        for idx in data.graph.node_indices() {
+            // Personalized teleport: only seed nodes receive the teleport boost
+            let teleport = if seed_indices.contains(&idx) {
+                (1.0 - damping) * seed_score
+            } else {
+                0.0
+            };
+
+            // Accumulate contributions from incoming neighbors
+            let mut incoming_sum: f64 = 0.0;
+            for pred_idx in data.graph.neighbors_directed(idx, Direction::Incoming) {
+                let pred_score = scores.get(&pred_idx).copied().unwrap_or(0.0);
+                if pred_score == 0.0 {
+                    continue;
+                }
+                let d = out_degree[&pred_idx];
+                if d > 0.0 {
+                    for edge_ref in data.graph.edges_connecting(pred_idx, idx) {
+                        let w = edge_impact_weight(*edge_ref.weight());
+                        incoming_sum += pred_score * w / d;
+                    }
+                }
+            }
+
+            let new_score = teleport + damping * incoming_sum;
+            let old_score = scores.get(&idx).copied().unwrap_or(0.0);
+            max_diff = max_diff.max((new_score - old_score).abs());
+            if new_score > epsilon {
+                new_scores.insert(idx, new_score);
+            }
+        }
+
+        scores = new_scores;
+        if max_diff < epsilon {
+            break;
+        }
+    }
+
+    let mut results: Vec<(String, f64)> = scores
+        .iter()
+        .filter(|(idx, _)| !seed_indices.contains(idx))
+        .map(|(idx, score)| (data.graph[*idx].qualified_name.clone(), *score))
+        .collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(max_results);
+    results
 }
