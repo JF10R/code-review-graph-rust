@@ -7,7 +7,9 @@
 //!   code-review-graph watch [--repo PATH]
 //!   code-review-graph visualize [--repo PATH]
 //!   code-review-graph serve [--repo PATH]
-//!   code-review-graph install [--repo PATH]
+//!   code-review-graph install [--repo PATH] [--dry-run]
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -87,8 +89,191 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
-    let _ = cmd;
-    todo!("Implement CLI command dispatch")
+    use code_review_graph::incremental;
+
+    match cmd {
+        Commands::Build { repo } => {
+            let root = resolve_project_root(repo.as_deref(), false)?;
+            let db_path = incremental::get_db_path(&root);
+            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            let result = incremental::full_build(&root, &store)?;
+            println!(
+                "Full build: {} files, {} nodes, {} edges",
+                result.files_parsed, result.total_nodes, result.total_edges
+            );
+            if !result.errors.is_empty() {
+                println!("Errors: {}", result.errors.len());
+            }
+            store.close()?;
+        }
+
+        Commands::Update { base, repo } => {
+            let root = resolve_project_root(repo.as_deref(), true)?;
+            let db_path = incremental::get_db_path(&root);
+            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            let result = incremental::incremental_update(&root, &store, &base, None)?;
+            println!(
+                "Incremental: {} files updated, {} nodes, {} edges",
+                result.files_updated, result.total_nodes, result.total_edges
+            );
+            store.close()?;
+        }
+
+        Commands::Status { repo } => {
+            let root = resolve_project_root(repo.as_deref(), false)?;
+            let db_path = incremental::get_db_path(&root);
+            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            let stats = store.get_stats()?;
+            println!("Nodes: {}", stats.total_nodes);
+            println!("Edges: {}", stats.total_edges);
+            println!("Files: {}", stats.files_count);
+            println!("Languages: {}", stats.languages.join(", "));
+            println!(
+                "Last updated: {}",
+                stats.last_updated.as_deref().unwrap_or("never")
+            );
+            store.close()?;
+        }
+
+        Commands::Watch { repo } => {
+            let root = resolve_project_root(repo.as_deref(), false)?;
+            let db_path = incremental::get_db_path(&root);
+            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            incremental::watch(&root, &store)?;
+            store.close()?;
+        }
+
+        Commands::Visualize { repo } => {
+            let root = resolve_project_root(repo.as_deref(), false)?;
+            let db_path = incremental::get_db_path(&root);
+            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            let html_path = root.join(".code-review-graph").join("graph.html");
+            code_review_graph::visualization::generate_html(&store, &html_path)?;
+            println!("Visualization: {}", html_path.display());
+            println!("Open in browser to explore your codebase graph.");
+            store.close()?;
+        }
+
+        Commands::Install { repo, dry_run } => {
+            handle_install(repo.as_deref(), dry_run)?;
+        }
+
+        // Serve is handled in main() before reaching here.
+        Commands::Serve { .. } => unreachable!(),
+    }
+
+    Ok(())
+}
+
+/// Resolve the repository/project root.
+///
+/// `require_git`: if true (for `update`), the root must be inside a git repo.
+fn resolve_project_root(
+    repo: Option<&str>,
+    require_git: bool,
+) -> anyhow::Result<PathBuf> {
+    use code_review_graph::incremental;
+
+    if let Some(r) = repo {
+        let path = PathBuf::from(r);
+        if !path.is_dir() {
+            anyhow::bail!("Repository path is not a directory: {}", path.display());
+        }
+        return Ok(path);
+    }
+
+    if require_git {
+        match incremental::find_repo_root(None) {
+            Some(root) => Ok(root),
+            None => anyhow::bail!(
+                "Not in a git repository. 'update' requires git for diffing.\n\
+                 Use 'build' for a full parse, or run 'git init' first."
+            ),
+        }
+    } else {
+        Ok(incremental::find_project_root(None))
+    }
+}
+
+/// Create or merge `.mcp.json` in the project root.
+fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+    use code_review_graph::incremental;
+
+    let root: PathBuf = if let Some(r) = repo {
+        PathBuf::from(r)
+    } else {
+        incremental::find_repo_root(None)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    };
+
+    let mcp_path = root.join(".mcp.json");
+
+    let entry = serde_json::json!({
+        "mcpServers": {
+            "code-review-graph": {
+                "command": "code-review-graph",
+                "args": ["serve"]
+            }
+        }
+    });
+
+    let final_config: serde_json::Value = if mcp_path.exists() {
+        let content = std::fs::read_to_string(&mcp_path)?;
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(mut existing) => {
+                // Already configured?
+                if existing
+                    .get("mcpServers")
+                    .and_then(|s| s.get("code-review-graph"))
+                    .is_some()
+                {
+                    println!("Already configured in {}", mcp_path.display());
+                    return Ok(());
+                }
+                // Merge our entry in
+                if let Some(servers) = existing
+                    .get_mut("mcpServers")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    servers.insert(
+                        "code-review-graph".to_string(),
+                        entry["mcpServers"]["code-review-graph"].clone(),
+                    );
+                } else {
+                    existing["mcpServers"] = entry["mcpServers"].clone();
+                }
+                existing
+            }
+            Err(_) => {
+                eprintln!(
+                    "Warning: existing {} has invalid JSON, overwriting.",
+                    mcp_path.display()
+                );
+                entry
+            }
+        }
+    } else {
+        entry
+    };
+
+    let json_str = serde_json::to_string_pretty(&final_config)?;
+
+    if dry_run {
+        println!("[dry-run] Would write to {}:", mcp_path.display());
+        println!("{}", json_str);
+        println!();
+        println!("[dry-run] No files were modified.");
+        return Ok(());
+    }
+
+    std::fs::write(&mcp_path, [json_str.as_bytes(), b"\n"].concat())?;
+    println!("Created {}", mcp_path.display());
+    println!();
+    println!("Next steps:");
+    println!("  1. code-review-graph build    # build the knowledge graph");
+    println!("  2. Restart Claude Code        # to pick up the new MCP server");
+
+    Ok(())
 }
 
 fn print_banner() {
@@ -109,6 +294,8 @@ fn print_banner() {
     status      Show graph statistics
     visualize   Generate interactive HTML graph
     serve       Start MCP server
+
+  Run code-review-graph <command> --help for details
 "#,
         version
     );
