@@ -438,6 +438,31 @@ fn resolve_root(repo_root: Option<&str>) -> PathBuf {
 // Background file watcher (Option B: saves to disk, tools reload per call)
 // ---------------------------------------------------------------------------
 
+/// Parse `path` from disk and store its nodes/edges into `store`.
+/// Returns `(node_count, edge_count)` on success, or an error string on failure.
+fn watcher_parse_and_store(
+    parser: &crate::parser::CodeParser,
+    store: &mut crate::graph::GraphStore,
+    path: &std::path::Path,
+) -> Result<(usize, usize), String> {
+    use crate::incremental::{is_binary_pub, sha256_bytes_pub};
+    if is_binary_pub(path) {
+        return Err(format!("{}: binary file skipped", path.display()));
+    }
+    let source = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let fhash = sha256_bytes_pub(&source);
+    let abs_str = path.to_string_lossy();
+    let (nodes, edges) = parser
+        .parse_bytes(path, &source)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    let n = nodes.len();
+    let e = edges.len();
+    store
+        .store_file_nodes_edges(&abs_str, &nodes, &edges, &fhash)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    Ok((n, e))
+}
+
 /// Spawn a background OS thread that watches `repo_root` for source-file
 /// changes and incrementally updates `graph.bin.zst` on disk.
 ///
@@ -449,7 +474,7 @@ fn resolve_root(repo_root: Option<&str>) -> PathBuf {
 fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
-    use crate::incremental::{get_db_path, load_ignore_patterns_pub, is_binary_pub, sha256_bytes_pub};
+    use crate::incremental::{get_db_path, load_ignore_patterns_pub, find_dependents};
     use crate::graph::GraphStore;
     use crate::parser::CodeParser;
 
@@ -529,42 +554,44 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
             }
         }
 
+        // Track processed paths to guard against circular import cycles.
+        let mut processed: HashSet<String> = paths_to_update
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+
         for path in &paths_to_update {
-            if is_binary_pub(path) {
-                continue;
-            }
-            match std::fs::read(path) {
-                Ok(source) => {
-                    let fhash = sha256_bytes_pub(&source);
-                    let abs_str = path.to_string_lossy().into_owned();
-                    match parser.parse_bytes(path, &source) {
-                        Ok((nodes, edges)) => {
-                            let n = nodes.len();
-                            let e = edges.len();
-                            if let Err(err) =
-                                store.store_file_nodes_edges(&abs_str, &nodes, &edges, &fhash)
-                            {
-                                log::error!("Watcher store {}: {}", abs_str, err);
-                            } else {
-                                let _ = store.set_metadata(
-                                    "last_updated",
-                                    &chrono::Utc::now()
-                                        .format("%Y-%m-%dT%H:%M:%S")
-                                        .to_string(),
-                                );
-                                let rel = path
-                                    .strip_prefix(&repo_root)
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|_| abs_str.clone());
-                                log::info!("Watcher updated: {} ({} nodes, {} edges)", rel, n, e);
-                            }
+            let abs_str = path.to_string_lossy().into_owned();
+            match watcher_parse_and_store(&parser, &mut store, path) {
+                Ok((n, e)) => {
+                    let _ = store.set_metadata(
+                        "last_updated",
+                        &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    );
+                    let rel = path
+                        .strip_prefix(&repo_root)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| abs_str.clone());
+                    log::info!("Watcher updated: {} ({} nodes, {} edges)", rel, n, e);
+
+                    // Re-parse dependents so cross-file edges stay fresh.
+                    let deps = find_dependents(&store, &abs_str).unwrap_or_default();
+                    for dep_path in &deps {
+                        if processed.contains(dep_path.as_str()) {
+                            continue;
                         }
-                        Err(err) => {
-                            log::error!("Watcher parse {}: {}", path.display(), err)
+                        processed.insert(dep_path.clone());
+                        let dep = std::path::PathBuf::from(dep_path);
+                        match watcher_parse_and_store(&parser, &mut store, &dep) {
+                            Ok((dn, de)) => log::debug!(
+                                "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
+                                dep_path, dn, de
+                            ),
+                            Err(e) => log::warn!("Watcher dependent {}: {}", dep_path, e),
                         }
                     }
                 }
-                Err(err) => log::error!("Watcher read {}: {}", path.display(), err),
+                Err(err) => log::error!("Watcher {}", err),
             }
         }
 

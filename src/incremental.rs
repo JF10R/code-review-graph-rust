@@ -167,6 +167,16 @@ fn sha256_bytes(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Returns true when the stored file hash for `abs_path` matches `fhash`,
+/// meaning the file content is unchanged and re-parsing can be skipped.
+fn file_hash_unchanged(store: &GraphStore, abs_path: &str, fhash: &str) -> bool {
+    store
+        .get_nodes_by_file(abs_path)
+        .unwrap_or_default()
+        .first()
+        .map(|n| n.file_hash.as_str()) == Some(fhash)
+}
+
 fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
@@ -287,16 +297,8 @@ pub fn collect_all_files(repo_root: &Path) -> Vec<String> {
 }
 
 /// Find files that import from or depend on the given file.
-pub fn find_dependents(store: &mut GraphStore, file_path: &str) -> Result<Vec<String>> {
+pub fn find_dependents(store: &GraphStore, file_path: &str) -> Result<Vec<String>> {
     let mut dependents: HashSet<String> = HashSet::new();
-
-    // IMPORTS_FROM edges where this file is the target
-    let edges = store.get_edges_by_target(file_path)?;
-    for e in edges {
-        if e.kind == EdgeKind::ImportsFrom {
-            dependents.insert(e.file_path.clone());
-        }
-    }
 
     // CALLS/IMPORTS_FROM/INHERITS/IMPLEMENTS edges targeting nodes in this file
     let nodes = store.get_nodes_by_file(file_path)?;
@@ -377,21 +379,19 @@ fn parse_file_parallel(parser: &CodeParser, repo_root: &Path, rel_path: &str) ->
 
 /// Parse `rel_path` (relative to `repo_root`) and store its nodes/edges.
 ///
+/// `source` and `fhash` are pre-computed by the caller to avoid a second disk read.
 /// Returns `(node_count, edge_count)` on success, or a `BuildError` on failure.
 /// Used by `incremental_update` (sequential, store access required per file).
 fn parse_and_store_file(
     parser: &CodeParser,
     repo_root: &Path,
     rel_path: &str,
+    source: &[u8],
+    fhash: &str,
     store: &mut GraphStore,
 ) -> std::result::Result<(usize, usize), BuildError> {
     let full_path = repo_root.join(rel_path);
-    let source = std::fs::read(&full_path).map_err(|e| BuildError {
-        file: rel_path.to_owned(),
-        error: e.to_string(),
-    })?;
-    let fhash = sha256_bytes(&source);
-    let (nodes, edges) = parser.parse_bytes(&full_path, &source).map_err(|e| {
+    let (nodes, edges) = parser.parse_bytes(&full_path, source).map_err(|e| {
         warn!("Error parsing {}: {}", rel_path, e);
         BuildError {
             file: rel_path.to_owned(),
@@ -401,7 +401,7 @@ fn parse_and_store_file(
     let n = nodes.len();
     let e = edges.len();
     store
-        .store_file_nodes_edges(&full_path.to_string_lossy(), &nodes, &edges, &fhash)
+        .store_file_nodes_edges(&full_path.to_string_lossy(), &nodes, &edges, fhash)
         .map_err(|err| BuildError {
             file: rel_path.to_owned(),
             error: err.to_string(),
@@ -559,23 +559,21 @@ pub fn incremental_update(
             continue;
         }
 
-        // Hash-based skip: avoid re-parsing files whose content hasn't changed.
-        let skip = match fs::read(&abs_path) {
-            Ok(source) => {
-                let fhash = sha256_bytes(&source);
-                let existing = store.get_nodes_by_file(&abs_path.to_string_lossy())?;
-                existing.first().map(|n| n.file_hash.as_str()) == Some(fhash.as_str())
-            }
-            Err(_) => false,
+        let abs_path_str = abs_path.to_string_lossy().into_owned();
+
+        let source = match fs::read(&abs_path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
         };
-        if skip {
+        let fhash = sha256_bytes(&source);
+
+        if file_hash_unchanged(store, &abs_path_str, &fhash) {
             continue;
         }
 
-        let abs_path_str = abs_path.to_string_lossy().into_owned();
         let old_hashes = store.get_body_hashes(&abs_path_str);
 
-        match parse_and_store_file(&parser, repo_root, rel_path, store) {
+        match parse_and_store_file(&parser, repo_root, rel_path, &source, &fhash, store) {
             Ok((n, e)) => {
                 total_nodes += n;
                 total_edges += e;
@@ -689,6 +687,11 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
                 Ok(source) => {
                     let fhash = sha256_bytes(&source);
                     let abs_str = path.to_string_lossy().into_owned();
+
+                    if file_hash_unchanged(store, &abs_str, &fhash) {
+                        continue;
+                    }
+
                     match parser.parse_bytes(&path, &source) {
                         Ok((nodes, edges)) => {
                             let n = nodes.len();
