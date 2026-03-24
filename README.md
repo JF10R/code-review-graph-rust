@@ -24,176 +24,176 @@ The original Python version solves this with a structural knowledge graph — Tr
 
 Same solution, fundamentally better execution:
 
-| | Sans code-review-graph | Python (original) | **Rust (cette version)** |
+| | Without code-review-graph | Python (original) | **Rust (this version)** |
 |---|---|---|---|
-| Token usage | Scan complet chaque fois | **6.8x reduction** | **6.8x reduction** (meme graphe) |
-| Installation | N/A | Python 3.10+ venv, ~150 MB | **Binaire unique 28 MB** |
+| Token usage | Full scan every time | **6.8x reduction** | **6.8x reduction** (same graph) |
+| Installation | N/A | Python 3.10+ venv, ~150 MB | **Single 28 MB binary** |
 | Startup | N/A | ~150-300 ms | **~2-5 ms** |
-| `list_graph_stats` | N/A | ~5 ms (SQL) | **<0.1 ms** (O(1) en memoire) |
-| `get_impact_radius` 1er appel | N/A | ~200 ms (build cache) | **<1 ms** (toujours en memoire) |
-| `query_graph callers_of` | N/A | ~10 ms (SQL + cache) | **<0.5 ms** (HashMap direct) |
-| Incremental update (5 fichiers) | N/A | ~200 ms | **~50 ms** |
-| Graphe sur disque (1k fichiers) | N/A | ~2 MB (SQLite) | **~200 KB** (bincode+zstd) |
-| Graphe sur disque (10k fichiers) | N/A | ~20 MB | **~2 MB** |
-| Dependencies runtime | N/A | Python + pip + venv | **Aucune** |
-| Auto-update du graphe | N/A | Hook manuel | **Background watcher + lazy stale-check** |
+| `list_graph_stats` | N/A | ~5 ms (SQL) | **<0.1 ms** (O(1) in-memory) |
+| `get_impact_radius` first call | N/A | ~200 ms (build cache) | **<1 ms** (always in memory) |
+| `query_graph callers_of` | N/A | ~10 ms (SQL + cache) | **<0.5 ms** (direct HashMap) |
+| Incremental update (5 files) | N/A | ~200 ms | **~50 ms** |
+| Graph on disk (1k files) | N/A | ~2 MB (SQLite) | **~200 KB** (bincode+zstd) |
+| Graph on disk (10k files) | N/A | ~20 MB | **~2 MB** |
+| Runtime dependencies | N/A | Python + pip + venv | **None** |
+| Auto-update graph | N/A | Manual hook | **Background watcher + lazy stale-check** |
 
 ---
 
 ## Quick Start
 
-### Download le binaire
+### Download the binary
 
 ```bash
-# Depuis les releases GitHub (a venir)
-# ou build depuis les sources :
+# From GitHub releases (coming soon)
+# or build from source:
 cargo install --path .
 ```
 
-### Initialiser
+### Initialize
 
 ```bash
-cd votre-projet
-code-review-graph install   # Cree .mcp.json pour Claude Code
-code-review-graph build     # Parse le codebase (~10s pour 500 fichiers)
+cd your-project
+code-review-graph install   # Creates .mcp.json for Claude Code
+code-review-graph build     # Parses the codebase (~10s for 500 files)
 ```
 
-Redemarrer Claude Code apres l'installation.
+Restart Claude Code after installation.
 
-### Utiliser
+### Use
 
-Le graphe se met a jour **automatiquement** :
-- Le serveur MCP lance un **background watcher** qui re-indexe les fichiers modifies en temps reel
-- Chaque requete d'outil verifie la **fraicheur du graphe** et fait un update incremental si necessaire
-- Le flag `--quiet` permet l'integration avec les hooks PostToolUse de Claude Code
+The graph updates **automatically**:
+- The MCP server starts a **background watcher** that re-indexes modified files in real time
+- Each tool request checks **graph freshness** and runs an incremental update if needed
+- The `--quiet` flag enables integration with Claude Code PostToolUse hooks
 
 ```
-# Demander a Claude :
+# Ask Claude:
 Review my recent changes using the code graph
 ```
 
 ---
 
-## Avantages vs la version Python
+## Advantages vs the Python version
 
 ### Performance
 
-| Operation | Python | Rust | Gain |
+| Operation | Python | Rust | Speedup |
 |---|---|---|---|
-| Startup du serveur MCP | 150-300 ms (interpreteur + imports) | 2-5 ms | **30-60x** |
-| Premiere requete (cold start) | 200+ ms (build cache NetworkX depuis SQLite) | <1 ms (graphe deja en memoire) | **200x** |
-| Stats du graphe | 5 ms (COUNT queries SQL) | <0.1 ms (O(1) `.node_count()`) | **50x** |
-| Recherche de noeuds | 10 ms (SQL LIKE) | <0.5 ms (HashMap iteration) | **20x** |
-| Save apres build | 100 ms (INSERT SQLite) | 20 ms (serialize+zstd+write) | **5x** |
-| Build complet (tree-sitter) | ~3s | ~2.5s | 1.2x (tree-sitter domine) |
+| MCP server startup | 150-300 ms (interpreter + imports) | 2-5 ms | **30-60x** |
+| First query (cold start) | 200+ ms (build NetworkX cache from SQLite) | <1 ms (graph already in memory) | **200x** |
+| Graph stats | 5 ms (COUNT SQL queries) | <0.1 ms (O(1) `.node_count()`) | **50x** |
+| Node search | 10 ms (SQL LIKE) | <0.5 ms (HashMap iteration) | **20x** |
+| Save after build | 100 ms (INSERT SQLite) | 20 ms (serialize+zstd+write) | **5x** |
+| Full build (tree-sitter) | ~3s | ~2.5s | 1.2x (tree-sitter dominates) |
 
 ### Architecture
 
 | Aspect | Python | Rust |
 |---|---|---|
-| Stockage | SQLite WAL + 3 tables + 7 indexes + cache lazy petgraph | **StableGraph en memoire**, persiste en bincode+zstd |
-| Format sur disque | `.code-review-graph/graph.db` (SQLite) | `.code-review-graph/graph.bin.zst` (4-10x plus petit) |
-| Cache graphe | Lazy — reconstruit au 1er `get_impact_radius()` | **Toujours en memoire** — zero cold start |
-| Concurrence | SQLite WAL (lecteurs multiples) | Arc\<Mutex\> en memoire (single-writer, zero I/O pour les reads) |
-| Integrite | SQLite journal | CRC-32 header + magic bytes + atomic write (tempfile+rename) |
-| Embeddings | SQLite table | bincode/zstd (meme format que le graphe) |
+| Storage | SQLite WAL + 3 tables + 7 indexes + lazy petgraph cache | **In-memory StableGraph**, persisted as bincode+zstd |
+| On-disk format | `.code-review-graph/graph.db` (SQLite) | `.code-review-graph/graph.bin.zst` (4-10x smaller) |
+| Graph cache | Lazy — rebuilt on first `get_impact_radius()` | **Always in memory** — zero cold start |
+| Concurrency | SQLite WAL (multiple readers) | Arc\<Mutex\> in memory (single-writer, zero I/O for reads) |
+| Integrity | SQLite journal | CRC-32 header + magic bytes + atomic write (tempfile+rename) |
+| Embeddings | SQLite table | bincode/zstd (same format as graph) |
 
 ### Distribution
 
 | Aspect | Python | Rust |
 |---|---|---|
-| Taille installation | ~150 MB (Python + venv + tree-sitter + SQLite) | **28 MB** (binaire unique statique) |
-| Dependencies | Python 3.10+, pip, venv, tree-sitter C libs | **Aucune** |
-| Installation | `pip install` + `code-review-graph install` | Telecharger le binaire + `code-review-graph install` |
-| Cross-platform | Wheels par plateforme | Binaire compile par cible |
-| Temps de build | ~50s (compilation C de SQLite + tree-sitter) | **~20s** (pas de SQLite) |
+| Install size | ~150 MB (Python + venv + tree-sitter + SQLite) | **28 MB** (single static binary) |
+| Dependencies | Python 3.10+, pip, venv, tree-sitter C libs | **None** |
+| Installation | `pip install` + `code-review-graph install` | Download binary + `code-review-graph install` |
+| Cross-platform | Platform-specific wheels | Compiled binary per target |
+| Build time | ~50s (C compilation of SQLite + tree-sitter) | **~20s** (no SQLite) |
 
-### Fonctionnalites ajoutees
+### Added features
 
 | Feature | Python | Rust |
 |---|---|---|
-| Background watcher dans le serveur MCP | Non (commande separee) | **Oui** — auto-start au `serve` |
-| Lazy stale-check par requete | Non | **Oui** — `git status` avant chaque query |
-| Flag `--quiet` pour hooks | Non | **Oui** — `code-review-graph update -q` |
-| Compression du graphe | Non | **zstd level 3** — ratio 4-5x |
-| Checksum d'integrite | Non | **CRC-32** + magic bytes + auto-rebuild sur corruption |
-| Atomic writes | Non | **tempfile + rename** — pas de corruption sur crash |
+| Background watcher in MCP server | No (separate command) | **Yes** — auto-starts on `serve` |
+| Lazy stale-check per request | No | **Yes** — `git status` before each query |
+| `--quiet` flag for hooks | No | **Yes** — `code-review-graph update -q` |
+| Graph compression | No | **zstd level 3** — 4-5x ratio |
+| Integrity checksum | No | **CRC-32** + magic bytes + auto-rebuild on corruption |
+| Atomic writes | No | **tempfile + rename** — no corruption on crash |
 
 ---
 
-## Avantages vs Claude Code sans code-review-graph
+## Advantages vs Claude Code without code-review-graph
 
-Sans le graphe, Claude Code doit :
-1. Lire **tous les fichiers modifies** + leurs dependances probables
-2. Deviner le blast radius d'un changement
-3. Scanner des milliers de tokens pour trouver les 5 fichiers pertinents
+Without the graph, Claude Code must:
+1. Read **all changed files** plus their likely dependencies
+2. Guess the blast radius of a change
+3. Scan thousands of tokens to find the 5 relevant files
 
-Avec code-review-graph :
-- **6.8x moins de tokens en moyenne** (jusqu'a 49x sur les monorepos)
-- **Blast radius precis** — sait exactement quels fonctions/classes/tests sont impactes
-- **Qualite de review superieure** — score 8.8/10 vs 7.2/10 sur les benchmarks
-- **14 langages supportes** avec extraction complete des fonctions, classes, imports, appels, heritage et tests
+With code-review-graph:
+- **6.8x fewer tokens on average** (up to 49x on monorepos)
+- **Precise blast radius** — knows exactly which functions/classes/tests are impacted
+- **Higher review quality** — scored 8.8/10 vs 7.2/10 on benchmarks
+- **14 languages supported** with full extraction of functions, classes, imports, calls, inheritance, and tests
 
-Les benchmarks du projet original (reproduits avec permission) :
+Benchmarks from the original project (reproduced with permission):
 
-| Repo | Taille | Tokens standard | Tokens avec graphe | Reduction | Qualite |
+| Repo | Size | Standard tokens | Tokens with graph | Reduction | Quality |
 |---|---:|---:|---:|---:|---|
-| httpx | 125 fichiers | 12,507 | 458 | **26.2x** | 9.0 vs 7.0 |
-| FastAPI | 2,915 fichiers | 5,495 | 871 | **8.1x** | 8.5 vs 7.5 |
-| Next.js | 27,732 fichiers | 21,614 | 4,457 | **6.0x** | 9.0 vs 7.0 |
+| httpx | 125 files | 12,507 | 458 | **26.2x** | 9.0 vs 7.0 |
+| FastAPI | 2,915 files | 5,495 | 871 | **8.1x** | 8.5 vs 7.5 |
+| Next.js | 27,732 files | 21,614 | 4,457 | **6.0x** | 9.0 vs 7.0 |
 
 ---
 
-## Langages supportes
+## Supported languages
 
 Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, C#, Ruby, PHP, Swift, Vue
 
-> Kotlin : les tables AST sont pretes dans le code, en attente d'une version compatible de `tree-sitter-kotlin` (0.3 depend de tree-sitter 0.20, incompatible avec notre 0.24).
+> Kotlin: AST tables are ready in the code, waiting for a compatible `tree-sitter-kotlin` release (0.3 depends on tree-sitter 0.20, incompatible with our 0.24).
 
 ---
 
 ## CLI
 
 ```
-code-review-graph install     # Enregistrer le serveur MCP (.mcp.json)
-code-review-graph build       # Parse complet du codebase
-code-review-graph update      # Mise a jour incrementale (fichiers modifies)
-code-review-graph status      # Statistiques du graphe
-code-review-graph watch       # Auto-update sur changements de fichiers
-code-review-graph visualize   # Generer une visualisation HTML interactive
-code-review-graph serve       # Demarrer le serveur MCP (stdio)
+code-review-graph install     # Register MCP server (.mcp.json)
+code-review-graph build       # Full codebase parse
+code-review-graph update      # Incremental update (changed files only)
+code-review-graph status      # Graph statistics
+code-review-graph watch       # Auto-update on file changes
+code-review-graph visualize   # Generate interactive HTML visualization
+code-review-graph serve       # Start MCP server (stdio)
 ```
 
-Options utiles :
-- `--repo PATH` — specifier le repertoire du projet
-- `--quiet` / `-q` — mode silencieux (pour les hooks)
-- `--base REF` — ref git pour le diff incremental (defaut: `HEAD~1`)
+Useful options:
+- `--repo PATH` — specify project directory
+- `--quiet` / `-q` — silent mode (for hooks)
+- `--base REF` — git ref for incremental diff (default: `HEAD~1`)
 
 ---
 
-## Outils MCP
+## MCP Tools
 
-Claude utilise ces outils automatiquement une fois le graphe construit.
+Claude uses these tools automatically once the graph is built.
 
-| Outil | Description |
+| Tool | Description |
 |---|---|
-| `build_or_update_graph` | Construire ou mettre a jour le graphe |
-| `get_impact_radius` | Blast radius des fichiers modifies |
-| `get_review_context` | Contexte de review optimise en tokens |
-| `query_graph` | Callers, callees, imports, heritage, tests |
-| `semantic_search_nodes` | Recherche par nom ou similarite |
-| `embed_graph` | Calculer les embeddings vectoriels |
-| `list_graph_stats` | Taille et sante du graphe |
-| `get_docs_section` | Sections de documentation |
-| `find_large_functions` | Fonctions/classes depassant un seuil de lignes |
+| `build_or_update_graph` | Build or update the graph |
+| `get_impact_radius` | Blast radius of changed files |
+| `get_review_context` | Token-optimized review context |
+| `query_graph` | Callers, callees, imports, inheritance, tests |
+| `semantic_search_nodes` | Search by name or similarity |
+| `embed_graph` | Compute vector embeddings |
+| `list_graph_stats` | Graph size and health |
+| `get_docs_section` | Documentation sections |
+| `find_large_functions` | Functions/classes exceeding a line-count threshold |
 
 ---
 
 ## Configuration
 
-### Exclure des fichiers
+### Exclude files
 
-Creer `.code-review-graphignore` a la racine du projet :
+Create `.code-review-graphignore` at the project root:
 
 ```
 generated/**
@@ -201,9 +201,9 @@ generated/**
 vendor/**
 ```
 
-### Hook PostToolUse (graphe toujours frais)
+### PostToolUse hook (always-fresh graph)
 
-Ajouter dans `.claude/settings.json` :
+Add to `.claude/settings.json`:
 
 ```json
 {
@@ -223,45 +223,45 @@ Ajouter dans `.claude/settings.json` :
 ```
 .code-review-graph/
 ├── graph.bin.zst         # StableGraph + indexes (bincode + zstd)
-├── embeddings.bin.zst    # Vecteurs d'embeddings (meme format)
-└── .gitignore            # Auto-genere
+├── embeddings.bin.zst    # Vector embeddings (same format)
+└── .gitignore            # Auto-generated
 ```
 
 ```
 src/
-├── parser.rs         # Tree-sitter multi-langages (13 grammaires)
+├── parser.rs         # Multi-language tree-sitter parser (13 grammars)
 ├── graph.rs          # StableGraph + bincode/zstd persistence
 ├── incremental.rs    # Git ops, full/incremental build, watch
-├── tools.rs          # 9 outils MCP
-├── server.rs         # Serveur MCP rmcp (stdio) + background watcher
+├── tools.rs          # 9 MCP tools
+├── server.rs         # rmcp MCP server (stdio) + background watcher
 ├── main.rs           # CLI (clap)
-├── types.rs          # Types partages
-├── embeddings.rs     # Store vectoriel
-├── visualization.rs  # Export HTML D3.js
-├── tsconfig.rs       # Resolver d'alias TypeScript
-├── error.rs          # Types d'erreurs
-└── lib.rs            # Racine du crate
+├── types.rs          # Shared types
+├── embeddings.rs     # Vector embedding store
+├── visualization.rs  # Interactive D3.js HTML export
+├── tsconfig.rs       # TypeScript path alias resolver
+├── error.rs          # Error types
+└── lib.rs            # Crate root
 ```
 
 ---
 
-## Build depuis les sources
+## Building from source
 
 ```bash
-git clone https://github.com/votre-user/code-review-graph-rust.git
+git clone https://github.com/JF10R/code-review-graph-rust.git
 cd code-review-graph-rust
 cargo build --release
-# Binaire: target/release/code-review-graph
+# Binary: target/release/code-review-graph
 ```
 
 ---
 
 ## Credits
 
-Rewrite Rust du projet [code-review-graph](https://github.com/tirth8205/code-review-graph) par [Tirth Kanani](https://github.com/tirth8205). L'architecture, les algorithmes de blast radius, et les benchmarks sont issus du projet original.
+Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-graph) by [Tirth Kanani](https://github.com/tirth8205). The architecture, blast-radius algorithms, and benchmarks originate from the original project.
 
-## Licence
+## License
 
-MIT. Voir [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
-Le projet original est egalement sous licence MIT.
+The original project is also MIT-licensed.
