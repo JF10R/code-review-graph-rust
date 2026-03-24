@@ -74,6 +74,24 @@ const EDGE_COLS: &str =
 // In-memory graph cache
 // ---------------------------------------------------------------------------
 
+/// Insert `name` into the petgraph (and index map) only when not already present.
+/// Returns the NodeIndex without a second clone of `name`.
+fn get_or_insert_node(
+    graph: &mut DiGraph<String, EdgeKind>,
+    index: &mut HashMap<String, NodeIndex>,
+    name: String,
+) -> NodeIndex {
+    use std::collections::hash_map::Entry;
+    match index.entry(name) {
+        Entry::Occupied(e) => *e.get(),
+        Entry::Vacant(e) => {
+            let idx = graph.add_node(e.key().clone());
+            e.insert(idx);
+            idx
+        }
+    }
+}
+
 struct GraphCache {
     graph: DiGraph<String, EdgeKind>,
     node_index: HashMap<String, NodeIndex>,
@@ -97,12 +115,8 @@ impl GraphCache {
         for row in rows {
             let (src, tgt, kind_str) = row?;
             let edge_kind = EdgeKind::from_str(&kind_str).unwrap_or(EdgeKind::Calls);
-            let src_idx = *node_index
-                .entry(src.clone())
-                .or_insert_with(|| graph.add_node(src.clone()));
-            let tgt_idx = *node_index
-                .entry(tgt.clone())
-                .or_insert_with(|| graph.add_node(tgt.clone()));
+            let src_idx = get_or_insert_node(&mut graph, &mut node_index, src);
+            let tgt_idx = get_or_insert_node(&mut graph, &mut node_index, tgt);
             graph.add_edge(src_idx, tgt_idx, edge_kind);
         }
 
@@ -165,9 +179,9 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Commit pending changes.
+    /// No-op: rusqlite auto-commits unless in an explicit transaction.
+    /// Kept for API compatibility with incremental.rs callers.
     pub fn commit(&self) -> Result<()> {
-        // rusqlite auto-commits each statement unless in an explicit transaction.
         Ok(())
     }
 
@@ -175,8 +189,12 @@ impl GraphStore {
 
     /// Get a node by qualified name.
     pub fn get_node(&self, qualified_name: &str) -> Result<Option<GraphNode>> {
-        let sql = format!("SELECT {NODE_COLS} FROM nodes WHERE qualified_name = ?");
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        const SQL: &str = concat!(
+            "SELECT kind, name, qualified_name, file_path, line_start, line_end, \
+             language, is_test, docstring, signature, body_hash, file_hash \
+             FROM nodes WHERE qualified_name = ?"
+        );
+        let mut stmt = self.conn.prepare_cached(SQL)?;
         let result = stmt.query_row(params![qualified_name], row_to_node);
         match result {
             Ok(n) => Ok(Some(n)),
@@ -187,8 +205,12 @@ impl GraphStore {
 
     /// Get all nodes in a file.
     pub fn get_nodes_by_file(&self, file_path: &str) -> Result<Vec<GraphNode>> {
-        let sql = format!("SELECT {NODE_COLS} FROM nodes WHERE file_path = ?");
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        const SQL: &str = concat!(
+            "SELECT kind, name, qualified_name, file_path, line_start, line_end, \
+             language, is_test, docstring, signature, body_hash, file_hash \
+             FROM nodes WHERE file_path = ?"
+        );
+        let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(params![file_path], row_to_node)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -275,16 +297,20 @@ impl GraphStore {
 
     /// Get edges originating from a qualified name.
     pub fn get_edges_by_source(&self, qualified_name: &str) -> Result<Vec<GraphEdge>> {
-        let sql = format!("SELECT {EDGE_COLS} FROM edges WHERE source_qualified = ?");
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        const SQL: &str =
+            "SELECT kind, source_qualified, target_qualified, file_path, line \
+             FROM edges WHERE source_qualified = ?";
+        let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(params![qualified_name], row_to_edge)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Get edges targeting a qualified name.
     pub fn get_edges_by_target(&self, qualified_name: &str) -> Result<Vec<GraphEdge>> {
-        let sql = format!("SELECT {EDGE_COLS} FROM edges WHERE target_qualified = ?");
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        const SQL: &str =
+            "SELECT kind, source_qualified, target_qualified, file_path, line \
+             FROM edges WHERE target_qualified = ?";
+        let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(params![qualified_name], row_to_edge)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -294,9 +320,10 @@ impl GraphStore {
     /// CALLS edges often store unqualified target names (e.g. `foo` rather than
     /// `file.ts::foo`). Use this to find callers even when qualified lookup fails.
     pub fn search_edges_by_target_name(&self, name: &str) -> Result<Vec<GraphEdge>> {
-        let sql =
-            format!("SELECT {EDGE_COLS} FROM edges WHERE target_qualified = ? AND kind = 'CALLS'");
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+        const SQL: &str =
+            "SELECT kind, source_qualified, target_qualified, file_path, line \
+             FROM edges WHERE target_qualified = ? AND kind = 'CALLS'";
+        let mut stmt = self.conn.prepare_cached(SQL)?;
         let rows = stmt.query_map(params![name], row_to_edge)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
@@ -681,14 +708,6 @@ fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphEdge> {
         file_path: row.get(3)?,
         line: row.get::<_, i64>(4)? as usize,
     })
-}
-
-/// Collect a rusqlite MappedRows iterator into a Vec, propagating errors.
-fn collect_rows<T, F>(rows: rusqlite::MappedRows<'_, F>) -> Result<Vec<T>>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-{
-    rows.map(|r| r.map_err(Into::into)).collect()
 }
 
 fn unix_now() -> f64 {

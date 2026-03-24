@@ -19,7 +19,7 @@ use crate::embeddings::{embed_all_nodes, semantic_search, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
-use crate::types::{edge_to_dict, node_to_dict};
+use crate::types::{edge_to_dict, node_to_dict, EdgeKind};
 
 /// Common JS/TS builtin method names filtered from callers_of results.
 /// "Who calls .map()?" returns hundreds of hits and is never useful.
@@ -324,7 +324,7 @@ pub fn query_graph(
     match pattern {
         "callers_of" => {
             for e in store.get_edges_by_target(&qn)? {
-                if e.kind.as_str() == "CALLS" {
+                if e.kind == EdgeKind::Calls {
                     if let Some(caller) = store.get_node(&e.source_qualified)? {
                         results.push(node_to_dict(&caller));
                     }
@@ -345,7 +345,7 @@ pub fn query_graph(
         }
         "callees_of" => {
             for e in store.get_edges_by_source(&qn)? {
-                if e.kind.as_str() == "CALLS" {
+                if e.kind == EdgeKind::Calls {
                     if let Some(callee) = store.get_node(&e.target_qualified)? {
                         results.push(node_to_dict(&callee));
                     }
@@ -355,7 +355,7 @@ pub fn query_graph(
         }
         "imports_of" => {
             for e in store.get_edges_by_source(&qn)? {
-                if e.kind.as_str() == "IMPORTS_FROM" {
+                if e.kind == EdgeKind::ImportsFrom {
                     results.push(json!({ "import_target": e.target_qualified }));
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -366,7 +366,7 @@ pub fn query_graph(
                 .map(|n| n.file_path.clone())
                 .unwrap_or_else(|| root.join(target).to_string_lossy().into_owned());
             for e in store.get_edges_by_target(&abs_target)? {
-                if e.kind.as_str() == "IMPORTS_FROM" {
+                if e.kind == EdgeKind::ImportsFrom {
                     results.push(json!({ "importer": e.source_qualified, "file": e.file_path }));
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -374,7 +374,7 @@ pub fn query_graph(
         }
         "children_of" => {
             for e in store.get_edges_by_source(&qn)? {
-                if e.kind.as_str() == "CONTAINS" {
+                if e.kind == EdgeKind::Contains {
                     if let Some(child) = store.get_node(&e.target_qualified)? {
                         results.push(node_to_dict(&child));
                     }
@@ -383,7 +383,7 @@ pub fn query_graph(
         }
         "tests_for" => {
             for e in store.get_edges_by_target(&qn)? {
-                if e.kind.as_str() == "TESTED_BY" {
+                if e.kind == EdgeKind::TestedBy {
                     if let Some(t) = store.get_node(&e.source_qualified)? {
                         results.push(node_to_dict(&t));
                     }
@@ -404,7 +404,7 @@ pub fn query_graph(
         }
         "inheritors_of" => {
             for e in store.get_edges_by_target(&qn)? {
-                if matches!(e.kind.as_str(), "INHERITS" | "IMPLEMENTS") {
+                if matches!(e.kind, EdgeKind::Inherits | EdgeKind::Implements) {
                     if let Some(child) = store.get_node(&e.source_qualified)? {
                         results.push(node_to_dict(&child));
                     }
@@ -499,7 +499,7 @@ pub fn get_review_context(
         context["source_snippets"] = Value::Object(snippets);
     }
 
-    let guidance = generate_review_guidance(&impact, &files);
+    let guidance = generate_review_guidance(&impact);
     context["review_guidance"] = json!(guidance);
 
     let summary_parts = vec![
@@ -889,18 +889,15 @@ fn extract_relevant_lines(
 }
 
 /// Generate review guidance from impact analysis.
-fn generate_review_guidance(
-    impact: &crate::types::ImpactResult,
-    _changed_files: &[String],
-) -> String {
+fn generate_review_guidance(impact: &crate::types::ImpactResult) -> String {
     let mut parts: Vec<String> = vec![];
 
     // Untested changed functions
     let changed_funcs: Vec<_> = impact.changed_nodes.iter()
-        .filter(|n| n.kind.as_str() == "Function")
+        .filter(|n| n.kind == crate::types::NodeKind::Function)
         .collect();
     let tested_sources: std::collections::HashSet<&str> = impact.edges.iter()
-        .filter(|e| e.kind.as_str() == "TESTED_BY")
+        .filter(|e| e.kind == EdgeKind::TestedBy)
         .map(|e| e.source_qualified.as_str())
         .collect();
     let untested: Vec<_> = changed_funcs.iter()
@@ -925,7 +922,7 @@ fn generate_review_guidance(
 
     // Inheritance changes
     let inheritance_count = impact.edges.iter()
-        .filter(|e| matches!(e.kind.as_str(), "INHERITS" | "IMPLEMENTS"))
+        .filter(|e| matches!(e.kind, EdgeKind::Inherits | EdgeKind::Implements))
         .count();
     if inheritance_count > 0 {
         parts.push(format!(

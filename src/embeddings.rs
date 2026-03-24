@@ -80,6 +80,7 @@ impl EmbeddingStore {
     }
 
     /// Remove a node's embedding.
+    #[allow(dead_code)]
     pub fn remove_node(&self, qualified_name: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM embeddings WHERE qualified_name = ?1",
@@ -139,6 +140,7 @@ pub fn semantic_search(
 }
 
 /// Convert a GraphNode to embeddable text (mirrors Python `_node_to_text`).
+#[allow(dead_code)]
 pub fn node_to_text(node: &GraphNode) -> String {
     let kind_lower = node.kind.as_str().to_lowercase();
     let mut parts: Vec<&str> = vec![&node.name];

@@ -87,7 +87,9 @@ pub fn get_db_path(repo_root: &Path) -> PathBuf {
     let crg_dir = repo_root.join(".code-review-graph");
     let new_db = crg_dir.join("graph.db");
 
-    fs::create_dir_all(&crg_dir).unwrap_or_default();
+    if let Err(e) = fs::create_dir_all(&crg_dir) {
+        warn!("Could not create {}: {}", crg_dir.display(), e);
+    }
 
     let inner_gitignore = crg_dir.join(".gitignore");
     if !inner_gitignore.exists() {
@@ -156,6 +158,7 @@ fn now_iso() -> String {
 fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
     let timeout = git_timeout();
     let repo_root = repo_root.to_path_buf();
+    // Clone args into owned Strings so the slice can be moved into the spawned thread.
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -326,6 +329,39 @@ pub struct BuildError {
     pub error: String,
 }
 
+/// Parse `rel_path` (relative to `repo_root`) and store its nodes/edges.
+///
+/// Returns `(node_count, edge_count)` on success, or a `BuildError` on failure.
+fn parse_and_store_file(
+    parser: &CodeParser,
+    repo_root: &Path,
+    rel_path: &str,
+    store: &mut GraphStore,
+) -> std::result::Result<(usize, usize), BuildError> {
+    let full_path = repo_root.join(rel_path);
+    let source = std::fs::read(&full_path).map_err(|e| BuildError {
+        file: rel_path.to_owned(),
+        error: e.to_string(),
+    })?;
+    let fhash = sha256_bytes(&source);
+    let (nodes, edges) = parser.parse_bytes(&full_path, &source).map_err(|e| {
+        warn!("Error parsing {}: {}", rel_path, e);
+        BuildError {
+            file: rel_path.to_owned(),
+            error: e.to_string(),
+        }
+    })?;
+    let n = nodes.len();
+    let e = edges.len();
+    store
+        .store_file_nodes_edges(&full_path.to_string_lossy(), &nodes, &edges, &fhash)
+        .map_err(|err| BuildError {
+            file: rel_path.to_owned(),
+            error: err.to_string(),
+        })?;
+    Ok((n, e))
+}
+
 /// Full rebuild of the entire graph.
 pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResult> {
     let parser = CodeParser::new();
@@ -349,44 +385,12 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
     let mut errors = Vec::new();
 
     for (i, rel_path) in files.iter().enumerate() {
-        let full_path = repo_root.join(rel_path);
-        match fs::read(&full_path) {
-            Ok(source) => {
-                let fhash = sha256_bytes(&source);
-                match parser.parse_bytes(&full_path, &source) {
-                    Ok((nodes, edges)) => {
-                        let n = nodes.len();
-                        let e = edges.len();
-                        if let Err(err) = store.store_file_nodes_edges(
-                            &full_path.to_string_lossy(),
-                            &nodes,
-                            &edges,
-                            &fhash,
-                        ) {
-                            errors.push(BuildError {
-                                file: rel_path.clone(),
-                                error: err.to_string(),
-                            });
-                        } else {
-                            total_nodes += n;
-                            total_edges += e;
-                        }
-                    }
-                    Err(err) => {
-                        warn!("Error parsing {}: {}", rel_path, err);
-                        errors.push(BuildError {
-                            file: rel_path.clone(),
-                            error: err.to_string(),
-                        });
-                    }
-                }
+        match parse_and_store_file(&parser, repo_root, rel_path, store) {
+            Ok((n, e)) => {
+                total_nodes += n;
+                total_edges += e;
             }
-            Err(err) => {
-                errors.push(BuildError {
-                    file: rel_path.clone(),
-                    error: err.to_string(),
-                });
-            }
+            Err(err) => errors.push(err),
         }
         let idx = i + 1;
         if idx % 50 == 0 || idx == file_count {
@@ -464,49 +468,25 @@ pub fn incremental_update(
             continue;
         }
 
-        match fs::read(&abs_path) {
+        // Hash-based skip: avoid re-parsing files whose content hasn't changed.
+        let skip = match fs::read(&abs_path) {
             Ok(source) => {
                 let fhash = sha256_bytes(&source);
-                // Hash-based skip: check if content unchanged
                 let existing = store.get_nodes_by_file(&abs_path.to_string_lossy())?;
-                if existing.first().map(|n| n.file_hash.as_str()) == Some(fhash.as_str()) {
-                    continue;
-                }
+                existing.first().map(|n| n.file_hash.as_str()) == Some(fhash.as_str())
+            }
+            Err(_) => false,
+        };
+        if skip {
+            continue;
+        }
 
-                match parser.parse_bytes(&abs_path, &source) {
-                    Ok((nodes, edges)) => {
-                        let n = nodes.len();
-                        let e = edges.len();
-                        if let Err(err) = store.store_file_nodes_edges(
-                            &abs_path.to_string_lossy(),
-                            &nodes,
-                            &edges,
-                            &fhash,
-                        ) {
-                            errors.push(BuildError {
-                                file: rel_path.clone(),
-                                error: err.to_string(),
-                            });
-                        } else {
-                            total_nodes += n;
-                            total_edges += e;
-                        }
-                    }
-                    Err(err) => {
-                        warn!("Error parsing {}: {}", rel_path, err);
-                        errors.push(BuildError {
-                            file: rel_path.clone(),
-                            error: err.to_string(),
-                        });
-                    }
-                }
+        match parse_and_store_file(&parser, repo_root, rel_path, store) {
+            Ok((n, e)) => {
+                total_nodes += n;
+                total_edges += e;
             }
-            Err(err) => {
-                errors.push(BuildError {
-                    file: rel_path.clone(),
-                    error: err.to_string(),
-                });
-            }
+            Err(err) => errors.push(err),
         }
     }
 

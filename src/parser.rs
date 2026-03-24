@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use tree_sitter::{Language, Node, Parser};
@@ -172,6 +173,26 @@ impl LangTypes {
     }
 }
 
+// Lazily-built cache: one LangTypes per language, constructed at most once.
+static LANG_TYPES_CACHE: OnceLock<HashMap<&'static str, LangTypes>> = OnceLock::new();
+
+fn get_lang_types(language: &str) -> &'static LangTypes {
+    let cache = LANG_TYPES_CACHE.get_or_init(|| {
+        let mut m = HashMap::new();
+        for lang in &[
+            "python", "javascript", "typescript", "tsx", "rust", "go", "java",
+            "c", "cpp", "csharp", "ruby", "php", "kotlin", "swift",
+        ] {
+            m.insert(*lang, LangTypes::new(lang));
+        }
+        m
+    });
+    cache.get(language).expect("unsupported language")
+}
+
+// Cached Ruby import regex — compiled once, reused on every Ruby parse.
+static RUBY_IMPORT_RE: OnceLock<regex::Regex> = OnceLock::new();
+
 // ---------------------------------------------------------------------------
 // Test detection patterns
 // ---------------------------------------------------------------------------
@@ -293,17 +314,17 @@ fn get_params(node: &Node, source: &[u8]) -> String {
 
 fn get_return_type(node: &Node, language: &str, source: &[u8]) -> String {
     let mut cur = node.walk();
-    let children: Vec<Node> = node.children(&mut cur).collect();
-    for (i, child) in children.iter().enumerate() {
+    let mut iter = node.children(&mut cur).peekable();
+    while let Some(child) = iter.next() {
         if matches!(
             child.kind(),
             "type" | "return_type" | "type_annotation" | "return_type_definition"
         ) {
-            return node_text(child, source).to_owned();
+            return node_text(&child, source).to_owned();
         }
-        // Python: -> annotation
+        // Python: -> annotation (next sibling is the return type)
         if language == "python" && child.kind() == "->" {
-            if let Some(next) = children.get(i + 1) {
+            if let Some(next) = iter.peek() {
                 return node_text(next, source).to_owned();
             }
         }
@@ -527,7 +548,9 @@ fn extract_imports(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
         }
         "ruby" => {
             if text.contains("require") {
-                let re = regex::Regex::new(r#"['"](.+?)['"]"#).unwrap();
+                let re = RUBY_IMPORT_RE.get_or_init(|| {
+                    regex::Regex::new(r#"['"](.+?)['"]"#).unwrap()
+                });
                 if let Some(cap) = re.captures(text) {
                     imports.push(cap[1].to_owned());
                 }
@@ -772,24 +795,31 @@ fn collect_file_scope(
 
 const MAX_AST_DEPTH: usize = 180;
 
-#[allow(clippy::too_many_arguments)]
+/// Walk context passed by reference through the recursive AST traversal,
+/// replacing the previous 12-parameter signature.
+struct WalkCtx<'a> {
+    source: &'a [u8],
+    language: &'a str,
+    file_path: &'a str,
+    import_map: &'a HashMap<String, String>,
+    defined_names: &'a HashSet<String>,
+    lt: &'a LangTypes,
+}
+
 fn extract_from_tree(
     root: &Node,
-    source: &[u8],
-    language: &str,
-    file_path: &str,
+    ctx: &WalkCtx<'_>,
     nodes: &mut Vec<NodeInfo>,
     edges: &mut Vec<EdgeInfo>,
     enclosing_class: Option<&str>,
     enclosing_func: Option<&str>,
-    import_map: &HashMap<String, String>,
-    defined_names: &HashSet<String>,
-    lt: &LangTypes,
     depth: usize,
 ) {
     if depth > MAX_AST_DEPTH {
         return;
     }
+
+    let WalkCtx { source, language, file_path, import_map, defined_names, lt } = ctx;
 
     let mut cur = root.walk();
     for child in root.children(&mut cur) {
@@ -806,10 +836,10 @@ fn extract_from_tree(
                     name: name.clone(),
                     qualified_name: qualified.clone(),
                     kind: NodeKind::Class,
-                    file_path: file_path.to_owned(),
+                    file_path: file_path.to_string(),
                     line_start,
                     line_end,
-                    language: language.to_owned(),
+                    language: language.to_string(),
                     is_test: false,
                     docstring: String::new(),
                     signature: String::new(),
@@ -817,10 +847,10 @@ fn extract_from_tree(
                 });
 
                 edges.push(EdgeInfo {
-                    source_qualified: file_path.to_owned(),
+                    source_qualified: file_path.to_string(),
                     target_qualified: qualified.clone(),
                     kind: EdgeKind::Contains,
-                    file_path: file_path.to_owned(),
+                    file_path: file_path.to_string(),
                     line: line_start,
                 });
 
@@ -830,25 +860,12 @@ fn extract_from_tree(
                         source_qualified: qualified.clone(),
                         target_qualified: base,
                         kind: EdgeKind::Inherits,
-                        file_path: file_path.to_owned(),
+                        file_path: file_path.to_string(),
                         line: line_start,
                     });
                 }
 
-                extract_from_tree(
-                    &child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    Some(&name),
-                    None,
-                    import_map,
-                    defined_names,
-                    lt,
-                    depth + 1,
-                );
+                extract_from_tree(&child, ctx, nodes, edges, Some(&name), None, depth + 1);
                 continue;
             }
         }
@@ -868,10 +885,10 @@ fn extract_from_tree(
                     name: name.clone(),
                     qualified_name: qualified.clone(),
                     kind,
-                    file_path: file_path.to_owned(),
+                    file_path: file_path.to_string(),
                     line_start,
                     line_end,
-                    language: language.to_owned(),
+                    language: language.to_string(),
                     is_test,
                     docstring: doc,
                     signature: sig,
@@ -880,30 +897,17 @@ fn extract_from_tree(
 
                 let container = match enclosing_class {
                     Some(cls) => qualify(cls, file_path, None),
-                    None => file_path.to_owned(),
+                    None => file_path.to_string(),
                 };
                 edges.push(EdgeInfo {
                     source_qualified: container,
                     target_qualified: qualified.clone(),
                     kind: EdgeKind::Contains,
-                    file_path: file_path.to_owned(),
+                    file_path: file_path.to_string(),
                     line: line_start,
                 });
 
-                extract_from_tree(
-                    &child,
-                    source,
-                    language,
-                    file_path,
-                    nodes,
-                    edges,
-                    enclosing_class,
-                    Some(&name),
-                    import_map,
-                    defined_names,
-                    lt,
-                    depth + 1,
-                );
+                extract_from_tree(&child, ctx, nodes, edges, enclosing_class, Some(&name), depth + 1);
                 continue;
             }
         }
@@ -911,18 +915,18 @@ fn extract_from_tree(
         // --- Imports ---
         if lt.imp.contains(node_type) {
             // Ruby: `call` is also the call_type; only emit import for "require" calls.
-            let is_ruby_require = language != "ruby" || node_text(&child, source).contains("require");
+            let is_ruby_require = *language != "ruby" || node_text(&child, source).contains("require");
             if is_ruby_require {
                 for target in extract_imports(&child, language, source) {
                     edges.push(EdgeInfo {
-                        source_qualified: file_path.to_owned(),
+                        source_qualified: file_path.to_string(),
                         target_qualified: target,
                         kind: EdgeKind::ImportsFrom,
-                        file_path: file_path.to_owned(),
+                        file_path: file_path.to_string(),
                         line: child.start_position().row + 1,
                     });
                 }
-                if language != "ruby" {
+                if *language != "ruby" {
                     continue;
                 }
             }
@@ -932,7 +936,7 @@ fn extract_from_tree(
         if lt.call.contains(node_type) {
             if let Some(call_name) = get_call_name(&child, source) {
                 // JS/TS test-runner wrappers in test files → Test nodes
-                if matches!(language, "javascript" | "typescript" | "tsx")
+                if matches!(*language, "javascript" | "typescript" | "tsx")
                     && is_test_file(file_path)
                     && TEST_RUNNER_NAMES.contains(&call_name.as_str())
                 {
@@ -949,10 +953,10 @@ fn extract_from_tree(
                         name: synthetic_name.clone(),
                         qualified_name: qualified.clone(),
                         kind: NodeKind::Test,
-                        file_path: file_path.to_owned(),
+                        file_path: file_path.to_string(),
                         line_start,
                         line_end,
-                        language: language.to_owned(),
+                        language: language.to_string(),
                         is_test: true,
                         docstring: String::new(),
                         signature: String::new(),
@@ -961,30 +965,17 @@ fn extract_from_tree(
 
                     let container = match enclosing_func {
                         Some(f) => qualify(f, file_path, enclosing_class),
-                        None => file_path.to_owned(),
+                        None => file_path.to_string(),
                     };
                     edges.push(EdgeInfo {
                         source_qualified: container,
                         target_qualified: qualified.clone(),
                         kind: EdgeKind::Contains,
-                        file_path: file_path.to_owned(),
+                        file_path: file_path.to_string(),
                         line: line_start,
                     });
 
-                    extract_from_tree(
-                        &child,
-                        source,
-                        language,
-                        file_path,
-                        nodes,
-                        edges,
-                        enclosing_class,
-                        Some(&synthetic_name),
-                        import_map,
-                        defined_names,
-                        lt,
-                        depth + 1,
-                    );
+                    extract_from_tree(&child, ctx, nodes, edges, enclosing_class, Some(&synthetic_name), depth + 1);
                     continue;
                 }
 
@@ -996,7 +987,7 @@ fn extract_from_tree(
                         source_qualified: caller,
                         target_qualified: target,
                         kind: EdgeKind::Calls,
-                        file_path: file_path.to_owned(),
+                        file_path: file_path.to_string(),
                         line: child.start_position().row + 1,
                     });
                 }
@@ -1004,20 +995,7 @@ fn extract_from_tree(
         }
 
         // Recurse into all other nodes
-        extract_from_tree(
-            &child,
-            source,
-            language,
-            file_path,
-            nodes,
-            edges,
-            enclosing_class,
-            enclosing_func,
-            import_map,
-            defined_names,
-            lt,
-            depth + 1,
-        );
+        extract_from_tree(&child, ctx, nodes, edges, enclosing_class, enclosing_func, depth + 1);
     }
 }
 
@@ -1097,13 +1075,11 @@ fn emit_tested_by_edges(nodes: &[NodeInfo], edges: &[EdgeInfo]) -> Vec<EdgeInfo>
 // ---------------------------------------------------------------------------
 
 /// Multi-language code parser backed by tree-sitter.
-pub struct CodeParser {
-    _private: (),
-}
+pub struct CodeParser;
 
 impl CodeParser {
     pub fn new() -> Self {
-        Self { _private: () }
+        Self
     }
 
     /// Detect the programming language from a file extension.
@@ -1155,23 +1131,18 @@ impl CodeParser {
             body_hash: body_hash(source),
         });
 
-        let lt = LangTypes::new(language);
-        let (import_map, defined_names) = collect_file_scope(&root, &lt, language, source);
+        let lt = get_lang_types(language);
+        let (import_map, defined_names) = collect_file_scope(&root, lt, language, source);
 
-        extract_from_tree(
-            &root,
+        let ctx = WalkCtx {
             source,
             language,
             file_path,
-            &mut nodes,
-            &mut edges,
-            None,
-            None,
-            &import_map,
-            &defined_names,
-            &lt,
-            0,
-        );
+            import_map: &import_map,
+            defined_names: &defined_names,
+            lt,
+        };
+        extract_from_tree(&root, &ctx, &mut nodes, &mut edges, None, None, 0);
 
         edges = resolve_call_targets_pass(&nodes, edges);
 

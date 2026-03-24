@@ -210,8 +210,7 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     let root: PathBuf = if let Some(r) = repo {
         PathBuf::from(r)
     } else {
-        incremental::find_repo_root(None)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        incremental::find_project_root(None)
     };
 
     let mcp_path = root.join(".mcp.json");
