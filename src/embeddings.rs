@@ -424,7 +424,7 @@ mod candle_impl {
                     .encode_batch(chunk.to_vec(), true)
                     .map_err(|e| CrgError::Other(format!("Tokenize batch: {e}")))?;
 
-                // Single pass: build all three tensor lists (tokenizer already padded to batch-longest)
+                // Tokenizer already padded to batch-longest, so all encodings have equal length
                 let n = chunk.len();
                 let mut ids_list = Vec::with_capacity(n);
                 let mut type_ids_list = Vec::with_capacity(n);
