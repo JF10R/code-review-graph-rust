@@ -129,10 +129,9 @@ fn parse_scm(scm: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>, H
         }
 
         // Extract the outermost node kind when a new S-expression opens.
-        if line.starts_with('(') {
-            let inner = &line[1..];
+        if let Some(inner) = line.strip_prefix('(') {
             let kind_end = inner
-                .find(|c: char| c == ')' || c == ' ')
+                .find([')', ' '])
                 .unwrap_or(inner.len());
             let kind = inner[..kind_end].trim();
             if !kind.is_empty() {
@@ -351,6 +350,7 @@ fn get_docstring(node: &Node, language: &str, source: &[u8]) -> String {
         for child in node.children(&mut cur) {
             if child.kind() == "block" {
                 let mut c2 = child.walk();
+                #[allow(clippy::never_loop)]
                 for stmt in child.children(&mut c2) {
                     if stmt.kind() == "expression_statement" {
                         let mut c3 = stmt.walk();
