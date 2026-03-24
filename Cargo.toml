@@ -30,9 +30,6 @@ tree-sitter-php = "0.24"
 tree-sitter-kotlin = "0.3"
 tree-sitter-swift = "0.7"
 
-# SQLite (embeddings only)
-rusqlite = { version = "0.32", features = ["bundled"] }
-
 # Graph algorithms
 petgraph = { version = "0.6", features = ["serde-1"] }
 

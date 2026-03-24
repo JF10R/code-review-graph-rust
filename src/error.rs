@@ -4,9 +4,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CrgError {
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
