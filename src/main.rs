@@ -95,8 +95,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
         Commands::Build { repo } => {
             let root = resolve_project_root(repo.as_deref(), false)?;
             let db_path = incremental::get_db_path(&root);
-            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
-            let result = incremental::full_build(&root, &store)?;
+            let mut store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            let result = incremental::full_build(&root, &mut store)?;
             println!(
                 "Full build: {} files, {} nodes, {} edges",
                 result.files_parsed, result.total_nodes, result.total_edges
@@ -110,8 +110,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
         Commands::Update { base, repo } => {
             let root = resolve_project_root(repo.as_deref(), true)?;
             let db_path = incremental::get_db_path(&root);
-            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
-            let result = incremental::incremental_update(&root, &store, &base, None)?;
+            let mut store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            let result = incremental::incremental_update(&root, &mut store, &base, None)?;
             println!(
                 "Incremental: {} files updated, {} nodes, {} edges",
                 result.files_updated, result.total_nodes, result.total_edges
@@ -138,8 +138,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
         Commands::Watch { repo } => {
             let root = resolve_project_root(repo.as_deref(), false)?;
             let db_path = incremental::get_db_path(&root);
-            let store = code_review_graph::graph::GraphStore::new(&db_path)?;
-            incremental::watch(&root, &store)?;
+            let mut store = code_review_graph::graph::GraphStore::new(&db_path)?;
+            incremental::watch(&root, &mut store)?;
             store.close()?;
         }
 
