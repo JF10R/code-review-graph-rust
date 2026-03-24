@@ -4,6 +4,11 @@
 //! All tool handlers delegate to `tokio::task::spawn_blocking` to avoid
 //! blocking the async event loop during heavy operations (SQLite writes,
 //! tree-sitter parsing, embedding).
+//!
+//! When started via `code-review-graph serve`, a background OS thread watches
+//! the repository for file changes and incrementally updates the graph stored
+//! on disk. Tool handlers continue to open the store per-call (Option B), so
+//! they always read the latest on-disk snapshot produced by the watcher.
 
 use rmcp::{
     ServerHandler,
@@ -14,7 +19,10 @@ use rmcp::{
     transport,
 };
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Parameter structs — one per tool that takes arguments
@@ -417,8 +425,175 @@ impl ServerHandler for CodeReviewServer {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Resolve a server-level repo root string to a `PathBuf`, or fall back to
+/// the project root auto-detection logic used by `tools.rs`.
+fn resolve_root(repo_root: Option<&str>) -> PathBuf {
+    match repo_root {
+        Some(p) => PathBuf::from(p),
+        None => crate::incremental::find_project_root(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background file watcher (Option B: saves to disk, tools reload per call)
+// ---------------------------------------------------------------------------
+
+/// Spawn a background OS thread that watches `repo_root` for source-file
+/// changes and incrementally updates `graph.bin.zst` on disk.
+///
+/// Uses the same notify debouncer logic as `incremental::watch()` but runs
+/// independently of any `Arc<Mutex<GraphStore>>` — it opens a fresh store,
+/// processes the batch, saves to disk, then drops the store. This keeps the
+/// locking surface minimal and is safe with the per-call `get_store()` pattern
+/// used by the tool handlers.
+fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
+    use notify::RecursiveMode;
+    use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
+    use crate::incremental::{get_db_path, load_ignore_patterns_pub, is_binary_pub, sha256_bytes_pub};
+    use crate::graph::GraphStore;
+    use crate::parser::CodeParser;
+
+    let ignore_patterns = load_ignore_patterns_pub(&repo_root);
+    let parser = CodeParser::new();
+
+    let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
+    let mut debouncer = new_debouncer(Duration::from_millis(300), tx)
+        .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+    debouncer
+        .watcher()
+        .watch(&repo_root, RecursiveMode::Recursive)
+        .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+
+    log::info!(
+        "Background watcher active — watching {}",
+        repo_root.display()
+    );
+
+    for result in rx {
+        let events = match result {
+            Ok(evts) => evts,
+            Err(e) => {
+                log::error!("Watcher error: {:?}", e);
+                continue;
+            }
+        };
+
+        let mut paths_to_update: HashSet<PathBuf> = HashSet::new();
+        let mut paths_to_remove: HashSet<PathBuf> = HashSet::new();
+
+        for event in events {
+            let path = event.path;
+            if path.is_symlink() {
+                continue;
+            }
+            let rel = match path.strip_prefix(&repo_root) {
+                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if crate::incremental::should_ignore_pub(&rel, &ignore_patterns) {
+                continue;
+            }
+            if path.is_file() {
+                if parser.detect_language(&path).is_some() {
+                    paths_to_update.insert(path);
+                }
+            } else {
+                paths_to_remove.insert(path);
+            }
+        }
+
+        if paths_to_update.is_empty() && paths_to_remove.is_empty() {
+            continue;
+        }
+
+        // Open the store once per batch, apply all changes, save, close.
+        let db_path = get_db_path(&repo_root);
+        let mut store = match GraphStore::new(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Background watcher: could not open store: {}", e);
+                continue;
+            }
+        };
+
+        for path in &paths_to_remove {
+            let abs_str = path.to_string_lossy().into_owned();
+            if let Err(e) = store.remove_file_data(&abs_str) {
+                log::error!("Watcher remove {}: {}", abs_str, e);
+            } else {
+                let rel = path
+                    .strip_prefix(&repo_root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| abs_str.clone());
+                log::info!("Watcher removed: {}", rel);
+            }
+        }
+
+        for path in &paths_to_update {
+            if is_binary_pub(path) {
+                continue;
+            }
+            match std::fs::read(path) {
+                Ok(source) => {
+                    let fhash = sha256_bytes_pub(&source);
+                    let abs_str = path.to_string_lossy().into_owned();
+                    match parser.parse_bytes(path, &source) {
+                        Ok((nodes, edges)) => {
+                            let n = nodes.len();
+                            let e = edges.len();
+                            if let Err(err) =
+                                store.store_file_nodes_edges(&abs_str, &nodes, &edges, &fhash)
+                            {
+                                log::error!("Watcher store {}: {}", abs_str, err);
+                            } else {
+                                let _ = store.set_metadata(
+                                    "last_updated",
+                                    &chrono::Utc::now()
+                                        .format("%Y-%m-%dT%H:%M:%S")
+                                        .to_string(),
+                                );
+                                let rel = path
+                                    .strip_prefix(&repo_root)
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|_| abs_str.clone());
+                                log::info!("Watcher updated: {} ({} nodes, {} edges)", rel, n, e);
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("Watcher parse {}: {}", path.display(), err)
+                        }
+                    }
+                }
+                Err(err) => log::error!("Watcher read {}: {}", path.display(), err),
+            }
+        }
+
+        if let Err(e) = store.commit() {
+            log::error!("Watcher commit error: {}", e);
+        }
+    }
+
+    log::info!("Background watcher stopped.");
+    Ok(())
+}
+
 /// Run the MCP server over stdio. Blocks until the client disconnects.
 pub async fn run_server(repo_root: Option<String>) -> crate::error::Result<()> {
+    // Resolve the repository root once so we can start the background watcher.
+    let root = resolve_root(repo_root.as_deref());
+
+    // Only start the watcher when we have a usable root directory.
+    if root.exists() {
+        let watcher_root = root.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = run_background_watcher(watcher_root) {
+                log::error!("Background watcher error: {}", e);
+            }
+        });
+    } else {
+        log::info!("No repo root detected, background watcher disabled");
+    }
+
     let server = CodeReviewServer::new(repo_root);
     let (stdin, stdout) = transport::io::stdio();
     serve_server(server, (stdin, stdout))

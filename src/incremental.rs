@@ -622,3 +622,27 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
     info!("Watch stopped.");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Pub re-exports of private helpers (used by server.rs background watcher)
+// ---------------------------------------------------------------------------
+
+/// Public wrapper around the private `load_ignore_patterns`.
+pub fn load_ignore_patterns_pub(repo_root: &Path) -> Vec<glob::Pattern> {
+    load_ignore_patterns(repo_root)
+}
+
+/// Public wrapper around the private `should_ignore`.
+pub fn should_ignore_pub(path: &str, patterns: &[glob::Pattern]) -> bool {
+    should_ignore(path, patterns)
+}
+
+/// Public wrapper around the private `is_binary`.
+pub fn is_binary_pub(path: &Path) -> bool {
+    is_binary(path)
+}
+
+/// Public wrapper around the private `sha256_bytes`.
+pub fn sha256_bytes_pub(data: &[u8]) -> String {
+    sha256_bytes(data)
+}
