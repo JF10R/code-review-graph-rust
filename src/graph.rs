@@ -137,6 +137,8 @@ impl GraphStore {
     ) -> Result<()> {
         self.remove_file_data_inner(file_path);
 
+        let file_hash_owned = file_hash.to_string();
+        let file_path_owned = file_path.to_string();
         let mut new_idxs: Vec<NodeIndex> = Vec::with_capacity(nodes.len());
         for node_info in nodes {
             let graph_node = GraphNode {
@@ -151,7 +153,7 @@ impl GraphStore {
                 docstring: node_info.docstring.clone(),
                 signature: node_info.signature.clone(),
                 body_hash: node_info.body_hash.clone(),
-                file_hash: file_hash.to_string(),
+                file_hash: file_hash_owned.clone(),
             };
             let idx = self.data.graph.add_node(graph_node);
             self.data
@@ -159,12 +161,8 @@ impl GraphStore {
                 .insert(node_info.qualified_name.clone(), idx);
             new_idxs.push(idx);
         }
-        self.data
-            .file_index
-            .insert(file_path.to_string(), new_idxs);
-        self.data
-            .file_hashes
-            .insert(file_path.to_string(), file_hash.to_string());
+        self.data.file_index.insert(file_path_owned.clone(), new_idxs);
+        self.data.file_hashes.insert(file_path_owned, file_hash_owned);
         Ok(())
     }
 
