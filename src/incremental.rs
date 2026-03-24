@@ -498,7 +498,6 @@ pub fn incremental_update(
             continue;
         }
 
-        // Snapshot old body_hashes before re-parsing
         let abs_path_str = abs_path.to_string_lossy().into_owned();
         let old_hashes = store.get_body_hashes(&abs_path_str);
 
@@ -507,7 +506,6 @@ pub fn incremental_update(
                 total_nodes += n;
                 total_edges += e;
 
-                // Diff body_hashes to find which nodes actually changed
                 let new_hashes = store.get_body_hashes(&abs_path_str);
                 for (qn, new_hash) in &new_hashes {
                     let old_hash = old_hashes.get(qn).map(String::as_str).unwrap_or("");
@@ -515,7 +513,7 @@ pub fn incremental_update(
                         changed_qualified_names.push(qn.clone());
                     }
                 }
-                // Nodes that existed before but are now gone also count as changed
+                // Deleted nodes also count as changed (callers must be re-checked)
                 for qn in old_hashes.keys() {
                     if !new_hashes.contains_key(qn) {
                         changed_qualified_names.push(qn.clone());

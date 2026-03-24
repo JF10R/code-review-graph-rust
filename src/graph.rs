@@ -449,16 +449,14 @@ impl GraphStore {
         max_nodes: usize,
         changed_nodes: Option<&[String]>,
     ) -> Result<ImpactResult> {
-        // Build seed set
         let mut seeds: HashSet<String> = HashSet::new();
         if let Some(specific_nodes) = changed_nodes {
-            // Node-level seeding: only actually-changed nodes
             for qn in specific_nodes {
                 seeds.insert(qn.clone());
             }
         }
-        // Fall back to (or supplement with) all nodes in changed files if no
-        // specific nodes provided or seeds are still empty
+        // Fall back to file-level seeding when no specific nodes were provided
+        // (or when all provided names are stale and not found in the graph)
         if seeds.is_empty() {
             for f in changed_files {
                 for node in self.get_nodes_by_file(f)? {
@@ -480,7 +478,6 @@ impl GraphStore {
             (r, "weighted_bfs".to_string())
         };
 
-        // Build impact_scores map and collect impacted nodes (exclude seeds)
         let mut impact_scores: HashMap<String, f64> = HashMap::new();
         let mut impacted_nodes: Vec<GraphNode> = Vec::new();
 
