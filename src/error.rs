@@ -13,6 +13,9 @@ pub enum CrgError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Bincode error: {0}")]
+    Bincode(#[from] bincode::Error),
+
     #[error("Tree-sitter error: {0}")]
     TreeSitter(String),
 

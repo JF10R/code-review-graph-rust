@@ -534,8 +534,8 @@ pub fn semantic_search_nodes(
     repo_root: Option<&str>,
 ) -> Result<Value> {
     let (store, root) = get_store(repo_root)?;
-    let db_path = incremental::get_db_path(&root);
-    let emb_store = EmbeddingStore::new(&db_path)?;
+    let emb_db_path = incremental::get_embeddings_db_path(&root);
+    let emb_store = EmbeddingStore::new(&emb_db_path)?;
     let search_mode;
 
     let results: Vec<Value> = if emb_store.available() && emb_store.count()? > 0 {
@@ -617,8 +617,8 @@ pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
     }
 
     // Embedding info
-    let db_path = incremental::get_db_path(&root);
-    let emb_count = EmbeddingStore::new(&db_path)
+    let emb_db_path = incremental::get_embeddings_db_path(&root);
+    let emb_count = EmbeddingStore::new(&emb_db_path)
         .and_then(|es| es.count())
         .unwrap_or(0);
     summary_parts.push(String::new());
@@ -646,8 +646,8 @@ pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
 
 pub fn embed_graph(repo_root: Option<&str>) -> Result<Value> {
     let (store, root) = get_store(repo_root)?;
-    let db_path = incremental::get_db_path(&root);
-    let emb_store = EmbeddingStore::new(&db_path)?;
+    let emb_db_path = incremental::get_embeddings_db_path(&root);
+    let emb_store = EmbeddingStore::new(&emb_db_path)?;
 
     if !emb_store.available() {
         emb_store.close()?;

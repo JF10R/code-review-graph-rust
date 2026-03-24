@@ -1,6 +1,6 @@
 //! Vector embedding support for semantic search.
 //!
-//! Stores embeddings in the same SQLite database as the graph.
+//! Stores embeddings in a dedicated SQLite database (`embeddings.db`).
 //! Embedding providers (sentence-transformers, Google Gemini) are not yet
 //! available in Rust — `available()` always returns false.  Keyword search
 //! is used as a fallback in all callers.

@@ -1,232 +1,280 @@
-//! SQLite-backed graph store with petgraph for traversal.
+//! Petgraph-backed graph store with bincode+zstd persistence.
 //!
-//! Stores nodes and edges in SQLite with WAL mode.
-//! Builds an in-memory petgraph DiGraph for impact radius analysis.
+//! The entire graph lives in memory as a `StableGraph`. Persistence is a
+//! single atomic file write: `graph.bin.zst` (zstd-compressed bincode with a
+//! 4-byte magic header and a CRC-32 integrity check).
+//!
+//! SQLite is no longer used here — see `embeddings.rs` for the embeddings DB.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write as _;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use petgraph::graph::{DiGraph, NodeIndex};
-use rusqlite::{params, Connection};
+use petgraph::stable_graph::StableGraph;
+use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+use petgraph::Direction;
+use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+pub use petgraph::stable_graph::NodeIndex;
+
+use crate::error::{CrgError, Result};
 use crate::types::{
     EdgeInfo, EdgeKind, GraphEdge, GraphNode, GraphStats, ImpactResult, NodeInfo, NodeKind,
 };
 
 // ---------------------------------------------------------------------------
-// Schema
+// File format constants
 // ---------------------------------------------------------------------------
 
-const SCHEMA_SQL: &str = "
-CREATE TABLE IF NOT EXISTS nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,
-    name TEXT NOT NULL,
-    qualified_name TEXT NOT NULL UNIQUE,
-    file_path TEXT NOT NULL,
-    line_start INTEGER NOT NULL DEFAULT 0,
-    line_end INTEGER NOT NULL DEFAULT 0,
-    language TEXT NOT NULL DEFAULT '',
-    is_test INTEGER NOT NULL DEFAULT 0,
-    docstring TEXT NOT NULL DEFAULT '',
-    signature TEXT NOT NULL DEFAULT '',
-    body_hash TEXT NOT NULL DEFAULT '',
-    file_hash TEXT NOT NULL DEFAULT '',
-    updated_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS edges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,
-    source_qualified TEXT NOT NULL,
-    target_qualified TEXT NOT NULL,
-    file_path TEXT NOT NULL,
-    line INTEGER NOT NULL DEFAULT 0,
-    updated_at REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
-CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
-CREATE INDEX IF NOT EXISTS idx_nodes_qualified ON nodes(qualified_name);
-CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_qualified);
-CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_qualified);
-CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(kind);
-CREATE INDEX IF NOT EXISTS idx_edges_file ON edges(file_path);
-";
-
-// Column list constants — avoids repeating SELECT projections across queries.
-const NODE_COLS: &str =
-    "kind, name, qualified_name, file_path, line_start, line_end, \
-     language, is_test, docstring, signature, body_hash, file_hash";
-
-const EDGE_COLS: &str =
-    "kind, source_qualified, target_qualified, file_path, line";
+/// Magic bytes at the start of every `.bin.zst` file.
+const MAGIC: &[u8; 4] = b"CRG\x01";
 
 // ---------------------------------------------------------------------------
-// In-memory graph cache
+// Serializable graph data
 // ---------------------------------------------------------------------------
 
-/// Insert `name` into the petgraph (and index map) only when not already present.
-/// Returns the NodeIndex without a second clone of `name`.
-fn get_or_insert_node(
-    graph: &mut DiGraph<String, EdgeKind>,
-    index: &mut HashMap<String, NodeIndex>,
-    name: String,
-) -> NodeIndex {
-    use std::collections::hash_map::Entry;
-    match index.entry(name) {
-        Entry::Occupied(e) => *e.get(),
-        Entry::Vacant(e) => {
-            let idx = graph.add_node(e.key().clone());
-            e.insert(idx);
-            idx
-        }
-    }
-}
-
-struct GraphCache {
-    graph: DiGraph<String, EdgeKind>,
+/// All graph state that gets serialized to disk.
+#[derive(Serialize, Deserialize)]
+pub struct GraphData {
+    graph: StableGraph<GraphNode, EdgeKind>,
+    /// qualified_name → NodeIndex
     node_index: HashMap<String, NodeIndex>,
+    /// file_path → [NodeIndex]
+    file_index: HashMap<String, Vec<NodeIndex>>,
+    metadata: HashMap<String, String>,
+    /// file_path → SHA-256 (kept for hash-skip in incremental)
+    file_hashes: HashMap<String, String>,
 }
 
-impl GraphCache {
-    fn build(conn: &Connection) -> Result<Self> {
-        let mut graph: DiGraph<String, EdgeKind> = DiGraph::new();
-        let mut node_index: HashMap<String, NodeIndex> = HashMap::new();
-
-        let mut stmt =
-            conn.prepare("SELECT source_qualified, target_qualified, kind FROM edges")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-
-        for row in rows {
-            let (src, tgt, kind_str) = row?;
-            let edge_kind = EdgeKind::from_str(&kind_str).unwrap_or(EdgeKind::Calls);
-            let src_idx = get_or_insert_node(&mut graph, &mut node_index, src);
-            let tgt_idx = get_or_insert_node(&mut graph, &mut node_index, tgt);
-            graph.add_edge(src_idx, tgt_idx, edge_kind);
+impl GraphData {
+    fn new() -> Self {
+        Self {
+            graph: StableGraph::new(),
+            node_index: HashMap::new(),
+            file_index: HashMap::new(),
+            metadata: HashMap::new(),
+            file_hashes: HashMap::new(),
         }
-
-        Ok(Self { graph, node_index })
     }
 }
 
 // ---------------------------------------------------------------------------
-// GraphStore
+// Persistence helpers
 // ---------------------------------------------------------------------------
 
-/// Persistent graph store backed by SQLite.
+/// Serialize, compress, and atomically write `data` to `path`.
+fn save(data: &GraphData, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let payload = bincode::serialize(data)?;
+    let compressed = zstd::encode_all(&payload[..], 3)
+        .map_err(|e| CrgError::Io(e))?;
+    let crc = crc32fast::hash(&compressed);
+
+    let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
+    {
+        let mut f = tmp.as_file();
+        f.write_all(MAGIC)?;
+        f.write_all(&crc.to_le_bytes())?;
+        f.write_all(&compressed)?;
+        f.flush()?;
+    }
+    tmp.persist(path)
+        .map_err(|e| CrgError::Io(e.error))?;
+    Ok(())
+}
+
+/// Load `GraphData` from a `graph.bin.zst` file.
+fn load(path: &Path) -> Result<GraphData> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 8 {
+        return Err(CrgError::Other("graph file too short".into()));
+    }
+    if &bytes[0..4] != MAGIC {
+        return Err(CrgError::Other("corrupt graph file (bad magic)".into()));
+    }
+    let stored_crc = u32::from_le_bytes(
+        bytes[4..8]
+            .try_into()
+            .map_err(|_| CrgError::Other("corrupt graph file (bad crc field)".into()))?,
+    );
+    let compressed = &bytes[8..];
+    if crc32fast::hash(compressed) != stored_crc {
+        return Err(CrgError::Other("graph file CRC mismatch".into()));
+    }
+    let decompressed = zstd::decode_all(compressed)
+        .map_err(|e| CrgError::Io(e))?;
+    let data: GraphData = bincode::deserialize(&decompressed)?;
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
+// GraphStore — public API
+// ---------------------------------------------------------------------------
+
+/// In-memory graph store backed by petgraph, persisted to disk as
+/// a zstd-compressed bincode blob.
 pub struct GraphStore {
-    conn: Connection,
-    cache: Mutex<Option<GraphCache>>,
+    data: GraphData,
+    /// Path to the `.bin.zst` file.
+    bin_path: std::path::PathBuf,
 }
 
 impl GraphStore {
-    /// Open (or create) the graph database at the given path.
+    /// Open (or create) the graph store.
+    ///
+    /// `db_path` is the path returned by `incremental::get_db_path()` —
+    /// i.e. `<repo>/.code-review-graph/graph.bin.zst`.
     pub fn new(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-        conn.execute_batch(SCHEMA_SQL)?;
+        let data = if db_path.exists() {
+            match load(db_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!(
+                        "Could not load graph from {}: {} — starting empty",
+                        db_path.display(),
+                        e
+                    );
+                    GraphData::new()
+                }
+            }
+        } else {
+            GraphData::new()
+        };
 
         Ok(Self {
-            conn,
-            cache: Mutex::new(None),
+            data,
+            bin_path: db_path.to_path_buf(),
         })
     }
 
     // -- Write operations --
 
-    /// Store all nodes and edges for a file (replaces previous data for that file).
+    /// Replace all nodes and edges for a file with the freshly-parsed data.
     pub fn store_file_nodes_edges(
-        &self,
+        &mut self,
         file_path: &str,
         nodes: &[NodeInfo],
         edges: &[EdgeInfo],
         file_hash: &str,
     ) -> Result<()> {
-        self.remove_file_data_inner(file_path)?;
-        for node in nodes {
-            self.upsert_node_inner(node, file_hash)?;
+        self.remove_file_data_inner(file_path);
+
+        // Insert new nodes
+        let mut new_idxs: Vec<NodeIndex> = Vec::with_capacity(nodes.len());
+        for node_info in nodes {
+            let graph_node = GraphNode {
+                kind: node_info.kind,
+                name: node_info.name.clone(),
+                qualified_name: node_info.qualified_name.clone(),
+                file_path: node_info.file_path.clone(),
+                line_start: node_info.line_start,
+                line_end: node_info.line_end,
+                language: node_info.language.clone(),
+                is_test: node_info.is_test,
+                docstring: node_info.docstring.clone(),
+                signature: node_info.signature.clone(),
+                body_hash: node_info.body_hash.clone(),
+                file_hash: file_hash.to_string(),
+            };
+            let idx = self.data.graph.add_node(graph_node);
+            self.data
+                .node_index
+                .insert(node_info.qualified_name.clone(), idx);
+            new_idxs.push(idx);
         }
-        for edge in edges {
-            self.upsert_edge_inner(edge)?;
+        self.data
+            .file_index
+            .insert(file_path.to_string(), new_idxs);
+        self.data
+            .file_hashes
+            .insert(file_path.to_string(), file_hash.to_string());
+
+        // Insert new edges (resolve endpoints via node_index)
+        for edge_info in edges {
+            let src_idx = self.data.node_index.get(&edge_info.source_qualified).copied();
+            let tgt_idx = self.data.node_index.get(&edge_info.target_qualified).copied();
+            if let (Some(src), Some(tgt)) = (src_idx, tgt_idx) {
+                // Avoid duplicate edges at the same call site
+                let already_exists = self
+                    .data
+                    .graph
+                    .edges_connecting(src, tgt)
+                    .any(|e| *e.weight() == edge_info.kind);
+                if !already_exists {
+                    self.data.graph.add_edge(src, tgt, edge_info.kind);
+                }
+            }
+            // Unresolved edges (target not in graph yet) are silently dropped —
+            // cross-file edges will be re-added on the next build that touches
+            // the target file.
         }
-        self.invalidate_cache();
+
         Ok(())
     }
 
-    /// Remove all data associated with a file.
-    pub fn remove_file_data(&self, file_path: &str) -> Result<()> {
-        self.remove_file_data_inner(file_path)?;
-        self.invalidate_cache();
+    /// Remove all nodes and edges associated with a file.
+    pub fn remove_file_data(&mut self, file_path: &str) -> Result<()> {
+        self.remove_file_data_inner(file_path);
         Ok(())
     }
 
-    /// No-op: rusqlite auto-commits unless in an explicit transaction.
-    /// Kept for API compatibility with incremental.rs callers.
+    /// Persist in-memory state to disk.
+    ///
+    /// Previously a no-op (rusqlite auto-committed). Now triggers a real
+    /// atomic file write.
     pub fn commit(&self) -> Result<()> {
-        Ok(())
+        save(&self.data, &self.bin_path)
     }
 
     // -- Read operations --
 
     /// Get a node by qualified name.
     pub fn get_node(&self, qualified_name: &str) -> Result<Option<GraphNode>> {
-        const SQL: &str = concat!(
-            "SELECT kind, name, qualified_name, file_path, line_start, line_end, \
-             language, is_test, docstring, signature, body_hash, file_hash \
-             FROM nodes WHERE qualified_name = ?"
-        );
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let result = stmt.query_row(params![qualified_name], row_to_node);
-        match result {
-            Ok(n) => Ok(Some(n)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let node = self
+            .data
+            .node_index
+            .get(qualified_name)
+            .map(|&idx| self.data.graph[idx].clone());
+        Ok(node)
     }
 
     /// Get all nodes in a file.
     pub fn get_nodes_by_file(&self, file_path: &str) -> Result<Vec<GraphNode>> {
-        const SQL: &str = concat!(
-            "SELECT kind, name, qualified_name, file_path, line_start, line_end, \
-             language, is_test, docstring, signature, body_hash, file_hash \
-             FROM nodes WHERE file_path = ?"
-        );
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![file_path], row_to_node)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        let nodes = self
+            .data
+            .file_index
+            .get(file_path)
+            .map(|idxs| {
+                idxs.iter()
+                    .map(|&idx| self.data.graph[idx].clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(nodes)
     }
 
-    /// Get all file paths in the store.
+    /// Get all file paths that have a `File` node.
     pub fn get_all_files(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn
-            .prepare_cached("SELECT DISTINCT file_path FROM nodes WHERE kind = 'File'")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        let files: Vec<String> = self
+            .data
+            .node_index
+            .values()
+            .filter(|&&idx| self.data.graph[idx].kind == NodeKind::File)
+            .map(|&idx| self.data.graph[idx].file_path.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(files)
     }
 
-    /// Search nodes by name substring (multi-word AND logic).
-    ///
-    /// Each word must independently match `name` or `qualified_name`
-    /// (case-insensitive).
+    /// Search nodes by name substring (multi-word AND logic, case-insensitive).
     pub fn search_nodes(&self, query: &str, limit: usize) -> Result<Vec<GraphNode>> {
         let words: Vec<String> = query
             .split_whitespace()
@@ -236,27 +284,22 @@ impl GraphStore {
             return Ok(vec![]);
         }
 
-        let conditions: String = words
+        let results: Vec<GraphNode> = self
+            .data
+            .node_index
             .iter()
-            .map(|_| "(LOWER(name) LIKE ? OR LOWER(qualified_name) LIKE ?)")
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let sql = format!(
-            "SELECT {NODE_COLS} FROM nodes WHERE {conditions} LIMIT {limit}"
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let param_values: Vec<String> = words
-            .iter()
-            .flat_map(|w| [format!("%{w}%"), format!("%{w}%")])
+            .filter(|(qn, &idx)| {
+                let node = &self.data.graph[idx];
+                let name_lower = node.name.to_lowercase();
+                let qn_lower = qn.to_lowercase();
+                words
+                    .iter()
+                    .all(|w| name_lower.contains(w.as_str()) || qn_lower.contains(w.as_str()))
+            })
+            .take(limit)
+            .map(|(_, &idx)| self.data.graph[idx].clone())
             .collect();
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = param_values
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
-
-        let rows = stmt.query_map(params_refs.as_slice(), row_to_node)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        Ok(results)
     }
 
     /// Get nodes exceeding a line count threshold, ordered by size descending.
@@ -267,70 +310,114 @@ impl GraphStore {
         file_path_pattern: Option<&str>,
         limit: usize,
     ) -> Result<Vec<GraphNode>> {
-        let mut conditions = vec!["(line_end - line_start + 1) >= ?".to_string()];
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(min_lines as i64)];
+        let pattern_lower = file_path_pattern.map(|p| p.to_lowercase());
+        let kind_filter = kind.and_then(NodeKind::from_str);
 
-        if let Some(k) = kind {
-            conditions.push("kind = ?".to_string());
-            param_values.push(Box::new(k.to_string()));
-        }
-        if let Some(pat) = file_path_pattern {
-            conditions.push("file_path LIKE ?".to_string());
-            param_values.push(Box::new(format!("%{pat}%")));
-        }
+        let mut results: Vec<GraphNode> = self
+            .data
+            .node_index
+            .values()
+            .map(|&idx| &self.data.graph[idx])
+            .filter(|node| {
+                let lines = node.line_end.saturating_sub(node.line_start) + 1;
+                if lines < min_lines {
+                    return false;
+                }
+                if let Some(kf) = kind_filter {
+                    if node.kind != kf {
+                        return false;
+                    }
+                }
+                if let Some(ref pat) = pattern_lower {
+                    if !node.file_path.to_lowercase().contains(pat.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
 
-        let where_clause = conditions.join(" AND ");
-        let sql = format!(
-            "SELECT {NODE_COLS} FROM nodes WHERE {where_clause} \
-             ORDER BY (line_end - line_start + 1) DESC LIMIT {limit}"
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(params_refs.as_slice(), row_to_node)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        results.sort_by(|a, b| {
+            let size_a = a.line_end.saturating_sub(a.line_start);
+            let size_b = b.line_end.saturating_sub(b.line_start);
+            size_b.cmp(&size_a)
+        });
+        results.truncate(limit);
+        Ok(results)
     }
 
     // -- Edge operations --
 
     /// Get edges originating from a qualified name.
     pub fn get_edges_by_source(&self, qualified_name: &str) -> Result<Vec<GraphEdge>> {
-        const SQL: &str =
-            "SELECT kind, source_qualified, target_qualified, file_path, line \
-             FROM edges WHERE source_qualified = ?";
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![qualified_name], row_to_edge)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        let edges = match self.data.node_index.get(qualified_name) {
+            None => vec![],
+            Some(&idx) => self
+                .data
+                .graph
+                .edges_directed(idx, Direction::Outgoing)
+                .map(|e| GraphEdge {
+                    kind: *e.weight(),
+                    source_qualified: self.data.graph[e.source()].qualified_name.clone(),
+                    target_qualified: self.data.graph[e.target()].qualified_name.clone(),
+                    file_path: self.data.graph[e.source()].file_path.clone(),
+                    line: 0,
+                })
+                .collect(),
+        };
+        Ok(edges)
     }
 
     /// Get edges targeting a qualified name.
     pub fn get_edges_by_target(&self, qualified_name: &str) -> Result<Vec<GraphEdge>> {
-        const SQL: &str =
-            "SELECT kind, source_qualified, target_qualified, file_path, line \
-             FROM edges WHERE target_qualified = ?";
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![qualified_name], row_to_edge)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        let edges = match self.data.node_index.get(qualified_name) {
+            None => vec![],
+            Some(&idx) => self
+                .data
+                .graph
+                .edges_directed(idx, Direction::Incoming)
+                .map(|e| GraphEdge {
+                    kind: *e.weight(),
+                    source_qualified: self.data.graph[e.source()].qualified_name.clone(),
+                    target_qualified: self.data.graph[e.target()].qualified_name.clone(),
+                    file_path: self.data.graph[e.source()].file_path.clone(),
+                    line: 0,
+                })
+                .collect(),
+        };
+        Ok(edges)
     }
 
-    /// Search edges by unqualified target name (CALLS edges only).
-    ///
-    /// CALLS edges often store unqualified target names (e.g. `foo` rather than
-    /// `file.ts::foo`). Use this to find callers even when qualified lookup fails.
+    /// Search edges where target_qualified equals `name` and kind is CALLS.
     pub fn search_edges_by_target_name(&self, name: &str) -> Result<Vec<GraphEdge>> {
-        const SQL: &str =
-            "SELECT kind, source_qualified, target_qualified, file_path, line \
-             FROM edges WHERE target_qualified = ? AND kind = 'CALLS'";
-        let mut stmt = self.conn.prepare_cached(SQL)?;
-        let rows = stmt.query_map(params![name], row_to_edge)?;
-        rows.map(|r| r.map_err(Into::into)).collect()
+        // Find any node whose qualified_name ends with or equals `name`
+        let edges: Vec<GraphEdge> = self
+            .data
+            .node_index
+            .iter()
+            .filter(|(qn, _)| qn.as_str() == name || qn.ends_with(&format!("::{}", name)))
+            .flat_map(|(_, &tgt_idx)| {
+                self.data
+                    .graph
+                    .edges_directed(tgt_idx, Direction::Incoming)
+                    .filter(|e| *e.weight() == EdgeKind::Calls)
+                    .map(|e| GraphEdge {
+                        kind: EdgeKind::Calls,
+                        source_qualified: self.data.graph[e.source()].qualified_name.clone(),
+                        target_qualified: self.data.graph[e.target()].qualified_name.clone(),
+                        file_path: self.data.graph[e.source()].file_path.clone(),
+                        line: 0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(edges)
     }
 
-    // -- Impact analysis (petgraph) --
+    // -- Impact analysis --
 
-    /// Compute the blast radius of changed files.
+    /// Compute the blast radius of changed files using BFS on the in-memory graph.
     pub fn get_impact_radius(
         &self,
         changed_files: &[String],
@@ -344,9 +431,7 @@ impl GraphStore {
             }
         }
 
-        let impacted = self.with_cache(|cache| {
-            Ok(bfs_impact(&seeds, cache, max_depth, max_nodes))
-        })?;
+        let impacted = bfs_impact(&seeds, &self.data, max_depth, max_nodes);
 
         let changed_nodes: Vec<GraphNode> = seeds
             .iter()
@@ -377,7 +462,7 @@ impl GraphStore {
             .cloned()
             .chain(impacted_nodes.iter().map(|n| n.qualified_name.clone()))
             .collect();
-        let edges = self.get_edges_among(&all_qns)?;
+        let edges = self.get_edges_among(&all_qns);
 
         Ok(ImpactResult {
             changed_nodes,
@@ -391,250 +476,121 @@ impl GraphStore {
 
     // -- Metadata --
 
-    /// Get aggregate statistics.
+    /// Get aggregate statistics. O(1) for counts; O(n) for breakdowns.
     pub fn get_stats(&self) -> Result<GraphStats> {
-        let total_nodes = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, i64>(0))?
-            as usize;
+        let total_nodes = self.data.graph.node_count();
+        let total_edges = self.data.graph.edge_count();
 
-        let total_edges = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get::<_, i64>(0))?
-            as usize;
+        let mut nodes_by_kind: HashMap<String, usize> = HashMap::new();
+        let mut edges_by_kind: HashMap<String, usize> = HashMap::new();
+        let mut languages: HashSet<String> = HashSet::new();
+        let mut files_count = 0usize;
 
-        let nodes_by_kind = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT kind, COUNT(*) FROM nodes GROUP BY kind")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as usize,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
-        };
+        for idx in self.data.graph.node_indices() {
+            let node = &self.data.graph[idx];
+            *nodes_by_kind
+                .entry(node.kind.as_str().to_string())
+                .or_insert(0) += 1;
+            if node.kind == NodeKind::File {
+                files_count += 1;
+            }
+            if !node.language.is_empty() {
+                languages.insert(node.language.clone());
+            }
+        }
 
-        let edges_by_kind = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT kind, COUNT(*) FROM edges GROUP BY kind")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? as usize,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<HashMap<_, _>>>()?
-        };
+        for edge_ref in (&self.data.graph).edge_references() {
+            *edges_by_kind
+                .entry(edge_ref.weight().as_str().to_string())
+                .or_insert(0) += 1;
+        }
 
-        let languages = {
-            let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT language FROM nodes \
-                 WHERE language IS NOT NULL AND language != ''",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.map(|r| r.map_err(Into::into)).collect::<Result<Vec<_>>>()?
-        };
-
-        let files_count = self.conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE kind = 'File'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )? as usize;
-
-        let last_updated = self.get_metadata("last_updated")?;
+        let last_updated = self.data.metadata.get("last_updated").cloned();
 
         Ok(GraphStats {
             total_nodes,
             total_edges,
             nodes_by_kind,
             edges_by_kind,
-            languages,
+            languages: languages.into_iter().collect(),
             files_count,
             last_updated,
         })
     }
 
     /// Set a metadata key-value pair.
-    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-            params![key, value],
-        )?;
+    pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
+        self.data
+            .metadata
+            .insert(key.to_string(), value.to_string());
         Ok(())
     }
 
     /// Get a metadata value.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
-        let result = self.conn.query_row(
-            "SELECT value FROM metadata WHERE key = ?",
-            params![key],
-            |row| row.get(0),
-        );
-        match result {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self.data.metadata.get(key).cloned())
     }
 
-    /// Close the database connection.
+    /// Save to disk and drop.
     pub fn close(self) -> Result<()> {
-        drop(self.conn);
-        Ok(())
+        save(&self.data, &self.bin_path)
     }
 
     // -- Internal helpers --
 
-    fn invalidate_cache(&self) {
-        if let Ok(mut guard) = self.cache.lock() {
-            *guard = None;
-        }
-    }
+    /// Remove all graph nodes/edges belonging to `file_path`.
+    fn remove_file_data_inner(&mut self, file_path: &str) {
+        // Collect node indices to remove
+        let idxs_to_remove: Vec<NodeIndex> = self
+            .data
+            .file_index
+            .remove(file_path)
+            .unwrap_or_default();
 
-    fn with_cache<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&GraphCache) -> Result<T>,
-    {
-        let mut guard = self.cache.lock().unwrap();
-        if guard.is_none() {
-            *guard = Some(GraphCache::build(&self.conn)?);
-        }
-        f(guard.as_ref().unwrap())
-    }
-
-    fn remove_file_data_inner(&self, file_path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM nodes WHERE file_path = ?", params![file_path])?;
-        self.conn
-            .execute("DELETE FROM edges WHERE file_path = ?", params![file_path])?;
-        Ok(())
-    }
-
-    fn upsert_node_inner(&self, node: &NodeInfo, file_hash: &str) -> Result<()> {
-        let now = unix_now();
-        self.conn.execute(
-            "INSERT INTO nodes
-               (kind, name, qualified_name, file_path, line_start, line_end,
-                language, is_test, docstring, signature, body_hash, file_hash, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(qualified_name) DO UPDATE SET
-               kind=excluded.kind, name=excluded.name,
-               file_path=excluded.file_path, line_start=excluded.line_start,
-               line_end=excluded.line_end, language=excluded.language,
-               is_test=excluded.is_test, docstring=excluded.docstring,
-               signature=excluded.signature, body_hash=excluded.body_hash,
-               file_hash=excluded.file_hash, updated_at=excluded.updated_at",
-            params![
-                node.kind.as_str(),
-                node.name,
-                node.qualified_name,
-                node.file_path,
-                node.line_start as i64,
-                node.line_end as i64,
-                node.language,
-                node.is_test as i64,
-                node.docstring,
-                node.signature,
-                node.body_hash,
-                file_hash,
-                now,
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn upsert_edge_inner(&self, edge: &EdgeInfo) -> Result<()> {
-        let now = unix_now();
-
-        // SELECT-then-INSERT-or-UPDATE preserves distinct call sites at different
-        // source lines (a single UPSERT on (kind,src,tgt) would collapse them).
-        let existing_id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM edges
-                 WHERE kind = ?1 AND source_qualified = ?2 AND target_qualified = ?3
-                       AND file_path = ?4 AND line = ?5",
-                params![
-                    edge.kind.as_str(),
-                    edge.source_qualified,
-                    edge.target_qualified,
-                    edge.file_path,
-                    edge.line as i64,
-                ],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if let Some(id) = existing_id {
-            self.conn.execute(
-                "UPDATE edges SET updated_at = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-        } else {
-            self.conn.execute(
-                "INSERT INTO edges
-                   (kind, source_qualified, target_qualified, file_path, line, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    edge.kind.as_str(),
-                    edge.source_qualified,
-                    edge.target_qualified,
-                    edge.file_path,
-                    edge.line as i64,
-                    now,
-                ],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Return edges where both source and target are in the given set.
-    ///
-    /// Batches the source-side IN clause to stay under SQLite's 999-variable limit,
-    /// then filters targets in Rust.
-    fn get_edges_among(&self, qualified_names: &HashSet<String>) -> Result<Vec<GraphEdge>> {
-        if qualified_names.is_empty() {
-            return Ok(vec![]);
-        }
-        const BATCH_SIZE: usize = 450;
-        let qns: Vec<&String> = qualified_names.iter().collect();
-        let mut results = Vec::new();
-
-        for batch in qns.chunks(BATCH_SIZE) {
-            let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            let sql = format!(
-                "SELECT {EDGE_COLS} FROM edges WHERE source_qualified IN ({placeholders})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-                batch.iter().map(|s| *s as &dyn rusqlite::types::ToSql).collect();
-            let rows = stmt.query_map(params_refs.as_slice(), row_to_edge)?;
-            for row in rows {
-                let edge = row?;
-                if qualified_names.contains(&edge.target_qualified) {
-                    results.push(edge);
-                }
+        for idx in &idxs_to_remove {
+            // Remove this node from node_index
+            if let Some(node) = self.data.graph.node_weight(*idx) {
+                let qn = node.qualified_name.clone();
+                self.data.node_index.remove(&qn);
             }
+            // StableGraph::remove_node also removes all incident edges
+            self.data.graph.remove_node(*idx);
         }
-        Ok(results)
+
+        self.data.file_hashes.remove(file_path);
+    }
+
+    /// Collect edges where both endpoints are in `qualified_names`.
+    fn get_edges_among(&self, qualified_names: &HashSet<String>) -> Vec<GraphEdge> {
+        use petgraph::stable_graph::EdgeReference;
+        (&self.data.graph)
+            .edge_references()
+            .filter(|e: &EdgeReference<'_, EdgeKind>| {
+                let src_qn = &self.data.graph[e.source()].qualified_name;
+                let tgt_qn = &self.data.graph[e.target()].qualified_name;
+                qualified_names.contains(src_qn) && qualified_names.contains(tgt_qn)
+            })
+            .map(|e: EdgeReference<'_, EdgeKind>| GraphEdge {
+                kind: *e.weight(),
+                source_qualified: self.data.graph[e.source()].qualified_name.clone(),
+                target_qualified: self.data.graph[e.target()].qualified_name.clone(),
+                file_path: self.data.graph[e.source()].file_path.clone(),
+                line: 0,
+            })
+            .collect()
     }
 }
 
 // ---------------------------------------------------------------------------
-// BFS traversal (pure function, no DB access)
+// BFS traversal (pure function, operates on GraphData)
 // ---------------------------------------------------------------------------
 
 fn bfs_impact(
     seeds: &HashSet<String>,
-    cache: &GraphCache,
+    data: &GraphData,
     max_depth: usize,
     max_nodes: usize,
 ) -> HashSet<String> {
-    use petgraph::Direction;
-
     let mut visited: HashSet<String> = HashSet::new();
     let mut frontier: VecDeque<String> = seeds.iter().cloned().collect();
     let mut impacted: HashSet<String> = HashSet::new();
@@ -644,75 +600,39 @@ fn bfs_impact(
             break;
         }
         let mut next_frontier: Vec<String> = Vec::new();
+
         while let Some(qn) = frontier.pop_front() {
             if visited.contains(&qn) {
                 continue;
             }
             visited.insert(qn.clone());
 
-            if let Some(&idx) = cache.node_index.get(&qn) {
-                for nb_idx in cache.graph.neighbors(idx) {
-                    let nb = &cache.graph[nb_idx];
-                    if !visited.contains(nb) {
+            if let Some(&idx) = data.node_index.get(&qn) {
+                // Outgoing neighbours
+                for nb_idx in data.graph.neighbors_directed(idx, Direction::Outgoing) {
+                    let nb = data.graph[nb_idx].qualified_name.clone();
+                    if !visited.contains(&nb) {
                         impacted.insert(nb.clone());
-                        next_frontier.push(nb.clone());
+                        next_frontier.push(nb);
                     }
                 }
-                for pred_idx in cache.graph.neighbors_directed(idx, Direction::Incoming) {
-                    let pred = &cache.graph[pred_idx];
-                    if !visited.contains(pred) {
+                // Incoming neighbours (reverse edges)
+                for pred_idx in data.graph.neighbors_directed(idx, Direction::Incoming) {
+                    let pred = data.graph[pred_idx].qualified_name.clone();
+                    if !visited.contains(&pred) {
                         impacted.insert(pred.clone());
-                        next_frontier.push(pred.clone());
+                        next_frontier.push(pred);
                     }
                 }
             }
+
             if visited.len() + next_frontier.len() > max_nodes {
                 return impacted;
             }
         }
+
         frontier.extend(next_frontier);
     }
+
     impacted
-}
-
-// ---------------------------------------------------------------------------
-// Row mapping helpers
-// ---------------------------------------------------------------------------
-
-fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphNode> {
-    let kind_str: String = row.get(0)?;
-    let kind = NodeKind::from_str(&kind_str).unwrap_or(NodeKind::Function);
-    Ok(GraphNode {
-        kind,
-        name: row.get(1)?,
-        qualified_name: row.get(2)?,
-        file_path: row.get(3)?,
-        line_start: row.get::<_, i64>(4)? as usize,
-        line_end: row.get::<_, i64>(5)? as usize,
-        language: row.get(6)?,
-        is_test: row.get::<_, i64>(7)? != 0,
-        docstring: row.get(8)?,
-        signature: row.get(9)?,
-        body_hash: row.get(10)?,
-        file_hash: row.get(11)?,
-    })
-}
-
-fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphEdge> {
-    let kind_str: String = row.get(0)?;
-    let kind = EdgeKind::from_str(&kind_str).unwrap_or(EdgeKind::Calls);
-    Ok(GraphEdge {
-        kind,
-        source_qualified: row.get(1)?,
-        target_qualified: row.get(2)?,
-        file_path: row.get(3)?,
-        line: row.get::<_, i64>(4)? as usize,
-    })
-}
-
-fn unix_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
 }
