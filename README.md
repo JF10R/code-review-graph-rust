@@ -46,18 +46,33 @@ Language-specific extraction rules are defined in declarative [`.scm` query file
 
 ## Performance vs Python
 
-| Metric | Python | Rust |
-|--------|--------|------|
-| Startup | 150-300 ms | 2-5 ms |
-| First query (cold start) | ~200 ms | <1 ms |
-| Parse 50 TS functions | N/A | 3.4 ms |
-| Graph save (1k nodes) | ~100 ms | 2.8 ms |
-| Graph load (1k nodes) | ~200 ms | 1.1 ms |
-| Impact radius query | ~200 ms | 470 us |
-| Node search | ~10 ms | 8.3 us |
-| Graph on disk (1k files) | ~2 MB (SQLite) | ~200 KB (bincode+zstd) |
-| Binary size | ~150 MB (with venv) | 28 MB |
+### Real-world benchmarks (same repos as original project)
+
+| Repo | Files | Python build | Rust build | Speedup |
+|------|------:|:-------------|:-----------|--------:|
+| [httpx](https://github.com/encode/httpx) | 60 | 0.96s | **0.29s** | **3.3x** |
+| [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **1.79s** | **3.7x** |
+| [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **19.4s** | **15.7x** |
+
+Build speedup scales with repo size — tree-sitter parsing dominates on small repos (both call the same C core), but Rust's bincode+zstd persistence and in-memory graph avoid SQLite overhead that compounds on large codebases.
+
+### Micro-benchmarks (criterion, 1000-node synthetic graph)
+
+| Operation | Python | Rust | Speedup |
+|-----------|--------|------|--------:|
+| Graph save (1k nodes) | 146.7 ms | **2.8 ms** | **52x** |
+| Graph load + stats | 120 ms | **62 ms** | 2x |
+| Impact radius (warm) | 853 us | **470 us** | 1.8x |
+| Node search | 146 us | **8.3 us** | **18x** |
+| Parse 50 TS functions | 6.5 ms | **3.4 ms** | 1.9x |
+
+### Distribution
+
+| | Python | Rust |
+|---|--------|------|
+| Binary size | ~150 MB (with venv) | ~40 MB |
 | Runtime dependencies | Python 3.10+ | None |
+| Startup | 150-300 ms | 2-5 ms |
 
 ---
 
