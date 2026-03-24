@@ -70,7 +70,7 @@ fn save(data: &GraphData, path: &Path) -> Result<()> {
 
     let payload = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
     let compressed = zstd::encode_all(&payload[..], 3)
-        .map_err(|e| CrgError::Io(e))?;
+        .map_err(CrgError::Io)?;
     let crc = crc32fast::hash(&compressed);
 
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
@@ -105,7 +105,7 @@ fn load(path: &Path) -> Result<GraphData> {
         return Err(CrgError::Other("graph file CRC mismatch".into()));
     }
     let decompressed = zstd::decode_all(compressed)
-        .map_err(|e| CrgError::Io(e))?;
+        .map_err(CrgError::Io)?;
     let (data, _): (GraphData, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
     Ok(data)
 }

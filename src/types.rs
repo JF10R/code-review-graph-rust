@@ -28,6 +28,7 @@ impl NodeKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "File" => Some(Self::File),
@@ -73,6 +74,7 @@ impl EdgeKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "CALLS" => Some(Self::Calls),

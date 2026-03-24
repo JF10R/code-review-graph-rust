@@ -179,7 +179,7 @@ fn match_and_probe(
 
         for replacement in replacements {
             let mapped = if replacement.contains('*') {
-                replacement.replacen('*', &suffix, 1)
+                replacement.replacen('*', suffix, 1)
             } else {
                 replacement.clone()
             };
@@ -187,7 +187,7 @@ fn match_and_probe(
             let candidate_base = base_dir.join(&mapped);
             let candidate_base = candidate_base
                 .canonicalize()
-                .unwrap_or_else(|_| candidate_base);
+                .unwrap_or(candidate_base);
 
             if let Some(found) = probe_path(&candidate_base) {
                 return Some(found);
