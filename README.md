@@ -12,7 +12,29 @@ Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-gra
 
 `code-review-graph` builds a structural knowledge graph of your codebase using Tree-sitter, then exposes it to Claude Code via MCP. Instead of scanning entire files, Claude queries the graph to find exactly which functions, classes, and tests are impacted by a change — reducing token usage by 6.8x on average (up to 49x on monorepos).
 
-This is a complete Rust rewrite of the original Python implementation, preserving full API compatibility. See the [original project](https://github.com/tirth8205/code-review-graph) for architecture details and benchmarks.
+This is a complete Rust rewrite of the original Python implementation, preserving full MCP API compatibility while adding significant new capabilities. See the [original project](https://github.com/tirth8205/code-review-graph) for the core concept and token-reduction benchmarks.
+
+---
+
+## What's different from the Python version
+
+| | Python (original) | Rust (this fork) |
+|---|---|---|
+| **Parsing** | Sequential, single-threaded | **Parallel via rayon** — all CPU cores parse concurrently |
+| **Storage** | SQLite WAL + 3 tables + 7 indexes | **In-memory StableGraph**, persisted as bincode + zstd |
+| **Blast radius** | Flat bidirectional BFS, all edges equal | **Direction-aware, weighted, with decay** — 30-50% fewer false positives |
+| **Large graph scaling** | BFS explodes on hub nodes | **Auto PageRank** at 10k+ nodes, dampens hubs proportionally |
+| **Diff seeding** | All nodes in changed files | **Node-level** — only functions whose `body_hash` changed |
+| **Embeddings** | Requires `pip install [embeddings]` + API key | **Free local embeddings** (candle, all-MiniLM-L6-v2) out of the box |
+| **Embedding providers** | Google Gemini only | **OpenAI + Voyage AI + Gemini** + local candle |
+| **Graph freshness** | Manual `build` / hook required | **Background watcher** in MCP server + lazy stale-check per query |
+| **Config** | Environment variables only | **`config` CLI** — persistent API key storage with masked display |
+| **Language rules** | Hardcoded Python HashSets | **Declarative `.scm` query files** — add a language without recompiling |
+| **Progress** | Log lines every 50 files | **indicatif progress bar** with ETA |
+| **Graph integrity** | SQLite journal | **CRC-32 header + magic bytes + atomic write** (tempfile + rename) |
+| **Graph compression** | None (raw SQLite) | **zstd level 3** — 4-10x smaller on disk |
+| **Distribution** | Python 3.10+ venv (~150 MB) | **Single 40 MB binary**, zero runtime deps |
+| **Startup** | 150-300 ms (interpreter) | **2-5 ms** |
 
 ---
 
@@ -54,7 +76,7 @@ Language-specific extraction rules are defined in declarative [`.scm` query file
 | [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **0.90s** | **7.3x** |
 | [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **3.97s** | **76.8x** |
 
-Build speedup scales with repo size thanks to rayon parallel parsing — all CPU cores parse files concurrently while the graph store writes sequentially. On small repos the thread pool startup overhead slightly reduces the speedup, but on large codebases the parallelism dominates.
+Build speedup scales with repo size thanks to **rayon parallel parsing** — all CPU cores parse files concurrently while the graph store writes sequentially. Small repos see modest gains (thread pool overhead), but large codebases see 50-80x improvements where the parallelism and bincode persistence compound.
 
 ### Micro-benchmarks (criterion, 1000-node synthetic graph)
 
@@ -329,7 +351,7 @@ cargo build --release
 
 ## Credits
 
-Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-graph) by [Tirth Kanani](https://github.com/tirth8205). The architecture, blast-radius algorithms, and benchmarks originate from the original project.
+Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-graph) by [Tirth Kanani](https://github.com/tirth8205). The core concept, MCP tool API, and token-reduction methodology originate from the original project. The blast radius algorithm, parallel parsing, embedding system, and persistence layer are new in this fork.
 
 ## License
 
