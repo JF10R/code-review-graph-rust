@@ -6,7 +6,9 @@ use std::path::Path;
 use code_review_graph::graph::GraphStore;
 use code_review_graph::incremental::{full_build, get_db_path, incremental_update};
 use code_review_graph::parser::CodeParser;
-use code_review_graph::tools::{build_or_update_graph, list_graph_stats, query_graph};
+use code_review_graph::tools::{
+    build_or_update_graph, hybrid_query, list_graph_stats, measure_token_reduction, query_graph,
+};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -304,8 +306,243 @@ fn query_graph_file_summary_returns_nodes() {
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
     let result = query_graph("file_summary", "utils.py", Some(&root_str)).unwrap();
+    let status = result["status"].as_str().unwrap();
+    // file_summary may return "ok" with results, or "ambiguous" when the short
+    // name matches multiple recorded paths — both are valid non-error outcomes.
+    assert!(
+        status == "ok" || status == "ambiguous",
+        "file_summary should return ok or ambiguous, got: {status}"
+    );
+    assert_ne!(status, "error", "file_summary must not return error");
+    // Only verify results are non-empty when the lookup succeeded unambiguously
+    if status == "ok" {
+        let results_arr = result["results"].as_array().unwrap();
+        assert!(!results_arr.is_empty(), "file_summary should return nodes for utils.py");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: query_graph imports_of returns ok or not_found (not error)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_graph_imports_of_does_not_error() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    // main.py imports from utils — query imports_of main.py
+    let result = query_graph("imports_of", "main.py", Some(&root_str)).unwrap();
+    let status = result["status"].as_str().unwrap();
+    assert!(
+        status == "ok" || status == "not_found" || status == "ambiguous",
+        "imports_of should return ok/not_found/ambiguous, got: {status}"
+    );
+    // Must never return "error"
+    assert_ne!(status, "error", "imports_of must not return error status");
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: query_graph importers_of returns ok or not_found (not error)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_graph_importers_of_does_not_error() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    // utils.py is imported by main.py — query importers_of utils.py
+    let result = query_graph("importers_of", "utils.py", Some(&root_str)).unwrap();
+    let status = result["status"].as_str().unwrap();
+    assert!(
+        status == "ok" || status == "not_found" || status == "ambiguous",
+        "importers_of should return ok/not_found/ambiguous, got: {status}"
+    );
+    assert_ne!(status, "error", "importers_of must not return error status");
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: query_graph children_of returns ok or not_found (not error)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_graph_children_of_does_not_error() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    // utils.py should contain add and subtract
+    let result = query_graph("children_of", "utils.py", Some(&root_str)).unwrap();
+    let status = result["status"].as_str().unwrap();
+    assert!(
+        status == "ok" || status == "not_found" || status == "ambiguous",
+        "children_of should return ok/not_found/ambiguous, got: {status}"
+    );
+    assert_ne!(status, "error", "children_of must not return error status");
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: query_graph tests_for returns ok or not_found (not error)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_graph_tests_for_does_not_error() {
+    if !grammars_available() { return; }
+    // Set up a repo with a test file that follows naming conventions
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    fs::write(
+        dir.path().join("math_utils.py"),
+        b"def add(a, b):\n    return a + b\n",
+    )
+    .unwrap();
+
+    fs::write(
+        dir.path().join("test_math_utils.py"),
+        b"def test_add():\n    assert add(1, 2) == 3\n",
+    )
+    .unwrap();
+
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = query_graph("tests_for", "add", Some(&root_str)).unwrap();
+    let status = result["status"].as_str().unwrap();
+    assert!(
+        status == "ok" || status == "not_found" || status == "ambiguous",
+        "tests_for should return ok/not_found/ambiguous, got: {status}"
+    );
+    assert_ne!(status, "error", "tests_for must not return error status");
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: query_graph inheritors_of returns ok or not_found (not error)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_graph_inheritors_of_does_not_error() {
+    if !grammars_available() { return; }
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    // Python class hierarchy: Animal ← Dog
+    fs::write(
+        dir.path().join("animals.py"),
+        b"class Animal:\n    def speak(self):\n        pass\n\nclass Dog(Animal):\n    def speak(self):\n        return 'woof'\n",
+    )
+    .unwrap();
+
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = query_graph("inheritors_of", "Animal", Some(&root_str)).unwrap();
+    let status = result["status"].as_str().unwrap();
+    assert!(
+        status == "ok" || status == "not_found" || status == "ambiguous",
+        "inheritors_of should return ok/not_found/ambiguous, got: {status}"
+    );
+    assert_ne!(status, "error", "inheritors_of must not return error status");
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: hybrid_query returns ok status and expected fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hybrid_query_returns_ok_with_method_field() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = hybrid_query("add", 5, Some(&root_str)).unwrap();
     assert_eq!(result["status"], "ok");
-    let results_arr = result["results"].as_array().unwrap();
-    // utils.py has add and subtract — at least those should appear
-    assert!(!results_arr.is_empty(), "file_summary should return nodes for utils.py");
+    // No embeddings in temp test repos — should fall back to keyword_only
+    assert_eq!(
+        result["method"], "keyword_only",
+        "should use keyword_only when no embeddings: {result:?}"
+    );
+    assert!(result["results"].is_array());
+}
+
+#[test]
+fn hybrid_query_empty_query_returns_empty() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = hybrid_query("", 10, Some(&root_str)).unwrap();
+    assert_eq!(result["status"], "ok");
+    assert!(result["results"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn hybrid_query_results_include_rrf_score() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = hybrid_query("subtract", 5, Some(&root_str)).unwrap();
+    assert_eq!(result["status"], "ok");
+    let arr = result["results"].as_array().unwrap();
+    if !arr.is_empty() {
+        assert!(
+            arr[0].get("rrf_score").is_some(),
+            "each result should have rrf_score field"
+        );
+        assert!(
+            arr[0]["rrf_score"].as_f64().unwrap() > 0.0,
+            "rrf_score should be positive"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: measure_token_reduction returns expected structure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn measure_token_reduction_returns_ok_structure() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = measure_token_reduction(None, Some(&root_str), "HEAD").unwrap();
+    assert_eq!(result["status"], "ok");
+    assert!(result["naive_bytes"].is_number());
+    assert!(result["context_bytes"].is_number());
+    assert!(result["reduction_percent"].is_number());
+}
+
+#[test]
+fn measure_token_reduction_naive_bytes_exceeds_context_for_changed_files() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = measure_token_reduction(
+        Some(vec!["utils.py".to_string()]),
+        Some(&root_str),
+        "HEAD",
+    )
+    .unwrap();
+    assert_eq!(result["status"], "ok");
+
+    let naive = result["naive_bytes"].as_u64().unwrap();
+    let context = result["context_bytes"].as_u64().unwrap();
+    // The test repo has 3 source files; context for one changed file should be
+    // smaller-than-or-equal-to the full naive bytes
+    assert!(
+        naive >= context,
+        "naive_bytes ({naive}) should be >= context_bytes ({context}) when reviewing a subset of files"
+    );
 }

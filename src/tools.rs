@@ -830,6 +830,165 @@ pub fn get_docs_section(section_name: &str, repo_root: Option<&str>) -> Result<V
 // Tool 9: find_large_functions
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tool 10: hybrid_query
+// ---------------------------------------------------------------------------
+
+/// Merge graph keyword search with semantic search via Reciprocal Rank Fusion.
+///
+/// RRF score formula: Σ 1 / (k + rank_i)  where k = 60 (standard constant).
+///
+/// Falls back to keyword-only when no embeddings are available, and sets
+/// `method: "keyword_only"` in the returned JSON to signal this.
+pub fn hybrid_query(
+    query: &str,
+    limit: usize,
+    repo_root: Option<&str>,
+) -> Result<Value> {
+    if query.trim().is_empty() {
+        return Ok(json!({
+            "status": "ok",
+            "query": query,
+            "method": "keyword_only",
+            "results": [],
+        }));
+    }
+
+    const RRF_K: f64 = 60.0;
+
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+
+    let emb_db_path = incremental::get_embeddings_db_path(&root);
+    let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
+
+    // Keyword results
+    let keyword_hits = store.search_nodes(query, limit * 2)?;
+
+    let method;
+    let mut rrf_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    // Populate keyword ranks
+    for (rank, node) in keyword_hits.iter().enumerate() {
+        let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+        *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
+    }
+
+    // Semantic ranks (if available)
+    if emb_store.available() && emb_store.count().unwrap_or(0) > 0 {
+        method = "hybrid_rrf";
+        let semantic_hits = crate::embeddings::semantic_search(query, &store, &mut emb_store, limit * 2)?;
+        for (rank, hit) in semantic_hits.iter().enumerate() {
+            if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
+                let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
+            }
+        }
+    } else {
+        method = "keyword_only";
+    }
+
+    // Sort by RRF score descending
+    let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(limit);
+
+    let results: Vec<Value> = ranked
+        .iter()
+        .filter_map(|(qn, score)| {
+            store.get_node(qn).ok().flatten().map(|node| {
+                let mut d = node_to_dict(&node);
+                d["rrf_score"] = json!(score);
+                d
+            })
+        })
+        .collect();
+
+    emb_store.close()?;
+    store.close()?;
+    Ok(json!({
+        "status": "ok",
+        "query": query,
+        "method": method,
+        "results": results,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Tool 11: measure_token_reduction
+// ---------------------------------------------------------------------------
+
+/// Compute how much smaller the graph-filtered review context is compared
+/// to naively concatenating all source files in the repo.
+///
+/// Returns `reduction_percent` = 100 * (1 - context_bytes / naive_bytes).
+/// A value of 80 means the context is 80 % smaller than a full-repo dump.
+pub fn measure_token_reduction(
+    changed_files: Option<Vec<String>>,
+    repo_root: Option<&str>,
+    base: &str,
+) -> Result<Value> {
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+
+    // Naive bytes: sum of all source files in the repo
+    let naive_bytes: u64 = walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().is_file()
+                && !e.path().components().any(|c| {
+                    matches!(c.as_os_str().to_str(), Some(".git") | Some("target") | Some("node_modules"))
+                })
+        })
+        .filter(|e| {
+            matches!(
+                e.path().extension().and_then(|s| s.to_str()),
+                Some("py" | "ts" | "tsx" | "js" | "jsx" | "rs" | "go" | "java" | "kt" | "swift" | "rb" | "cs" | "php" | "cpp" | "c" | "h" | "vue")
+            )
+        })
+        .filter_map(|e| std::fs::metadata(e.path()).ok())
+        .map(|m| m.len())
+        .sum();
+
+    // Context bytes: size of graph-filtered impact context
+    let files = resolve_changed_files(changed_files, &root, base);
+    let abs_files: Vec<String> = files.iter()
+        .map(|f| root.join(f).to_string_lossy().into_owned())
+        .collect();
+
+    let context_bytes: u64 = if abs_files.is_empty() {
+        // No changed files — context is just the changed file names (minimal)
+        0
+    } else {
+        let impact = store.get_impact_radius(&abs_files, 3, 200, None)?;
+        // Context = source text of only the changed files (trimmed to relevant nodes)
+        abs_files.iter()
+            .filter_map(|p| std::fs::read(p).ok())
+            .map(|b| b.len() as u64)
+            .sum::<u64>()
+            + impact.impacted_nodes.iter()
+                .filter_map(|n| std::fs::metadata(&n.file_path).ok())
+                .map(|m| m.len() / 4) // impacted files contribute 1/4 (signature-level context)
+                .sum::<u64>()
+    };
+
+    let reduction_percent = if naive_bytes == 0 {
+        0.0_f64
+    } else {
+        100.0 * (1.0 - (context_bytes as f64 / naive_bytes as f64)).max(0.0)
+    };
+
+    store.close()?;
+    Ok(json!({
+        "status": "ok",
+        "naive_bytes": naive_bytes,
+        "context_bytes": context_bytes,
+        "reduction_percent": reduction_percent,
+        "changed_files": files,
+    }))
+}
+
 pub fn find_large_functions(
     min_lines: usize,
     kind: Option<&str>,
@@ -890,121 +1049,6 @@ pub fn find_large_functions(
         "total_found": results.len(),
         "min_lines": min_lines,
         "results": results,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// Tool 10: hybrid_query
-// ---------------------------------------------------------------------------
-
-/// Merge graph keyword search and semantic search via Reciprocal Rank Fusion.
-pub fn hybrid_query(query: &str, limit: usize, repo_root: Option<&str>) -> Result<Value> {
-    let (mut store, root) = get_store(repo_root)?;
-    maybe_auto_update(&mut store, &root);
-    let emb_db_path = incremental::get_embeddings_db_path(&root);
-    let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-
-    // Graph keyword search
-    let kw_nodes = store.search_nodes(query, limit * 2)?;
-
-    // Semantic search (if available)
-    let (sem_results, method) = if emb_store.available() && emb_store.count()? > 0 {
-        let r = semantic_search(query, &store, &mut emb_store, limit * 2)?;
-        (r, "hybrid")
-    } else {
-        (vec![], "keyword_only")
-    };
-
-    // Reciprocal Rank Fusion: score = sum(1 / (60 + rank)) across all lists
-    let mut rrf_scores: HashMap<String, f64> = HashMap::new();
-    let mut result_map: HashMap<String, Value> = HashMap::new();
-
-    for (rank, node) in kw_nodes.iter().enumerate() {
-        let item = node_to_dict(node);
-        *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += 1.0 / (60.0 + (rank + 1) as f64);
-        result_map.entry(node.qualified_name.clone()).or_insert(item);
-    }
-    for (rank, item) in sem_results.iter().enumerate() {
-        if let Some(qn) = item.get("qualified_name").and_then(|v| v.as_str()) {
-            *rrf_scores.entry(qn.to_string()).or_insert(0.0) += 1.0 / (60.0 + (rank + 1) as f64);
-            result_map.entry(qn.to_string()).or_insert_with(|| item.clone());
-        }
-    }
-
-    let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(limit);
-
-    let results: Vec<Value> = ranked.iter()
-        .filter_map(|(qn, _)| result_map.remove(qn))
-        .collect();
-
-    emb_store.close()?;
-    store.close()?;
-    Ok(json!({
-        "status": "ok",
-        "query": query,
-        "method": method,
-        "summary": format!("Found {} result(s) via {} search for '{}'", results.len(), method, query),
-        "results": results,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// Tool 11: measure_token_reduction
-// ---------------------------------------------------------------------------
-
-/// Measure how much context is saved versus naively reading all changed files.
-pub fn measure_token_reduction(
-    changed_files: Option<Vec<String>>,
-    repo_root: Option<&str>,
-    base: &str,
-) -> Result<Value> {
-    let (mut store, root) = get_store(repo_root)?;
-    maybe_auto_update(&mut store, &root);
-
-    let files = resolve_changed_files(changed_files, &root, base);
-
-    // Naive context: sum of raw file sizes
-    let naive_bytes: usize = files.iter().map(|f| {
-        std::fs::read(root.join(f)).map(|b| b.len()).unwrap_or(0)
-    }).sum();
-
-    // Graph context: serialize the review context JSON payload
-    let abs_files: Vec<String> = files.iter()
-        .map(|f| root.join(f).to_string_lossy().into_owned())
-        .collect();
-    let impact = store.get_impact_radius(&abs_files, 3, 500, None)?;
-    let context_val = json!({
-        "changed_files": files,
-        "impacted_files": impact.impacted_files,
-        "graph": {
-            "changed_nodes": impact.changed_nodes.iter().map(node_to_dict).collect::<Vec<_>>(),
-            "impacted_nodes": impact.impacted_nodes.iter().map(node_to_dict).collect::<Vec<_>>(),
-            "edges": impact.edges.iter().map(edge_to_dict).collect::<Vec<_>>(),
-        },
-    });
-    let context_bytes = serde_json::to_vec(&context_val)
-        .map(|b| b.len())
-        .unwrap_or(0);
-
-    let reduction = if naive_bytes > 0 {
-        (1.0 - (context_bytes as f64 / naive_bytes as f64)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let reduction_percent = (reduction * 100.0).round();
-
-    store.close()?;
-    Ok(json!({
-        "status": "ok",
-        "naive_bytes": naive_bytes,
-        "context_bytes": context_bytes,
-        "reduction_percent": reduction_percent,
-        "summary": format!(
-            "Graph context uses {} bytes vs {} bytes naive ({:.0}% reduction for {} file(s)).",
-            context_bytes, naive_bytes, reduction_percent, files.len()
-        ),
     }))
 }
 
@@ -1318,5 +1362,137 @@ mod tests {
         let val = result.unwrap();
         assert_eq!(val["status"], "not_found");
         assert!(val["error"].as_str().unwrap().contains("completely_unknown_section_xyz"));
+    }
+
+    // -----------------------------------------------------------------------
+    // hybrid_query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hybrid_query_empty_query_returns_empty_results() {
+        let (dir, path) = make_git_repo();
+        fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query("", 10, Some(&path));
+        assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        let results = val["results"].as_array().unwrap();
+        assert!(results.is_empty(), "empty query should return empty results");
+    }
+
+    #[test]
+    fn hybrid_query_returns_keyword_only_when_no_embeddings() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("utils.py"),
+            b"def add(a, b): return a + b\ndef subtract(a, b): return a - b\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query("add", 5, Some(&path));
+        assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        // No embeddings in a fresh temp repo — must fall back to keyword_only
+        assert_eq!(
+            val["method"], "keyword_only",
+            "should use keyword_only when no embeddings available"
+        );
+    }
+
+    #[test]
+    fn hybrid_query_results_have_rrf_score_field() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("calc.py"),
+            b"def square(x): return x * x\ndef cube(x): return x * x * x\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query("square", 5, Some(&path));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        let results = val["results"].as_array().unwrap();
+        if !results.is_empty() {
+            assert!(
+                results[0].get("rrf_score").is_some(),
+                "each result should have an rrf_score field"
+            );
+            let score = results[0]["rrf_score"].as_f64().unwrap();
+            assert!(score > 0.0, "rrf_score should be positive, got {score}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // measure_token_reduction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn measure_token_reduction_returns_ok_with_required_fields() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("utils.py"),
+            b"def add(a, b): return a + b\ndef subtract(a, b): return a - b\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = measure_token_reduction(None, Some(&path), "HEAD");
+        assert!(result.is_ok(), "measure_token_reduction should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        assert!(val["naive_bytes"].is_number(), "naive_bytes should be a number");
+        assert!(val["context_bytes"].is_number(), "context_bytes should be a number");
+        assert!(val["reduction_percent"].is_number(), "reduction_percent should be a number");
+    }
+
+    #[test]
+    fn measure_token_reduction_naive_bytes_positive_when_source_exists() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("service.py"),
+            b"def process(data): return data\ndef validate(data): return bool(data)\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = measure_token_reduction(None, Some(&path), "HEAD");
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        let naive = val["naive_bytes"].as_u64().unwrap();
+        assert!(naive > 0, "naive_bytes should be > 0 when source files exist, got {naive}");
+    }
+
+    #[test]
+    fn measure_token_reduction_with_explicit_changed_files() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("utils.py"),
+            b"def add(a, b): return a + b\ndef subtract(a, b): return a - b\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("main.py"),
+            b"from utils import add\ndef run(): return add(1, 2)\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = measure_token_reduction(
+            Some(vec!["utils.py".to_string()]),
+            Some(&path),
+            "HEAD",
+        );
+        assert!(result.is_ok(), "measure_token_reduction should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        let changed = val["changed_files"].as_array().unwrap();
+        assert_eq!(changed.len(), 1, "should report exactly 1 changed file");
+        assert_eq!(changed[0], "utils.py");
     }
 }
