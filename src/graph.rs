@@ -6,7 +6,7 @@
 //!
 //! SQLite is no longer used here — see `embeddings.rs` for the embeddings DB.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use petgraph::stable_graph::StableGraph;
@@ -640,6 +640,97 @@ impl GraphStore {
                 line: 0,
             })
             .collect()
+    }
+
+    /// Find the shortest call path between two nodes using BFS on Calls edges.
+    /// Tries outgoing direction first (callee chain), then incoming (caller chain).
+    /// Returns the path as a sequence of `(GraphNode, Option<GraphEdge>)` pairs.
+    /// The last element has `edge=None` (destination, no outgoing edge in path).
+    pub fn trace_call_chain(
+        &self,
+        from_qn: &str,
+        to_qn: &str,
+        max_depth: usize,
+    ) -> Result<Option<Vec<(GraphNode, Option<GraphEdge>)>>> {
+        let Some(&from_idx) = self.data.node_index.get(from_qn) else {
+            return Ok(None);
+        };
+        let Some(&to_idx) = self.data.node_index.get(to_qn) else {
+            return Ok(None);
+        };
+
+        // BFS over Calls edges in `direction`. Returns parent map on success.
+        let bfs = |direction: Direction| -> Option<HashMap<NodeIndex, NodeIndex>> {
+            let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();
+            // parent[child] = parent; from_idx maps to itself as the BFS root sentinel.
+            let mut parent: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+            queue.push_back((from_idx, 0));
+            parent.insert(from_idx, from_idx);
+
+            while let Some((idx, depth)) = queue.pop_front() {
+                if depth >= max_depth {
+                    continue;
+                }
+                for edge_ref in self.data.graph.edges_directed(idx, direction) {
+                    if *edge_ref.weight() != EdgeKind::Calls {
+                        continue;
+                    }
+                    let neighbor = match direction {
+                        Direction::Outgoing => edge_ref.target(),
+                        Direction::Incoming => edge_ref.source(),
+                    };
+                    if parent.contains_key(&neighbor) {
+                        continue;
+                    }
+                    parent.insert(neighbor, idx);
+                    if neighbor == to_idx {
+                        return Some(parent);
+                    }
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+            None
+        };
+
+        // Try outgoing (callee chain) first, then incoming (caller chain).
+        let Some(parent) = bfs(Direction::Outgoing).or_else(|| bfs(Direction::Incoming)) else {
+            return Ok(None);
+        };
+
+        // Walk parent map from to_idx back to from_idx, then reverse.
+        let mut path_indices: Vec<NodeIndex> = Vec::new();
+        let mut cur = to_idx;
+        loop {
+            path_indices.push(cur);
+            if cur == from_idx {
+                break;
+            }
+            cur = parent[&cur];
+        }
+        path_indices.reverse();
+
+        // Each step: (node, Some(CALLS edge to next)) except the last (None).
+        let result: Vec<(GraphNode, Option<GraphEdge>)> = path_indices
+            .windows(2)
+            .map(|w| {
+                let node = self.data.graph[w[0]].clone();
+                let edge = Some(GraphEdge {
+                    kind: EdgeKind::Calls,
+                    source_qualified: node.qualified_name.clone(),
+                    target_qualified: self.data.graph[w[1]].qualified_name.clone(),
+                    file_path: node.file_path.clone(),
+                    line: 0,
+                });
+                (node, edge)
+            })
+            .chain(std::iter::once({
+                let last = self.data.graph[*path_indices.last().unwrap()].clone();
+                (last, None)
+            }))
+            .collect();
+
+        Ok(Some(result))
     }
 }
 

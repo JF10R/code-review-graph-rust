@@ -1052,6 +1052,94 @@ pub fn find_large_functions(
     }))
 }
 
+pub fn trace_call_chain(
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    _compact: bool,
+    repo_root: Option<&str>,
+) -> Result<Value> {
+    // TODO: pass compact flag when compact mode merges (node_to_dict currently takes 1 arg)
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+
+    let from_node = match resolve_target_node(&store, from, &root)? {
+        ResolveResult::Found(n) => n,
+        ResolveResult::NotFound => {
+            store.close()?;
+            return Ok(json!({
+                "status": "error",
+                "summary": format!("Node not found: '{from}'"),
+            }));
+        }
+        ResolveResult::Ambiguous(candidates) => {
+            store.close()?;
+            return Ok(json!({
+                "status": "ambiguous",
+                "summary": format!("Ambiguous name '{from}' — qualify with file path or full qualified name"),
+                "candidates": candidates,
+            }));
+        }
+    };
+
+    let to_node = match resolve_target_node(&store, to, &root)? {
+        ResolveResult::Found(n) => n,
+        ResolveResult::NotFound => {
+            store.close()?;
+            return Ok(json!({
+                "status": "error",
+                "summary": format!("Node not found: '{to}'"),
+            }));
+        }
+        ResolveResult::Ambiguous(candidates) => {
+            store.close()?;
+            return Ok(json!({
+                "status": "ambiguous",
+                "summary": format!("Ambiguous name '{to}' — qualify with file path or full qualified name"),
+                "candidates": candidates,
+            }));
+        }
+    };
+
+    let result = store.trace_call_chain(
+        &from_node.qualified_name,
+        &to_node.qualified_name,
+        max_depth,
+    )?;
+
+    store.close()?;
+
+    match result {
+        Some(path) => {
+            let hops = path.len().saturating_sub(1);
+            let path_json: Vec<Value> = path.iter().map(|(node, edge)| {
+                json!({
+                    "node": node_to_dict(node),
+                    "edge_to_next": edge.is_some().then_some("CALLS"),
+                })
+            }).collect();
+            Ok(json!({
+                "status": "ok",
+                "summary": format!(
+                    "Found {hops}-hop call chain from '{}' to '{}'",
+                    from_node.qualified_name,
+                    to_node.qualified_name,
+                ),
+                "hops": hops,
+                "path": path_json,
+            }))
+        }
+        None => Ok(json!({
+            "status": "no_path",
+            "summary": format!(
+                "No call chain found from '{}' to '{}' within {max_depth} hops",
+                from_node.qualified_name,
+                to_node.qualified_name,
+            ),
+        })),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
