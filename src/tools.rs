@@ -1111,7 +1111,7 @@ mod tests {
 
     #[test]
     fn query_graph_unknown_pattern_returns_error() {
-        let (dir, path) = make_git_repo();
+        let (_dir, path) = make_git_repo();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         let result = query_graph("totally_unknown_pattern", "some_target", Some(&path));
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn query_graph_known_pattern_not_found_returns_not_found() {
-        let (dir, path) = make_git_repo();
+        let (_dir, path) = make_git_repo();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         let result = query_graph("callers_of", "definitely_not_a_real_function_xyz", Some(&path));
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn get_docs_section_unknown_section_returns_not_found() {
-        let (dir, path) = make_git_repo();
+        let (_dir, path) = make_git_repo();
         let result = get_docs_section("completely_unknown_section_xyz", Some(&path));
         assert!(result.is_ok());
         let val = result.unwrap();

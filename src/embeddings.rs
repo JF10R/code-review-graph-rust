@@ -13,7 +13,7 @@
 //! ```
 //!
 //! Stores embeddings in a `.embeddings.bin.zst` file using the same
-//! bincode/zstd pattern as `graph.rs`.
+//! postcard/zstd pattern as `graph.rs`.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -52,7 +52,7 @@ fn save_embedding_data(data: &EmbeddingData, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
+    let payload = postcard::to_allocvec(data)?;
     let compressed = zstd::encode_all(&payload[..], 3).map_err(CrgError::Io)?;
     let crc = crc32fast::hash(&compressed);
 
@@ -90,7 +90,7 @@ fn load_embedding_data(path: &Path) -> Result<EmbeddingData> {
     }
     let decompressed =
         zstd::decode_all(compressed).map_err(CrgError::Io)?;
-    let (data, _): (EmbeddingData, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
+    let data: EmbeddingData = postcard::from_bytes(&decompressed)?;
     Ok(data)
 }
 
@@ -579,7 +579,7 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
 // EmbeddingStore
 // ---------------------------------------------------------------------------
 
-/// Embedding storage backed by a bincode/zstd file.
+/// Embedding storage backed by a postcard/zstd file.
 pub struct EmbeddingStore {
     data: EmbeddingData,
     path: PathBuf,

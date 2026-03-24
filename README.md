@@ -25,7 +25,7 @@ This is a complete Rust rewrite of the original Python implementation, preservin
 | Scale | **PageRank auto-kicks in** at 10k+ nodes — no blast radius explosion |
 | Embeddings | **Free and local** — works out of the box, no API key |
 | Freshness | **Automatic** — background watcher + lazy stale-check, zero manual builds |
-| Disk usage | **4-10x smaller** graph files (bincode + zstd) |
+| Disk usage | **4-10x smaller** graph files (postcard + zstd) |
 
 ---
 
@@ -34,7 +34,7 @@ This is a complete Rust rewrite of the original Python implementation, preservin
 | | Python (original) | Rust (this fork) |
 |---|---|---|
 | **Parsing** | Sequential, single-threaded | **Parallel via rayon** — all CPU cores parse concurrently |
-| **Storage** | SQLite WAL + 3 tables + 7 indexes | **In-memory StableGraph**, persisted as bincode + zstd |
+| **Storage** | SQLite WAL + 3 tables + 7 indexes | **In-memory StableGraph**, persisted as postcard + zstd |
 | **Blast radius** | Flat bidirectional BFS, all edges equal | **Direction-aware, weighted, with decay** — 30-50% fewer false positives |
 | **Large graph scaling** | BFS explodes on hub nodes | **Auto PageRank** at 10k+ nodes, dampens hubs proportionally |
 | **Diff seeding** | All nodes in changed files | **Node-level** — only functions whose `body_hash` changed |
@@ -89,13 +89,13 @@ Language-specific extraction rules are defined in declarative [`.scm` query file
 | [FastAPI](https://github.com/fastapi/fastapi) | 1,122 | 6.61s | **0.90s** | **7.3x** |
 | [Next.js](https://github.com/vercel/next.js) | 2,382 | 305s | **3.97s** | **76.8x** |
 
-Build speedup scales with repo size thanks to **rayon parallel parsing** — all CPU cores parse files concurrently while the graph store writes sequentially. Small repos see modest gains (thread pool overhead), but large codebases see 50-80x improvements where the parallelism and bincode persistence compound.
+Build speedup scales with repo size thanks to **rayon parallel parsing** — all CPU cores parse files concurrently while the graph store writes sequentially. Small repos see modest gains (thread pool overhead), but large codebases see 50-80x improvements where the parallelism and postcard persistence compound.
 
 ### Micro-benchmarks (criterion, 1000-node synthetic graph)
 
 | Operation | Python | Rust | Speedup |
 |-----------|--------|------|--------:|
-| Graph save (1k nodes) | 146.7 ms | **2.8 ms** | **52x** |
+| Graph save (1k nodes) | 146.7 ms | **2.5 ms** | **59x** |
 | Graph load + stats | 120 ms | **62 ms** | 2x |
 | Impact radius (warm) | 853 us | **470 us** | 1.8x |
 | Node search | 146 us | **8.3 us** | **18x** |
@@ -319,7 +319,7 @@ That's it. Run `cargo test` to verify extraction works, then `cargo bench` to ch
 ```
 src/
 ├── parser.rs         # Multi-language tree-sitter parser (14 grammars)
-├── graph.rs          # StableGraph + bincode/zstd persistence
+├── graph.rs          # StableGraph + postcard/zstd persistence
 ├── incremental.rs    # Git ops, full/incremental build, watch
 ├── tools.rs          # 9 MCP tools
 ├── server.rs         # rmcp MCP server (stdio) + background watcher

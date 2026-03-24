@@ -5,7 +5,8 @@ use code_review_graph::{
     parser::CodeParser,
     types::{EdgeInfo, EdgeKind, NodeInfo, NodeKind},
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use tempfile::TempDir;
 
 fn grammar_check_ok(parser: &CodeParser, path: &Path, label: &str) -> bool {

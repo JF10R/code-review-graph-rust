@@ -1,7 +1,7 @@
-//! Petgraph-backed graph store with bincode+zstd persistence.
+//! Petgraph-backed graph store with postcard+zstd persistence.
 //!
 //! The entire graph lives in memory as a `StableGraph`. Persistence is a
-//! single atomic file write: `graph.bin.zst` (zstd-compressed bincode with a
+//! single atomic file write: `graph.bin.zst` (zstd-compressed postcard with a
 //! 4-byte magic header and a CRC-32 integrity check).
 //!
 //! SQLite is no longer used here — see `embeddings.rs` for the embeddings DB.
@@ -68,7 +68,7 @@ fn save(data: &GraphData, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
+    let payload = postcard::to_allocvec(data)?;
     let compressed = zstd::encode_all(&payload[..], 3)
         .map_err(|e| CrgError::Io(e))?;
     let crc = crc32fast::hash(&compressed);
@@ -106,7 +106,7 @@ fn load(path: &Path) -> Result<GraphData> {
     }
     let decompressed = zstd::decode_all(compressed)
         .map_err(|e| CrgError::Io(e))?;
-    let (data, _): (GraphData, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
+    let data: GraphData = postcard::from_bytes(&decompressed)?;
     Ok(data)
 }
 
@@ -115,7 +115,7 @@ fn load(path: &Path) -> Result<GraphData> {
 // ---------------------------------------------------------------------------
 
 /// In-memory graph store backed by petgraph, persisted to disk as
-/// a zstd-compressed bincode blob.
+/// a zstd-compressed postcard blob.
 pub struct GraphStore {
     data: GraphData,
     /// Path to the `.bin.zst` file.

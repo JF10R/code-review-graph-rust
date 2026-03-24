@@ -7,7 +7,6 @@ use code_review_graph::graph::GraphStore;
 use code_review_graph::incremental::{full_build, get_db_path, incremental_update};
 use code_review_graph::parser::CodeParser;
 use code_review_graph::tools::{build_or_update_graph, list_graph_stats, query_graph};
-use code_review_graph::types::EdgeKind;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
