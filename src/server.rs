@@ -144,6 +144,23 @@ struct LargeFunctionsParams {
     repo_root: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TraceCallChainParams {
+    #[schemars(description = "Function name or qualified name for the start of the chain")]
+    from: String,
+    #[schemars(description = "Function name or qualified name for the end of the chain")]
+    to: String,
+    #[schemars(description = "Maximum number of hops to traverse (default: 10)")]
+    #[serde(default = "default_chain_depth")]
+    max_depth: usize,
+    #[schemars(description = "If true, return slim node objects. Reduces response tokens ~40%.")]
+    #[serde(default)]
+    compact: bool,
+    #[schemars(description = "Repository root path. Auto-detected if omitted.")]
+    #[serde(default)]
+    repo_root: Option<String>,
+}
+
 // Default value helpers
 fn default_base() -> String { "HEAD~1".to_string() }
 fn default_max_depth() -> usize { 2 }
@@ -152,6 +169,7 @@ fn default_max_lines() -> usize { 200 }
 fn default_search_limit() -> usize { 20 }
 fn default_min_lines() -> usize { 50 }
 fn default_large_limit() -> usize { 50 }
+fn default_chain_depth() -> usize { 10 }
 
 // ---------------------------------------------------------------------------
 // MCP server struct
@@ -391,6 +409,32 @@ impl CodeReviewServer {
                 p.kind.as_deref(),
                 p.file_path_pattern.as_deref(),
                 p.limit,
+                repo_root.as_deref(),
+            )
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Find the shortest call chain between two functions.
+    /// Traverses CALLS edges to show how function A connects to function B
+    /// through intermediate calls. Useful for understanding data flow,
+    /// tracing bug propagation, and mapping dependency chains.
+    /// Try outgoing (callee) direction first, then incoming (caller) direction.
+    #[tool(name = "trace_call_chain")]
+    async fn trace_call_chain_tool(
+        &self,
+        Parameters(p): Parameters<TraceCallChainParams>,
+    ) -> std::result::Result<String, String> {
+        let repo_root = self.resolve_repo_root(p.repo_root);
+        tokio::task::spawn_blocking(move || {
+            crate::tools::trace_call_chain(
+                &p.from,
+                &p.to,
+                p.max_depth,
+                p.compact,
                 repo_root.as_deref(),
             )
             .map(|v| v.to_string())
