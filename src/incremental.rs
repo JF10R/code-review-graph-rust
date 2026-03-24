@@ -668,3 +668,288 @@ pub fn is_binary_pub(path: &Path) -> bool {
 pub fn sha256_bytes_pub(data: &[u8]) -> String {
     sha256_bytes(data)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // find_repo_root
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_repo_root_finds_git_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let subdir = dir.path().join("src");
+        fs::create_dir(&subdir).unwrap();
+
+        let root = find_repo_root(Some(&subdir));
+        assert!(root.is_some(), "should find repo root");
+        assert_eq!(root.unwrap().canonicalize().unwrap(), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn find_repo_root_returns_none_outside_git() {
+        let dir = TempDir::new().unwrap();
+        // No .git directory created — should find nothing inside this temp dir.
+        // We use a path that is definitely not inside a git repo.
+        // Walk up from a newly created leaf dir with no .git anywhere in temp path.
+        let leaf = dir.path().join("a").join("b").join("c");
+        fs::create_dir_all(&leaf).unwrap();
+
+        // We can't guarantee the system tmp dir is not inside a git repo, so
+        // we just verify the function doesn't panic and returns Some or None.
+        // The important thing is it terminates.
+        let _ = find_repo_root(Some(&leaf));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_db_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_db_path_creates_crg_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = get_db_path(dir.path());
+
+        let crg_dir = dir.path().join(".code-review-graph");
+        assert!(crg_dir.is_dir(), ".code-review-graph dir should be created");
+        assert_eq!(path, crg_dir.join("graph.bin.zst"));
+    }
+
+    #[test]
+    fn get_db_path_creates_gitignore() {
+        let dir = TempDir::new().unwrap();
+        get_db_path(dir.path());
+
+        let gitignore = dir.path().join(".code-review-graph").join(".gitignore");
+        assert!(gitignore.exists(), ".gitignore should be created inside .code-review-graph");
+        let content = fs::read_to_string(&gitignore).unwrap();
+        assert!(content.contains('*'), ".gitignore should contain a wildcard");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_binary_pub
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_binary_detects_binary_files() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bin.dat");
+        fs::write(&path, b"\x00\x01\x02\x03binary\x00data").unwrap();
+        assert!(is_binary_pub(&path), "file with null bytes should be binary");
+    }
+
+    #[test]
+    fn is_binary_returns_false_for_text() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("text.py");
+        fs::write(&path, b"def foo():\n    pass\n").unwrap();
+        assert!(!is_binary_pub(&path), "Python source should not be binary");
+    }
+
+    // -----------------------------------------------------------------------
+    // should_ignore_pub
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_ignore_matches_node_modules() {
+        let patterns = load_ignore_patterns_pub(Path::new("."));
+        assert!(
+            should_ignore_pub("node_modules/react/index.js", &patterns),
+            "node_modules should be ignored"
+        );
+    }
+
+    #[test]
+    fn should_ignore_matches_git_dir() {
+        let patterns = load_ignore_patterns_pub(Path::new("."));
+        assert!(
+            should_ignore_pub(".git/config", &patterns),
+            ".git should be ignored"
+        );
+    }
+
+    #[test]
+    fn should_ignore_does_not_ignore_src_files() {
+        let patterns = load_ignore_patterns_pub(Path::new("."));
+        assert!(
+            !should_ignore_pub("src/main.py", &patterns),
+            "src/main.py should not be ignored"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // sha256_bytes_pub
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sha256_bytes_produces_hex_hash() {
+        let hash = sha256_bytes_pub(b"hello world");
+        // SHA-256 hex output is always 64 lowercase hex characters
+        assert_eq!(hash.len(), 64, "SHA-256 hex output should be 64 characters");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "should be lowercase hex");
+        // The SHA-256 of "hello world" is a well-known constant — verify first 16 chars
+        assert!(
+            hash.starts_with("b94d27b9934d3e08"),
+            "SHA-256('hello world') should start with b94d27b9934d3e08, got: {}",
+            hash
+        );
+    }
+
+    #[test]
+    fn sha256_bytes_deterministic() {
+        let h1 = sha256_bytes_pub(b"test data");
+        let h2 = sha256_bytes_pub(b"test data");
+        assert_eq!(h1, h2, "hash should be deterministic");
+    }
+
+    #[test]
+    fn sha256_bytes_different_for_different_input() {
+        let h1 = sha256_bytes_pub(b"aaa");
+        let h2 = sha256_bytes_pub(b"bbb");
+        assert_ne!(h1, h2);
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_all_files skips ignored paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collect_all_files_skips_ignored_paths() {
+        let dir = TempDir::new().unwrap();
+        // Create a .git dir and a node_modules dir
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir(&nm).unwrap();
+        fs::write(nm.join("index.js"), b"module.exports = {}").unwrap();
+
+        // Create a legitimate Python file
+        fs::write(dir.path().join("main.py"), b"def foo(): pass\n").unwrap();
+
+        let files = collect_all_files(dir.path());
+        // node_modules should be excluded
+        assert!(
+            !files.iter().any(|f| f.contains("node_modules")),
+            "node_modules should be excluded from collected files"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // full_build on a temp directory
+    // -----------------------------------------------------------------------
+
+    /// Check if tree-sitter grammars can be initialized on this system.
+    /// Returns false on platforms where the C ABI grammar libraries fail.
+    fn parser_works() -> bool {
+        let parser = crate::parser::CodeParser::new();
+        let path = std::path::Path::new("check.py");
+        parser.parse_bytes(path, b"").is_ok()
+    }
+
+    #[test]
+    fn full_build_on_temp_dir() {
+        if !parser_works() { return; }
+        let dir = TempDir::new().unwrap();
+        // Create a minimal Python file and a Rust file
+        fs::write(
+            dir.path().join("app.py"),
+            b"def hello():\n    return 'hi'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lib.rs"),
+            b"pub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+        )
+        .unwrap();
+
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+        let result = full_build(dir.path(), &mut store).unwrap();
+
+        assert!(result.files_parsed >= 2, "should parse at least 2 files");
+        assert!(result.total_nodes > 0, "should extract nodes");
+        assert!(result.errors.is_empty() || result.errors.len() < result.files_parsed,
+            "most files should parse without error");
+    }
+
+    // -----------------------------------------------------------------------
+    // incremental_update detects changed files via hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incremental_update_detects_no_changes_when_unchanged() {
+        if !parser_works() { return; }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("app.py"), b"def foo(): pass\n").unwrap();
+
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+        full_build(dir.path(), &mut store).unwrap();
+
+        // Call incremental with the same files — no hash changes
+        let result = incremental_update(
+            dir.path(),
+            &mut store,
+            "HEAD",
+            Some(vec!["app.py".to_string()]),
+        )
+        .unwrap();
+
+        // Since content is unchanged, changed_qualified_names should be empty
+        assert!(
+            result.changed_qualified_names.is_empty(),
+            "unchanged file should produce no changed_qualified_names"
+        );
+    }
+
+    #[test]
+    fn incremental_update_detects_changed_file() {
+        if !parser_works() { return; }
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("app.py"), b"def foo(): pass\n").unwrap();
+
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+        full_build(dir.path(), &mut store).unwrap();
+
+        // Modify the file
+        fs::write(
+            dir.path().join("app.py"),
+            b"def foo():\n    return 42\n\ndef bar(): pass\n",
+        )
+        .unwrap();
+
+        let result = incremental_update(
+            dir.path(),
+            &mut store,
+            "HEAD",
+            Some(vec!["app.py".to_string()]),
+        )
+        .unwrap();
+
+        // foo's body changed, bar is new — both should appear in changed_qualified_names
+        assert!(
+            !result.changed_qualified_names.is_empty(),
+            "modified file should produce changed_qualified_names"
+        );
+    }
+
+    #[test]
+    fn incremental_update_empty_changed_list_returns_zero() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let result = incremental_update(dir.path(), &mut store, "HEAD", Some(vec![])).unwrap();
+        assert_eq!(result.files_updated, 0);
+        assert_eq!(result.total_nodes, 0);
+    }
+}

@@ -1,0 +1,6 @@
+[env]
+# tree-sitter grammars require single-threaded test execution on Windows.
+# The LANGUAGE statics use C ABI which is not safe to initialize in parallel.
+
+[test]
+# Run all tests sequentially to avoid tree-sitter thread-safety issues

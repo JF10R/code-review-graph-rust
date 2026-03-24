@@ -845,3 +845,505 @@ fn pagerank_impact(
         .collect();
     sort_and_truncate(results, max_results)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // Helper: create a fresh in-memory-backed GraphStore with a temp file path
+    // -----------------------------------------------------------------------
+
+    fn test_store() -> (GraphStore, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.bin.zst");
+        let store = GraphStore::new(&path).unwrap();
+        (store, dir)
+    }
+
+    fn make_node(name: &str, qn: &str, file: &str, kind: NodeKind) -> NodeInfo {
+        crate::types::NodeInfo {
+            name: name.to_string(),
+            qualified_name: qn.to_string(),
+            kind,
+            file_path: file.to_string(),
+            line_start: 1,
+            line_end: 10,
+            language: "python".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: format!("hash_{name}"),
+        }
+    }
+
+    fn make_edge(src: &str, tgt: &str, kind: EdgeKind, file: &str) -> EdgeInfo {
+        crate::types::EdgeInfo {
+            source_qualified: src.to_string(),
+            target_qualified: tgt.to_string(),
+            kind,
+            file_path: file.to_string(),
+            line: 1,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // store_file_nodes_edges + get_node
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn store_and_get_node() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![make_node("foo", "file.py::foo", "file.py", NodeKind::Function)];
+        let edges = vec![];
+        store
+            .store_file_nodes_edges("file.py", &nodes, &edges, "abc123")
+            .unwrap();
+
+        let node = store.get_node("file.py::foo").unwrap();
+        assert!(node.is_some());
+        let node = node.unwrap();
+        assert_eq!(node.name, "foo");
+        assert_eq!(node.qualified_name, "file.py::foo");
+        assert_eq!(node.kind, NodeKind::Function);
+    }
+
+    #[test]
+    fn store_replaces_old_data_on_recall() {
+        let (mut store, _dir) = test_store();
+        // First store: two nodes
+        let nodes1 = vec![
+            make_node("foo", "file.py::foo", "file.py", NodeKind::Function),
+            make_node("bar", "file.py::bar", "file.py", NodeKind::Function),
+        ];
+        store
+            .store_file_nodes_edges("file.py", &nodes1, &[], "hash1")
+            .unwrap();
+
+        // Second store: replace with one node
+        let nodes2 = vec![make_node("baz", "file.py::baz", "file.py", NodeKind::Function)];
+        store
+            .store_file_nodes_edges("file.py", &nodes2, &[], "hash2")
+            .unwrap();
+
+        // Old nodes must be gone
+        assert!(store.get_node("file.py::foo").unwrap().is_none());
+        assert!(store.get_node("file.py::bar").unwrap().is_none());
+        // New node is present
+        assert!(store.get_node("file.py::baz").unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_file_data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_file_data_clears_nodes() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![make_node("foo", "file.py::foo", "file.py", NodeKind::Function)];
+        store
+            .store_file_nodes_edges("file.py", &nodes, &[], "hash1")
+            .unwrap();
+
+        store.remove_file_data("file.py").unwrap();
+
+        assert!(store.get_node("file.py::foo").unwrap().is_none());
+        assert!(store.get_nodes_by_file("file.py").unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_nodes_by_file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_nodes_by_file_returns_all_nodes() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("foo", "file.py::foo", "file.py", NodeKind::Function),
+            make_node("Bar", "file.py::Bar", "file.py", NodeKind::Class),
+        ];
+        store
+            .store_file_nodes_edges("file.py", &nodes, &[], "h1")
+            .unwrap();
+
+        let file_nodes = store.get_nodes_by_file("file.py").unwrap();
+        assert_eq!(file_nodes.len(), 2);
+        let names: Vec<&str> = file_nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"foo"));
+        assert!(names.contains(&"Bar"));
+    }
+
+    #[test]
+    fn get_nodes_by_file_empty_for_unknown_file() {
+        let (store, _dir) = test_store();
+        assert!(store.get_nodes_by_file("nonexistent.py").unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_all_files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_all_files_lists_file_nodes() {
+        let (mut store, _dir) = test_store();
+        // File node has NodeKind::File
+        let nodes_a = vec![make_node("a.py", "a.py", "a.py", NodeKind::File)];
+        let nodes_b = vec![make_node("b.py", "b.py", "b.py", NodeKind::File)];
+        store
+            .store_file_nodes_edges("a.py", &nodes_a, &[], "h1")
+            .unwrap();
+        store
+            .store_file_nodes_edges("b.py", &nodes_b, &[], "h2")
+            .unwrap();
+
+        let files = store.get_all_files().unwrap();
+        assert!(files.contains(&"a.py".to_string()));
+        assert!(files.contains(&"b.py".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // search_nodes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_nodes_case_insensitive() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![make_node("FooBar", "file.py::FooBar", "file.py", NodeKind::Function)];
+        store
+            .store_file_nodes_edges("file.py", &nodes, &[], "h1")
+            .unwrap();
+
+        let results = store.search_nodes("foobar", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "FooBar");
+    }
+
+    #[test]
+    fn search_nodes_multi_word_and_logic() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("process_request", "f.py::process_request", "f.py", NodeKind::Function),
+            make_node("process_response", "f.py::process_response", "f.py", NodeKind::Function),
+            make_node("send_email", "f.py::send_email", "f.py", NodeKind::Function),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &[], "h1")
+            .unwrap();
+
+        // Both words must match
+        let results = store.search_nodes("process request", 10).unwrap();
+        let names: Vec<&str> = results.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"process_request"), "should find process_request");
+        assert!(!names.contains(&"send_email"), "should not find send_email");
+    }
+
+    #[test]
+    fn search_nodes_empty_query_returns_empty() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![make_node("foo", "f.py::foo", "f.py", NodeKind::Function)];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &[], "h1")
+            .unwrap();
+
+        let results = store.search_nodes("   ", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_nodes_by_size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_nodes_by_size_filters_small() {
+        let (mut store, _dir) = test_store();
+        // large node: 100 lines
+        let mut large = make_node("large_fn", "f.py::large_fn", "f.py", NodeKind::Function);
+        large.line_start = 1;
+        large.line_end = 100;
+        // small node: 5 lines
+        let mut small = make_node("small_fn", "f.py::small_fn", "f.py", NodeKind::Function);
+        small.line_start = 110;
+        small.line_end = 114;
+
+        store
+            .store_file_nodes_edges("f.py", &[large, small], &[], "h1")
+            .unwrap();
+
+        let results = store.get_nodes_by_size(50, None, None, 10).unwrap();
+        let names: Vec<&str> = results.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"large_fn"));
+        assert!(!names.contains(&"small_fn"));
+    }
+
+    #[test]
+    fn get_nodes_by_size_sorted_descending() {
+        let (mut store, _dir) = test_store();
+        let mut n50 = make_node("fifty", "f.py::fifty", "f.py", NodeKind::Function);
+        n50.line_start = 1;
+        n50.line_end = 50;
+        let mut n200 = make_node("twohundred", "f.py::twohundred", "f.py", NodeKind::Function);
+        n200.line_start = 60;
+        n200.line_end = 259;
+
+        store
+            .store_file_nodes_edges("f.py", &[n50, n200], &[], "h1")
+            .unwrap();
+
+        let results = store.get_nodes_by_size(1, None, None, 10).unwrap();
+        assert_eq!(results[0].name, "twohundred");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_edges_by_source / get_edges_by_target
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn edges_by_source_and_target() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("caller", "f.py::caller", "f.py", NodeKind::Function),
+            make_node("callee", "f.py::callee", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![make_edge("f.py::caller", "f.py::callee", EdgeKind::Calls, "f.py")];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        let by_src = store.get_edges_by_source("f.py::caller").unwrap();
+        assert_eq!(by_src.len(), 1);
+        assert_eq!(by_src[0].kind, EdgeKind::Calls);
+        assert_eq!(by_src[0].target_qualified, "f.py::callee");
+
+        let by_tgt = store.get_edges_by_target("f.py::callee").unwrap();
+        assert_eq!(by_tgt.len(), 1);
+        assert_eq!(by_tgt[0].source_qualified, "f.py::caller");
+    }
+
+    #[test]
+    fn duplicate_edges_not_added() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("a", "f.py::a", "f.py", NodeKind::Function),
+            make_node("b", "f.py::b", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![
+            make_edge("f.py::a", "f.py::b", EdgeKind::Calls, "f.py"),
+            make_edge("f.py::a", "f.py::b", EdgeKind::Calls, "f.py"),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        let by_src = store.get_edges_by_source("f.py::a").unwrap();
+        // Should only have one edge, not two
+        assert_eq!(by_src.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_impact_radius — weighted BFS (small graph)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn impact_radius_bfs_finds_callers() {
+        let (mut store, _dir) = test_store();
+        // "a" (in caller.py) calls "b" (in lib.py).
+        // When lib.py changes, "a" (the caller in caller.py) should be impacted.
+        // Nodes in different files so that seeds (lib.py nodes) ≠ callers (caller.py nodes).
+        let lib_nodes = vec![
+            make_node("b", "lib.py::b", "lib.py", NodeKind::Function),
+        ];
+        let caller_nodes = vec![
+            make_node("a", "caller.py::a", "caller.py", NodeKind::Function),
+        ];
+        // a calls b — edge from a → b
+        let edges = vec![make_edge("caller.py::a", "lib.py::b", EdgeKind::Calls, "caller.py")];
+        store
+            .store_file_nodes_edges("lib.py", &lib_nodes, &[], "h_lib")
+            .unwrap();
+        // Store the edge with the caller nodes
+        store
+            .store_file_nodes_edges("caller.py", &caller_nodes, &edges, "h_caller")
+            .unwrap();
+
+        // Change lib.py — seeds are lib.py nodes only
+        let result = store
+            .get_impact_radius(&["lib.py".to_string()], 5, 50, None)
+            .unwrap();
+
+        assert_eq!(result.algorithm, "weighted_bfs");
+        // a is in caller.py (not a seed) and calls b (in lib.py which changed)
+        // so a should appear as impacted
+        let impacted_names: Vec<&str> = result
+            .impacted_nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            impacted_names.contains(&"a"),
+            "caller 'a' should be impacted when 'b' (which it calls) changes; \
+             impacted: {:?}",
+            impacted_names
+        );
+    }
+
+    #[test]
+    fn impact_radius_with_changed_nodes_seed() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("x", "f.py::x", "f.py", NodeKind::Function),
+            make_node("y", "f.py::y", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![make_edge("f.py::x", "f.py::y", EdgeKind::Calls, "f.py")];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        // Seed with changed_nodes=["f.py::y"] — x (caller) should be impacted
+        let result = store
+            .get_impact_radius(
+                &["f.py".to_string()],
+                5,
+                50,
+                Some(&["f.py::y".to_string()]),
+            )
+            .unwrap();
+
+        let impacted_names: Vec<&str> = result
+            .impacted_nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(impacted_names.contains(&"x"));
+    }
+
+    // -----------------------------------------------------------------------
+    // get_stats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_stats_counts_correctly() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("Foo", "f.py::Foo", "f.py", NodeKind::Class),
+            make_node("bar", "f.py::bar", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![make_edge("f.py::Foo", "f.py::bar", EdgeKind::Contains, "f.py")];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        let stats = store.get_stats().unwrap();
+        assert_eq!(stats.total_nodes, 2);
+        assert_eq!(stats.total_edges, 1);
+        assert!(stats.nodes_by_kind.contains_key("Class"));
+        assert!(stats.nodes_by_kind.contains_key("Function"));
+        assert!(stats.edges_by_kind.contains_key("CONTAINS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // set_metadata / get_metadata
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metadata_roundtrip() {
+        let (mut store, _dir) = test_store();
+        store.set_metadata("last_updated", "2024-01-01T00:00:00").unwrap();
+        let val = store.get_metadata("last_updated").unwrap();
+        assert_eq!(val, Some("2024-01-01T00:00:00".to_string()));
+    }
+
+    #[test]
+    fn metadata_missing_key_returns_none() {
+        let (store, _dir) = test_store();
+        let val = store.get_metadata("nonexistent").unwrap();
+        assert!(val.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // save + load roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.bin.zst");
+
+        {
+            let mut store = GraphStore::new(&path).unwrap();
+            let nodes = vec![make_node("roundtrip_fn", "f.py::roundtrip_fn", "f.py", NodeKind::Function)];
+            store
+                .store_file_nodes_edges("f.py", &nodes, &[], "hash99")
+                .unwrap();
+            store.set_metadata("key", "value").unwrap();
+            store.commit().unwrap();
+        }
+
+        // Reload from disk
+        let store2 = GraphStore::new(&path).unwrap();
+        let node = store2.get_node("f.py::roundtrip_fn").unwrap();
+        assert!(node.is_some(), "node should survive save+load");
+        assert_eq!(store2.get_metadata("key").unwrap(), Some("value".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Corrupt file triggers error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn corrupt_file_bad_magic_starts_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.bin.zst");
+        // Write garbage — bad magic bytes
+        std::fs::write(&path, b"BADBYTES_NOT_CRG_MAGIC").unwrap();
+
+        // GraphStore::new should not panic — it falls back to empty graph
+        let store = GraphStore::new(&path).unwrap();
+        assert_eq!(store.get_stats().unwrap().total_nodes, 0);
+    }
+
+    #[test]
+    fn corrupt_file_bad_crc_starts_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("crc.bin.zst");
+        // Write valid magic but broken CRC (all zeros after magic)
+        let mut data = b"CRG\x01".to_vec();
+        data.extend_from_slice(&[0u8; 100]); // bad CRC + garbage compressed payload
+        std::fs::write(&path, &data).unwrap();
+
+        let store = GraphStore::new(&path).unwrap();
+        assert_eq!(store.get_stats().unwrap().total_nodes, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_body_hashes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_body_hashes_returns_map() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("fn1", "f.py::fn1", "f.py", NodeKind::Function),
+            make_node("fn2", "f.py::fn2", "f.py", NodeKind::Function),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &[], "h1")
+            .unwrap();
+
+        let hashes = store.get_body_hashes("f.py");
+        assert!(hashes.contains_key("f.py::fn1"));
+        assert!(hashes.contains_key("f.py::fn2"));
+        assert!(!hashes["f.py::fn1"].is_empty());
+    }
+
+    #[test]
+    fn get_body_hashes_empty_for_unknown_file() {
+        let (store, _dir) = test_store();
+        let hashes = store.get_body_hashes("nonexistent.py");
+        assert!(hashes.is_empty());
+    }
+}
