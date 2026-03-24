@@ -877,3 +877,118 @@ pub fn node_to_text(node: &GraphNode) -> String {
     }
     parts.join(" ")
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{GraphNode, NodeKind};
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_opposite_vectors() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![-1.0f32, -2.0, -3.0];
+        assert!((cosine_similarity(&a, &b) - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_vectors() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vector() {
+        let a = vec![0.0f32, 0.0, 0.0];
+        let b = vec![1.0f32, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+        assert_eq!(cosine_similarity(&b, &a), 0.0);
+    }
+
+    #[test]
+    fn cosine_similarity_dimension_mismatch() {
+        let a = vec![1.0f32, 2.0];
+        let b = vec![1.0f32, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn node_to_text_with_all_fields() {
+        let node = GraphNode {
+            name: "parse_config".to_string(),
+            qualified_name: "mod::parse_config".to_string(),
+            kind: NodeKind::Function,
+            file_path: "src/config.rs".to_string(),
+            line_start: 10,
+            line_end: 30,
+            language: "rust".to_string(),
+            is_test: false,
+            docstring: "Parse configuration from file".to_string(),
+            signature: "fn parse_config(path: &Path) -> Config".to_string(),
+            body_hash: "abc".to_string(),
+            file_hash: "def".to_string(),
+        };
+        let text = node_to_text(&node);
+        assert!(text.contains("parse_config"));
+        assert!(text.contains("function"));
+        assert!(text.contains("rust"));
+    }
+
+    #[test]
+    fn node_to_text_without_optional_fields() {
+        let node = GraphNode {
+            name: "Foo".to_string(),
+            qualified_name: "Foo".to_string(),
+            kind: NodeKind::Class,
+            file_path: "foo.py".to_string(),
+            line_start: 1,
+            line_end: 5,
+            language: String::new(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: String::new(),
+            file_hash: String::new(),
+        };
+        let text = node_to_text(&node);
+        assert!(text.contains("Foo"));
+        assert!(text.contains("class"));
+    }
+
+    #[test]
+    fn embedding_store_count_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.embeddings.bin.zst");
+        let store = EmbeddingStore::new(&path).unwrap();
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn embedding_store_save_reload_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.embeddings.bin.zst");
+        let mut store = EmbeddingStore::new(&path).unwrap();
+        store.data.vectors.insert(
+            "mod::foo".to_string(),
+            (vec![1.0, 2.0, 3.0], "hash1".to_string(), "test".to_string()),
+        );
+        store.save().unwrap();
+
+        let reloaded = EmbeddingStore::new(&path).unwrap();
+        assert_eq!(reloaded.count().unwrap(), 1);
+        let (vec, hash, provider) = reloaded.data.vectors.get("mod::foo").unwrap();
+        assert_eq!(vec, &[1.0, 2.0, 3.0]);
+        assert_eq!(hash, "hash1");
+        assert_eq!(provider, "test");
+    }
+}

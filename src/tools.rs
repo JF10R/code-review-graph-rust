@@ -866,7 +866,7 @@ pub fn hybrid_query(
     let keyword_hits = store.search_nodes(query, limit * 2)?;
 
     let method;
-    let mut rrf_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut rrf_scores: HashMap<String, f64> = HashMap::new();
 
     // Populate keyword ranks
     for (rank, node) in keyword_hits.iter().enumerate() {
