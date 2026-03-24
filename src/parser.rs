@@ -1286,4 +1286,71 @@ func main() { Hello() }
         let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
         assert!(!calls.is_empty(), "expected CALLS edge in go");
     }
+
+    /// Vue SFC parsing test.
+    ///
+    /// TODO: Full Vue SFC support requires a 2-pass approach:
+    ///   1. Parse the `.vue` file with `tree-sitter-vue` to locate the `<script>` block.
+    ///   2. Extract the script block source text and re-parse it with the JS/TS grammar.
+    ///
+    /// `tree-sitter-vue` is not yet in Cargo.toml. Until it is added, `.vue` files are
+    /// unrecognised by `detect_language` and the parser returns an empty result set.
+    ///
+    /// Required Cargo.toml additions when implementing:
+    ///   tree-sitter-vue = "0.x"   # once a stable crate is published
+    ///
+    /// Once implemented the test assertions below (currently `assert!(nodes.is_empty())`)
+    /// should be flipped to verify that `setup` and the `ref` import are extracted with
+    /// `language == "typescript"` (or "javascript" when no `lang` attribute is present).
+    #[test]
+    fn vue_sfc_parsing() {
+        // Read the fixture created alongside this test.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/test.vue");
+        let src = std::fs::read(&fixture)
+            .expect("tests/fixtures/test.vue must exist");
+
+        let parser = CodeParser::new();
+
+        // Language detection: .vue is not yet supported — expect None.
+        assert_eq!(
+            parser.detect_language(&fixture),
+            None,
+            // TODO: change to Some(\"vue\") once detect_language handles .vue
+            "TODO: detect_language should return Some(\"vue\") after tree-sitter-vue is added"
+        );
+
+        // parse_bytes returns Ok(([], [])) for unknown extensions — no panic.
+        let (nodes, edges) = parser
+            .parse_bytes(&fixture, &src)
+            .expect("parse_bytes must not error on unknown extension");
+
+        // TODO: once Vue SFC support is implemented, replace these assertions:
+        //
+        //   let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        //   assert!(names.contains(&"setup"), "expected setup function extracted from <script>");
+        //
+        //   let import_edges: Vec<_> = edges.iter()
+        //       .filter(|e| e.kind == EdgeKind::ImportsFrom)
+        //       .collect();
+        //   assert!(!import_edges.is_empty(), "expected ref import from vue");
+        //
+        //   let script_nodes: Vec<_> = nodes.iter()
+        //       .filter(|n| n.name != fixture.to_string_lossy().as_ref())
+        //       .collect();
+        //   assert!(
+        //       script_nodes.iter().all(|n| n.language == "typescript" || n.language == "javascript"),
+        //       "script-block nodes must carry js/ts language, not \"vue\""
+        //   );
+
+        // Current (stub) behaviour: no nodes/edges extracted from unrecognised extension.
+        assert!(
+            nodes.is_empty(),
+            "until tree-sitter-vue is wired up, no nodes should be extracted from .vue files"
+        );
+        assert!(
+            edges.is_empty(),
+            "until tree-sitter-vue is wired up, no edges should be extracted from .vue files"
+        );
+    }
 }
