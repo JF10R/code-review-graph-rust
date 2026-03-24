@@ -174,10 +174,14 @@ pub struct GraphStats {
 pub struct ImpactResult {
     pub changed_nodes: Vec<GraphNode>,
     pub impacted_nodes: Vec<GraphNode>,
+    /// qualified_name → impact score (higher = more impacted).
+    pub impact_scores: HashMap<String, f64>,
     pub impacted_files: Vec<String>,
     pub edges: Vec<GraphEdge>,
     pub truncated: bool,
     pub total_impacted: usize,
+    /// Algorithm used: "weighted_bfs" or "pagerank".
+    pub algorithm: String,
 }
 
 // ---------------------------------------------------------------------------

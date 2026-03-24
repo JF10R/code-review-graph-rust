@@ -334,6 +334,8 @@ pub struct UpdateResult {
     pub changed_files: Vec<String>,
     pub dependent_files: Vec<String>,
     pub errors: Vec<BuildError>,
+    /// Qualified names of nodes whose body actually changed (not just file-level changes).
+    pub changed_qualified_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -443,6 +445,7 @@ pub fn incremental_update(
             changed_files: vec![],
             dependent_files: vec![],
             errors: vec![],
+            changed_qualified_names: vec![],
         });
     }
 
@@ -466,6 +469,7 @@ pub fn incremental_update(
     let mut total_nodes = 0usize;
     let mut total_edges = 0usize;
     let mut errors = Vec::new();
+    let mut changed_qualified_names: Vec<String> = Vec::new();
 
     for rel_path in &all_files {
         if should_ignore(rel_path, &ignore_patterns) {
@@ -494,10 +498,29 @@ pub fn incremental_update(
             continue;
         }
 
+        // Snapshot old body_hashes before re-parsing
+        let abs_path_str = abs_path.to_string_lossy().into_owned();
+        let old_hashes = store.get_body_hashes(&abs_path_str);
+
         match parse_and_store_file(&parser, repo_root, rel_path, store) {
             Ok((n, e)) => {
                 total_nodes += n;
                 total_edges += e;
+
+                // Diff body_hashes to find which nodes actually changed
+                let new_hashes = store.get_body_hashes(&abs_path_str);
+                for (qn, new_hash) in &new_hashes {
+                    let old_hash = old_hashes.get(qn).map(String::as_str).unwrap_or("");
+                    if old_hash != new_hash.as_str() {
+                        changed_qualified_names.push(qn.clone());
+                    }
+                }
+                // Nodes that existed before but are now gone also count as changed
+                for qn in old_hashes.keys() {
+                    if !new_hashes.contains_key(qn) {
+                        changed_qualified_names.push(qn.clone());
+                    }
+                }
             }
             Err(err) => errors.push(err),
         }
@@ -514,6 +537,7 @@ pub fn incremental_update(
         changed_files,
         dependent_files,
         errors,
+        changed_qualified_names,
     })
 }
 

@@ -637,6 +637,13 @@ impl GraphStore {
 // Impact analysis helpers (pure functions, operate on GraphData)
 // ---------------------------------------------------------------------------
 
+/// Sort `(qualified_name, score)` pairs descending by score, truncate to `limit`.
+fn sort_and_truncate(mut results: Vec<(String, f64)>, limit: usize) -> Vec<(String, f64)> {
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    results
+}
+
 /// Weight assigned to each edge kind for impact propagation.
 /// Higher = more impactful relationship.
 fn edge_impact_weight(kind: EdgeKind) -> f64 {
@@ -691,18 +698,17 @@ fn weighted_bfs_impact(
     const DECAY: f64 = 0.7;
     const THRESHOLD: f64 = 0.01;
 
-    // Max-heap: (score, depth, qualified_name)
-    let mut heap: BinaryHeap<(OrdF64, std::cmp::Reverse<usize>, String)> = BinaryHeap::new();
+    // Max-heap ordered by score descending. Depth is tracked separately.
+    let mut heap: BinaryHeap<(OrdF64, usize, String)> = BinaryHeap::new();
     let mut best_score: HashMap<String, f64> = HashMap::new();
 
-    // Seed nodes start at score 1.0, depth 0
     for qn in seeds {
         best_score.insert(qn.clone(), 1.0);
-        heap.push((OrdF64(1.0), std::cmp::Reverse(0), qn.clone()));
+        heap.push((OrdF64(1.0), 0, qn.clone()));
     }
 
-    while let Some((OrdF64(score), std::cmp::Reverse(depth), qn)) = heap.pop() {
-        // Skip if we've already processed this node at a higher score
+    while let Some((OrdF64(score), depth, qn)) = heap.pop() {
+        // Lazy deletion: skip stale entries superseded by a better path
         if best_score.get(&qn).copied().unwrap_or(0.0) > score + f64::EPSILON {
             continue;
         }
@@ -712,11 +718,9 @@ fn weighted_bfs_impact(
 
         let Some(&idx) = data.node_index.get(&qn) else { continue };
 
-        // --- INCOMING edges: who depends on me? ---
+        // INCOMING edges: callers/inheritors/importers depend on me — impacted
         for edge_ref in data.graph.edges_directed(idx, Direction::Incoming) {
-            let kind = *edge_ref.weight();
-            let weight = edge_impact_weight(kind);
-            let new_score = score * weight * DECAY;
+            let new_score = score * edge_impact_weight(*edge_ref.weight()) * DECAY;
             if new_score < THRESHOLD {
                 continue;
             }
@@ -724,18 +728,16 @@ fn weighted_bfs_impact(
             let prev = best_score.get(&nb_qn).copied().unwrap_or(0.0);
             if new_score > prev {
                 best_score.insert(nb_qn.clone(), new_score);
-                heap.push((OrdF64(new_score), std::cmp::Reverse(depth + 1), nb_qn));
+                heap.push((OrdF64(new_score), depth + 1, nb_qn));
             }
         }
 
-        // --- OUTGOING edges: only propagate TestedBy ---
+        // OUTGOING edges: only TestedBy propagates — tests must be re-run
         for edge_ref in data.graph.edges_directed(idx, Direction::Outgoing) {
-            let kind = *edge_ref.weight();
-            if kind != EdgeKind::TestedBy {
+            if *edge_ref.weight() != EdgeKind::TestedBy {
                 continue;
             }
-            let weight = edge_impact_weight(kind);
-            let new_score = score * weight * DECAY;
+            let new_score = score * edge_impact_weight(EdgeKind::TestedBy) * DECAY;
             if new_score < THRESHOLD {
                 continue;
             }
@@ -743,18 +745,16 @@ fn weighted_bfs_impact(
             let prev = best_score.get(&nb_qn).copied().unwrap_or(0.0);
             if new_score > prev {
                 best_score.insert(nb_qn.clone(), new_score);
-                heap.push((OrdF64(new_score), std::cmp::Reverse(depth + 1), nb_qn));
+                heap.push((OrdF64(new_score), depth + 1, nb_qn));
             }
         }
     }
 
-    let mut results: Vec<(String, f64)> = best_score
+    let results: Vec<(String, f64)> = best_score
         .into_iter()
         .filter(|(qn, _)| !seeds.contains(qn))
         .collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(max_results);
-    results
+    sort_and_truncate(results, max_results)
 }
 
 /// Personalized PageRank for large graphs (>= 10k nodes).
@@ -771,8 +771,7 @@ fn pagerank_impact(
     let damping: f64 = 0.85;
     let max_iterations: usize = 20;
     let epsilon: f64 = 1e-6;
-    let n = data.graph.node_count();
-    if n == 0 || seeds.is_empty() {
+    if data.graph.node_count() == 0 || seeds.is_empty() {
         return vec![];
     }
 
@@ -842,12 +841,10 @@ fn pagerank_impact(
         }
     }
 
-    let mut results: Vec<(String, f64)> = scores
+    let results: Vec<(String, f64)> = scores
         .iter()
         .filter(|(idx, _)| !seed_indices.contains(idx))
         .map(|(idx, score)| (data.graph[*idx].qualified_name.clone(), *score))
         .collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(max_results);
-    results
+    sort_and_truncate(results, max_results)
 }

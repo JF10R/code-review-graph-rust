@@ -184,6 +184,7 @@ pub fn build_or_update_graph(
                 "total_edges": r.total_edges,
                 "changed_files": r.changed_files,
                 "dependent_files": r.dependent_files,
+                "changed_qualified_names": r.changed_qualified_names,
                 "errors": r.errors,
             })
         }
@@ -224,7 +225,7 @@ pub fn get_impact_radius(
         .map(|f| root.join(f).to_string_lossy().into_owned())
         .collect();
 
-    let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS)?;
+    let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS, None)?;
 
     let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(node_to_dict).collect();
     let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(node_to_dict).collect();
@@ -251,13 +252,24 @@ pub fn get_impact_radius(
         ));
     }
 
+    // impacted_nodes is already sorted by score descending (insertion order from ranked vec)
+    let scores_vec: Vec<Value> = impact.impacted_nodes.iter()
+        .filter_map(|n| {
+            impact.impact_scores.get(&n.qualified_name).map(|&s| {
+                json!({ "qualified_name": n.qualified_name, "score": s })
+            })
+        })
+        .collect();
+
     store.close()?;
     Ok(json!({
         "status": "ok",
         "summary": summary_parts.join("\n"),
+        "algorithm": impact.algorithm,
         "changed_files": files,
         "changed_nodes": changed_dicts,
         "impacted_nodes": impacted_dicts,
+        "impact_scores": scores_vec,
         "impacted_files": impact.impacted_files,
         "edges": edge_dicts,
         "truncated": impact.truncated,
@@ -493,7 +505,7 @@ pub fn get_review_context(
         .map(|f| root.join(f).to_string_lossy().into_owned())
         .collect();
 
-    let impact = store.get_impact_radius(&abs_files, max_depth, 500)?;
+    let impact = store.get_impact_radius(&abs_files, max_depth, 500, None)?;
 
     let mut context = json!({
         "changed_files": files,

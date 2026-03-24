@@ -57,10 +57,7 @@ fn grammar_for(language: &str) -> Option<Language> {
         "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
         "ruby" => Some(tree_sitter_ruby::LANGUAGE.into()),
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
-        // tree-sitter-kotlin 0.3 depends on tree-sitter 0.20 (vs our 0.24).
-        // The Language types are incompatible at the type level; we skip kotlin
-        // grammar support until the crate is updated to tree-sitter 0.24+.
-        "kotlin" => None,
+        "kotlin" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
         _ => None,
     }
