@@ -70,7 +70,7 @@ fn save(data: &GraphData, path: &Path) -> Result<()> {
 
     let payload = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
     let compressed = zstd::encode_all(&payload[..], 3)
-        .map_err(|e| CrgError::Io(e))?;
+        .map_err(CrgError::Io)?;
     let crc = crc32fast::hash(&compressed);
 
     let tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
@@ -105,7 +105,7 @@ fn load(path: &Path) -> Result<GraphData> {
         return Err(CrgError::Other("graph file CRC mismatch".into()));
     }
     let decompressed = zstd::decode_all(compressed)
-        .map_err(|e| CrgError::Io(e))?;
+        .map_err(CrgError::Io)?;
     let (data, _): (GraphData, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
     Ok(data)
 }
@@ -262,19 +262,13 @@ impl GraphStore {
 
     /// Get all file paths that have a `File` node.
     pub fn get_all_files(&self) -> Result<Vec<String>> {
-        let files: Vec<String> = self
-            .data
-            .node_index
-            .values()
-            .filter(|&&idx| self.data.graph[idx].kind == NodeKind::File)
-            .map(|&idx| self.data.graph[idx].file_path.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        Ok(files)
+        Ok(self.data.file_index.keys().cloned().collect())
     }
 
     /// Search nodes by name substring (multi-word AND logic, case-insensitive).
+    ///
+    /// Results are sorted by relevance: exact name match (0) > prefix match (1) > contains (2),
+    /// then alphabetically by name for stable ordering within each tier.
     pub fn search_nodes(&self, query: &str, limit: usize) -> Result<Vec<GraphNode>> {
         let words: Vec<String> = query
             .split_whitespace()
@@ -284,22 +278,36 @@ impl GraphStore {
             return Ok(vec![]);
         }
 
-        let results: Vec<GraphNode> = self
+        let query_lower = query.to_lowercase();
+
+        let mut results: Vec<(u8, GraphNode)> = self
             .data
             .node_index
             .iter()
-            .filter(|(qn, &idx)| {
+            .filter_map(|(qn, &idx)| {
                 let node = &self.data.graph[idx];
                 let name_lower = node.name.to_lowercase();
                 let qn_lower = qn.to_lowercase();
-                words
+                if !words
                     .iter()
                     .all(|w| name_lower.contains(w.as_str()) || qn_lower.contains(w.as_str()))
+                {
+                    return None;
+                }
+                let relevance = if name_lower == query_lower || qn_lower == query_lower {
+                    0u8
+                } else if name_lower.starts_with(&query_lower) {
+                    1u8
+                } else {
+                    2u8
+                };
+                Some((relevance, node.clone()))
             })
-            .take(limit)
-            .map(|(_, &idx)| self.data.graph[idx].clone())
             .collect();
-        Ok(results)
+
+        results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        results.truncate(limit);
+        Ok(results.into_iter().map(|(_, n)| n).collect())
     }
 
     /// Get nodes exceeding a line count threshold, ordered by size descending.
@@ -434,10 +442,13 @@ impl GraphStore {
             .unwrap_or_default()
     }
 
-    /// Compute the blast radius of changed files.
+    /// Compute the blast radius of changed files using Personalized PageRank.
     ///
-    /// Uses weighted directed BFS for graphs < 10k nodes, personalized PageRank
-    /// for larger graphs. Automatically selects algorithm based on graph size.
+    /// Teleportation is biased exclusively toward seed nodes, so only nodes
+    /// reachable from the seeds accumulate meaningful scores — exactly the
+    /// "blast radius" semantic needed for change impact analysis.
+    ///
+    /// `max_depth` is accepted for API compatibility but is not used by PPR.
     ///
     /// If `changed_nodes` is provided, those qualified names are used as seeds
     /// directly (node-level diff seeding). Otherwise seeds are all nodes in
@@ -445,7 +456,7 @@ impl GraphStore {
     pub fn get_impact_radius(
         &self,
         changed_files: &[String],
-        max_depth: usize,
+        _max_depth: usize,
         max_nodes: usize,
         changed_nodes: Option<&[String]>,
     ) -> Result<ImpactResult> {
@@ -470,13 +481,8 @@ impl GraphStore {
             .filter_map(|qn| self.get_node(qn).ok().flatten())
             .collect();
 
-        let (ranked, algorithm) = if self.data.graph.node_count() >= 10_000 {
-            let r = pagerank_impact(&seeds, &self.data, max_nodes);
-            (r, "pagerank".to_string())
-        } else {
-            let r = weighted_bfs_impact(&seeds, &self.data, max_depth, max_nodes);
-            (r, "weighted_bfs".to_string())
-        };
+        let ranked = pagerank_impact(&seeds, &self.data, max_nodes);
+        let algorithm = "personalized_pagerank".to_string();
 
         let mut impact_scores: HashMap<String, f64> = HashMap::new();
         let mut impacted_nodes: Vec<GraphNode> = Vec::new();
@@ -585,6 +591,36 @@ impl GraphStore {
         save(&self.data, &self.bin_path)
     }
 
+    /// Get all incoming edges whose target nodes belong to a given file.
+    ///
+    /// More efficient than iterating all nodes when the file has many nodes:
+    /// uses `file_index` for O(nodes_in_file) lookup instead of O(all_nodes).
+    pub fn get_incoming_edges_for_file_nodes(&self, file_path: &str) -> Result<Vec<GraphEdge>> {
+        let node_indices = self
+            .data
+            .file_index
+            .get(file_path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        let mut edges = Vec::new();
+        for &idx in node_indices {
+            for edge in self.data.graph.edges_directed(idx, Direction::Incoming) {
+                let source_idx = edge.source();
+                let source = &self.data.graph[source_idx];
+                let target = &self.data.graph[idx];
+                edges.push(GraphEdge {
+                    source_qualified: source.qualified_name.clone(),
+                    target_qualified: target.qualified_name.clone(),
+                    kind: *edge.weight(),
+                    file_path: source.file_path.clone(),
+                    line: 0,
+                });
+            }
+        }
+        Ok(edges)
+    }
+
     // -- Internal helpers --
 
     /// Remove all graph nodes/edges belonging to `file_path`.
@@ -657,6 +693,7 @@ fn edge_impact_weight(kind: EdgeKind) -> f64 {
 /// Wrapper for `f64` that implements `Ord` so it can live in a `BinaryHeap`.
 /// NaN is treated as less than any finite value.
 #[derive(PartialEq)]
+#[allow(dead_code)]
 struct OrdF64(f64);
 
 impl Eq for OrdF64 {}
@@ -686,6 +723,7 @@ impl Ord for OrdF64 {
 /// Traversal continues only for nodes with score > threshold.
 ///
 /// Returns (qualified_name, score) pairs sorted by score descending.
+#[allow(dead_code)]
 fn weighted_bfs_impact(
     seeds: &HashSet<String>,
     data: &GraphData,
@@ -754,10 +792,16 @@ fn weighted_bfs_impact(
     sort_and_truncate(results, max_results)
 }
 
-/// Personalized PageRank for large graphs (>= 10k nodes).
+/// Personalized PageRank for impact analysis (reverse propagation).
 ///
-/// Propagates scores through INCOMING edges (reverse direction) with edge weights.
-/// Seeds receive a teleport component that keeps scores anchored to the changed nodes.
+/// Runs PPR on the *reversed* graph so that score flows FROM seeds TOWARD nodes
+/// that depend on (call/inherit/import) those seeds.  This is the "blast radius"
+/// semantic: if `b` changes, every node `a` that has an outgoing edge `a → b`
+/// (a calls b) is a dependent and accumulates impact score.
+///
+/// Concretely: for each node `v`, we sum contributions from its OUTGOING
+/// successors `s` (nodes it depends on) weighted by `w(v→s) / in_degree_weighted(s)`.
+/// Seeds receive the teleport probability; non-seeds get zero teleport.
 ///
 /// Returns (qualified_name, score) pairs sorted by score descending (seeds excluded).
 fn pagerank_impact(
@@ -774,13 +818,19 @@ fn pagerank_impact(
 
     let seed_score = 1.0 / seeds.len() as f64;
 
-    // Precompute out-degree for each node (used in every iteration).
-    let out_degree: HashMap<NodeIndex, f64> = data
+    // Precompute weighted in-degree for each node.
+    // Used to normalise contributions from outgoing successors so that
+    // popular (highly-depended-upon) nodes don't dominate unfairly.
+    let in_degree: HashMap<NodeIndex, f64> = data
         .graph
         .node_indices()
         .map(|idx| {
-            let d = data.graph.neighbors_directed(idx, Direction::Outgoing).count() as f64;
-            (idx, d)
+            let w_sum: f64 = data
+                .graph
+                .edges_directed(idx, Direction::Incoming)
+                .map(|e| edge_impact_weight(*e.weight()))
+                .sum();
+            (idx, w_sum)
         })
         .collect();
 
@@ -790,7 +840,7 @@ fn pagerank_impact(
         .filter_map(|qn| data.node_index.get(qn).copied())
         .collect();
 
-    // Initialize scores: seeds get seed_score, others get 0.0
+    // Initialize scores: seeds get seed_score, others get 0.0.
     let mut scores: HashMap<NodeIndex, f64> = HashMap::new();
     for &idx in &seed_indices {
         scores.insert(idx, seed_score);
@@ -801,30 +851,30 @@ fn pagerank_impact(
         let mut max_diff: f64 = 0.0;
 
         for idx in data.graph.node_indices() {
-            // Personalized teleport: only seed nodes receive the teleport boost
+            // Personalized teleport: only seed nodes receive the teleport boost.
             let teleport = if seed_indices.contains(&idx) {
                 (1.0 - damping) * seed_score
             } else {
                 0.0
             };
 
-            // Accumulate contributions from incoming neighbors
-            let mut incoming_sum: f64 = 0.0;
-            for pred_idx in data.graph.neighbors_directed(idx, Direction::Incoming) {
-                let pred_score = scores.get(&pred_idx).copied().unwrap_or(0.0);
-                if pred_score == 0.0 {
+            // Accumulate impact from outgoing successors (nodes this node depends on).
+            let mut dep_sum: f64 = 0.0;
+            for succ_idx in data.graph.neighbors_directed(idx, Direction::Outgoing) {
+                let succ_score = scores.get(&succ_idx).copied().unwrap_or(0.0);
+                if succ_score == 0.0 {
                     continue;
                 }
-                let d = out_degree[&pred_idx];
+                let d = in_degree[&succ_idx];
                 if d > 0.0 {
-                    for edge_ref in data.graph.edges_connecting(pred_idx, idx) {
+                    for edge_ref in data.graph.edges_connecting(idx, succ_idx) {
                         let w = edge_impact_weight(*edge_ref.weight());
-                        incoming_sum += pred_score * w / d;
+                        dep_sum += succ_score * w / d;
                     }
                 }
             }
 
-            let new_score = teleport + damping * incoming_sum;
+            let new_score = teleport + damping * dep_sum;
             let old_score = scores.get(&idx).copied().unwrap_or(0.0);
             max_diff = max_diff.max((new_score - old_score).abs());
             if new_score > epsilon {
@@ -1145,7 +1195,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // get_impact_radius — weighted BFS (small graph)
+    // get_impact_radius — Personalized PageRank
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1175,7 +1225,7 @@ mod tests {
             .get_impact_radius(&["lib.py".to_string()], 5, 50, None)
             .unwrap();
 
-        assert_eq!(result.algorithm, "weighted_bfs");
+        assert_eq!(result.algorithm, "personalized_pagerank");
         // a is in caller.py (not a seed) and calls b (in lib.py which changed)
         // so a should appear as impacted
         let impacted_names: Vec<&str> = result
@@ -1345,5 +1395,112 @@ mod tests {
         let (store, _dir) = test_store();
         let hashes = store.get_body_hashes("nonexistent.py");
         assert!(hashes.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // PPR edge-weight test: high-weight edges (Inherits=1.2) contribute more
+    // than low-weight edges (Contains=0.1) for equal predecessor scores.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ppr_high_weight_edge_yields_higher_score_than_low_weight() {
+        let (mut store, _dir) = test_store();
+
+        // high_target → seed via Inherits (weight=1.2): high_target depends on seed
+        // seed → low_target  via Contains (weight=0.1): seed contains low_target
+        // Only high_target has an outgoing edge to the seed, so it accumulates score.
+        let nodes = vec![
+            make_node("seed", "f.py::seed", "f.py", NodeKind::Class),
+            make_node("high_target", "f.py::high_target", "f.py", NodeKind::Class),
+            make_node("low_target", "f.py::low_target", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![
+            make_edge("f.py::high_target", "f.py::seed", EdgeKind::Inherits, "f.py"),
+            make_edge("f.py::seed", "f.py::low_target", EdgeKind::Contains, "f.py"),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        // Seed on "seed"; high_target inherits from seed (incoming to high_target),
+        // low_target is contained by seed (outgoing from seed → incoming to low_target).
+        let result = store
+            .get_impact_radius(&["f.py".to_string()], 5, 50, Some(&["f.py::seed".to_string()]))
+            .unwrap();
+
+        let high_score = result
+            .impact_scores
+            .get("f.py::high_target")
+            .copied()
+            .unwrap_or(0.0);
+        let low_score = result
+            .impact_scores
+            .get("f.py::low_target")
+            .copied()
+            .unwrap_or(0.0);
+
+        assert!(
+            high_score > low_score,
+            "Inherits edge (weight=1.2) should yield higher PPR score than Contains (weight=0.1); \
+             high_target={high_score:.6}, low_target={low_score:.6}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // search_nodes determinism: exact match ranks before prefix, prefix before contains
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_nodes_relevance_ordering() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node("process", "f.py::process", "f.py", NodeKind::Function),
+            make_node("process_request", "f.py::process_request", "f.py", NodeKind::Function),
+            make_node("pre_process", "f.py::pre_process", "f.py", NodeKind::Function),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &[], "h1")
+            .unwrap();
+
+        let results = store.search_nodes("process", 10).unwrap();
+        assert_eq!(results.len(), 3);
+        // Exact match must be first
+        assert_eq!(results[0].name, "process");
+        // Prefix match before contains match
+        assert_eq!(results[1].name, "process_request");
+        assert_eq!(results[2].name, "pre_process");
+    }
+
+    // -----------------------------------------------------------------------
+    // get_incoming_edges_for_file_nodes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incoming_edges_for_file_nodes_finds_callers() {
+        let (mut store, _dir) = test_store();
+        let lib_nodes = vec![make_node("b", "lib.py::b", "lib.py", NodeKind::Function)];
+        let caller_nodes = vec![make_node("a", "caller.py::a", "caller.py", NodeKind::Function)];
+        let edges = vec![make_edge("caller.py::a", "lib.py::b", EdgeKind::Calls, "caller.py")];
+        store
+            .store_file_nodes_edges("lib.py", &lib_nodes, &[], "h_lib")
+            .unwrap();
+        store
+            .store_file_nodes_edges("caller.py", &caller_nodes, &edges, "h_caller")
+            .unwrap();
+
+        let incoming = store.get_incoming_edges_for_file_nodes("lib.py").unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].source_qualified, "caller.py::a");
+        assert_eq!(incoming[0].target_qualified, "lib.py::b");
+        assert_eq!(incoming[0].kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn incoming_edges_for_file_nodes_empty_for_unknown_file() {
+        let (store, _dir) = test_store();
+        let edges = store
+            .get_incoming_edges_for_file_nodes("nonexistent.py")
+            .unwrap();
+        assert!(edges.is_empty());
     }
 }

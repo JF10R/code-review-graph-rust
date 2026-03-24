@@ -545,7 +545,7 @@ pub fn get_review_context(
     let guidance = generate_review_guidance(&impact);
     context["review_guidance"] = json!(guidance);
 
-    let summary_parts = vec![
+    let summary_parts = [
         format!("Review context for {} changed file(s):", files.len()),
         format!("  - {} directly changed nodes", impact.changed_nodes.len()),
         format!(
@@ -926,8 +926,13 @@ fn extract_relevant_lines(
         if !parts.is_empty() {
             parts.push("...".to_string());
         }
-        for i in start..end.min(lines.len()) {
-            parts.push(format!("{}: {}", i + 1, lines[i]));
+        for (i, line) in lines
+            .iter()
+            .enumerate()
+            .take(end.min(lines.len()))
+            .skip(start)
+        {
+            parts.push(format!("{}: {}", i + 1, line));
         }
     }
     parts.join("\n")
