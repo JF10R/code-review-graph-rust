@@ -1026,4 +1026,382 @@ mod tests {
         assert_eq!(result.files_updated, 0);
         assert_eq!(result.total_nodes, 0);
     }
+
+    // -----------------------------------------------------------------------
+    // find_dependents
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal NodeInfo for testing (no parser required).
+    fn make_node(name: &str, qualified_name: &str, file_path: &str) -> crate::types::NodeInfo {
+        crate::types::NodeInfo {
+            name: name.to_string(),
+            qualified_name: qualified_name.to_string(),
+            kind: crate::types::NodeKind::Function,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 5,
+            language: "python".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: format!("def {}():", name),
+            body_hash: sha256_bytes(name.as_bytes()),
+        }
+    }
+
+    /// Build a Calls edge from `source_qn` (in `file_path`) to `target_qn`.
+    fn make_calls_edge(
+        source_qn: &str,
+        target_qn: &str,
+        file_path: &str,
+    ) -> crate::types::EdgeInfo {
+        crate::types::EdgeInfo {
+            source_qualified: source_qn.to_string(),
+            target_qualified: target_qn.to_string(),
+            kind: crate::types::EdgeKind::Calls,
+            file_path: file_path.to_string(),
+            line: 3,
+        }
+    }
+
+    /// Build an ImportsFrom edge from `source_qn` (in `file_path`) to `target_qn`.
+    fn make_imports_edge(
+        source_qn: &str,
+        target_qn: &str,
+        file_path: &str,
+    ) -> crate::types::EdgeInfo {
+        crate::types::EdgeInfo {
+            source_qualified: source_qn.to_string(),
+            target_qualified: target_qn.to_string(),
+            kind: crate::types::EdgeKind::ImportsFrom,
+            file_path: file_path.to_string(),
+            line: 1,
+        }
+    }
+
+    /// Populate the store: file A has `func_a` which calls `func_b` in file B.
+    fn setup_ab_dependency(
+        store: &mut crate::graph::GraphStore,
+        abs_a: &str,
+        abs_b: &str,
+    ) {
+        let node_b = make_node("func_b", "func_b", abs_b);
+        let node_a = make_node("func_a", "func_a", abs_a);
+        let edge_a_calls_b = make_calls_edge("func_a", "func_b", abs_a);
+
+        store
+            .store_file_nodes_edges(abs_b, &[node_b], &[], "hash_b")
+            .unwrap();
+        store
+            .store_file_nodes_edges(abs_a, &[node_a], &[edge_a_calls_b], "hash_a")
+            .unwrap();
+    }
+
+    #[test]
+    fn find_dependents_returns_caller_file() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
+        let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
+
+        setup_ab_dependency(&mut store, &abs_a, &abs_b);
+
+        let dependents = find_dependents(&mut store, &abs_b).unwrap();
+
+        assert_eq!(
+            dependents.len(),
+            1,
+            "exactly one file depends on b.py; got: {:?}",
+            dependents
+        );
+        assert_eq!(
+            dependents[0], abs_a,
+            "a.py should be the dependent of b.py"
+        );
+    }
+
+    #[test]
+    fn find_dependents_returns_empty_for_no_dependents() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
+        let node_b = make_node("func_b", "func_b", &abs_b);
+        store
+            .store_file_nodes_edges(&abs_b, &[node_b], &[], "hash_b")
+            .unwrap();
+
+        let dependents = find_dependents(&mut store, &abs_b).unwrap();
+
+        assert!(
+            dependents.is_empty(),
+            "b.py has no dependents; got: {:?}",
+            dependents
+        );
+    }
+
+    #[test]
+    fn find_dependents_excludes_self() {
+        // A file should not appear in its own dependents list even if a
+        // self-referential edge somehow exists in the graph.
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
+        let node_b = make_node("func_b", "func_b", &abs_b);
+        // Edge: func_b calls func_b (self-referential)
+        let self_edge = make_calls_edge("func_b", "func_b", &abs_b);
+        store
+            .store_file_nodes_edges(&abs_b, &[node_b], &[self_edge], "hash_b")
+            .unwrap();
+
+        let dependents = find_dependents(&mut store, &abs_b).unwrap();
+
+        assert!(
+            !dependents.contains(&abs_b),
+            "b.py must not appear in its own dependents list; got: {:?}",
+            dependents
+        );
+    }
+
+    #[test]
+    fn find_dependents_returns_multiple_callers() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
+        let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
+        let abs_c = dir.path().join("c.py").to_string_lossy().into_owned();
+
+        // b.py defines func_b
+        let node_b = make_node("func_b", "func_b", &abs_b);
+        store
+            .store_file_nodes_edges(&abs_b, &[node_b], &[], "hash_b")
+            .unwrap();
+
+        // a.py calls func_b
+        let node_a = make_node("func_a", "func_a", &abs_a);
+        let edge_a = make_calls_edge("func_a", "func_b", &abs_a);
+        store
+            .store_file_nodes_edges(&abs_a, &[node_a], &[edge_a], "hash_a")
+            .unwrap();
+
+        // c.py also calls func_b
+        let node_c = make_node("func_c", "func_c", &abs_c);
+        let edge_c = make_calls_edge("func_c", "func_b", &abs_c);
+        store
+            .store_file_nodes_edges(&abs_c, &[node_c], &[edge_c], "hash_c")
+            .unwrap();
+
+        let mut dependents = find_dependents(&mut store, &abs_b).unwrap();
+        dependents.sort();
+
+        let mut expected = vec![abs_a.clone(), abs_c.clone()];
+        expected.sort();
+
+        assert_eq!(
+            dependents, expected,
+            "both a.py and c.py should be dependents of b.py"
+        );
+    }
+
+    #[test]
+    fn find_dependents_detects_imports_from_edge() {
+        // An ImportsFrom edge at the node level (source imports a symbol from b.py)
+        // should also be detected.
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
+        let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
+
+        let node_b = make_node("MyClass", "MyClass", &abs_b);
+        store
+            .store_file_nodes_edges(&abs_b, &[node_b], &[], "hash_b")
+            .unwrap();
+
+        let node_a = make_node("use_class", "use_class", &abs_a);
+        let import_edge = make_imports_edge("use_class", "MyClass", &abs_a);
+        store
+            .store_file_nodes_edges(&abs_a, &[node_a], &[import_edge], "hash_a")
+            .unwrap();
+
+        let dependents = find_dependents(&mut store, &abs_b).unwrap();
+
+        assert!(
+            dependents.contains(&abs_a),
+            "a.py imports from b.py and should be in dependents; got: {:?}",
+            dependents
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // hash-skip: incremental_update skips unchanged files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incremental_update_skips_file_when_hash_unchanged() {
+        if !parser_works() {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+
+        // Use git init so collect_all_files works via git ls-files
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let py_content = b"def stable(): return 1\n";
+        fs::write(dir.path().join("stable.py"), py_content).unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "stable.py"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+        full_build(dir.path(), &mut store).unwrap();
+
+        // Call incremental with the same unchanged file — hash matches what was stored
+        let result = incremental_update(
+            dir.path(),
+            &mut store,
+            "HEAD",
+            Some(vec!["stable.py".to_string()]),
+        )
+        .unwrap();
+
+        // Because the file hash hasn't changed, no body hashes differ
+        assert!(
+            result.changed_qualified_names.is_empty(),
+            "file with unchanged content must produce no changed_qualified_names; got: {:?}",
+            result.changed_qualified_names
+        );
+    }
+
+    #[test]
+    fn incremental_update_processes_file_when_hash_changes() {
+        if !parser_works() {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let original = b"def greet(): return 'hello'\n";
+        fs::write(dir.path().join("greet.py"), original).unwrap();
+
+        std::process::Command::new("git")
+            .args(["add", "greet.py"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+        full_build(dir.path(), &mut store).unwrap();
+
+        // Modify the file on disk — new content produces a different hash
+        let modified = b"def greet(): return 'world'\ndef farewell(): pass\n";
+        fs::write(dir.path().join("greet.py"), modified).unwrap();
+
+        let result = incremental_update(
+            dir.path(),
+            &mut store,
+            "HEAD",
+            Some(vec!["greet.py".to_string()]),
+        )
+        .unwrap();
+
+        assert!(
+            !result.changed_qualified_names.is_empty(),
+            "modified file must produce changed_qualified_names; got: {:?}",
+            result.changed_qualified_names
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_dependents drives incremental_update dependent discovery
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn incremental_update_includes_dependent_files() {
+        if !parser_works() {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(dir.path());
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        // Manually populate the graph: a.py calls func_b defined in b.py
+        let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
+        let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
+
+        // Write actual files so incremental_update can read them
+        fs::write(&abs_b, b"def func_b(): return 42\n").unwrap();
+        fs::write(&abs_a, b"def func_a(): pass\n").unwrap();
+
+        // Seed the graph with the dependency relationship
+        setup_ab_dependency(&mut store, &abs_a, &abs_b);
+        store.commit().unwrap();
+
+        // Trigger incremental on b.py — a.py should appear in dependent_files
+        let result = incremental_update(
+            dir.path(),
+            &mut store,
+            "HEAD",
+            Some(vec!["b.py".to_string()]),
+        )
+        .unwrap();
+
+        assert!(
+            result.dependent_files.contains(&"a.py".to_string())
+                || result.dependent_files.iter().any(|f| f.contains("a.py")),
+            "a.py should be discovered as a dependent of b.py; dependent_files: {:?}",
+            result.dependent_files
+        );
+    }
 }
