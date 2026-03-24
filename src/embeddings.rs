@@ -518,7 +518,6 @@ use candle_impl::CandleProvider;
 fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
     let config = crate::config::AppConfig::load();
 
-    // Helper: env var first, then config file fallback.
     let get = |env_key: &str, config_key: &str| -> Option<String> {
         std::env::var(env_key)
             .ok()
