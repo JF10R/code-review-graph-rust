@@ -129,10 +129,9 @@ fn parse_scm(scm: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>, H
         }
 
         // Extract the outermost node kind when a new S-expression opens.
-        if line.starts_with('(') {
-            let inner = &line[1..];
+        if let Some(inner) = line.strip_prefix('(') {
             let kind_end = inner
-                .find(|c: char| c == ')' || c == ' ')
+                .find([')', ' '])
                 .unwrap_or(inner.len());
             let kind = inner[..kind_end].trim();
             if !kind.is_empty() {
@@ -185,7 +184,7 @@ impl CompiledQueries {
 // Lazily-built cache: one CompiledQueries per language, constructed at most once.
 static LANG_TYPES_CACHE: OnceLock<HashMap<&'static str, CompiledQueries>> = OnceLock::new();
 
-fn get_lang_types(language: &str) -> &'static CompiledQueries {
+fn get_lang_types(language: &str) -> Option<&'static CompiledQueries> {
     let cache = LANG_TYPES_CACHE.get_or_init(|| {
         let mut m = HashMap::new();
         for &(lang, scm) in SCM_SOURCES {
@@ -193,7 +192,7 @@ fn get_lang_types(language: &str) -> &'static CompiledQueries {
         }
         m
     });
-    cache.get(language).expect("unsupported language")
+    cache.get(language)
 }
 
 // Cached Ruby import regex — compiled once, reused on every Ruby parse.
@@ -350,8 +349,12 @@ fn get_docstring(node: &Node, language: &str, source: &[u8]) -> String {
         let mut cur = node.walk();
         for child in node.children(&mut cur) {
             if child.kind() == "block" {
-                let mut c2 = child.walk();
-                for stmt in child.children(&mut c2) {
+                let first_stmt: Option<tree_sitter::Node> = {
+                    let mut c2 = child.walk();
+                    let first = child.children(&mut c2).next();
+                    first
+                };
+                if let Some(stmt) = first_stmt {
                     if stmt.kind() == "expression_statement" {
                         let mut c3 = stmt.walk();
                         for expr in stmt.children(&mut c3) {
@@ -361,7 +364,6 @@ fn get_docstring(node: &Node, language: &str, source: &[u8]) -> String {
                             }
                         }
                     }
-                    break; // only check first statement
                 }
             }
         }
@@ -1205,7 +1207,8 @@ impl CodeParser {
             body_hash: body_hash(source),
         });
 
-        let lt = get_lang_types(language);
+        let lt = get_lang_types(language)
+            .ok_or_else(|| CrgError::Other(format!("unsupported language: {language}")))?;
         let (import_map, defined_names) = collect_file_scope(&root, lt, language, source);
 
         let ctx = WalkCtx {
@@ -1271,7 +1274,8 @@ impl CodeParser {
             .ok_or_else(|| CrgError::TreeSitter("Vue script parse returned None".into()))?;
 
         let root = tree.root_node();
-        let lt = get_lang_types(script_lang);
+        let lt = get_lang_types(script_lang)
+            .ok_or_else(|| CrgError::Other(format!("unsupported language: {script_lang}")))?;
         let (import_map, defined_names) =
             collect_file_scope(&root, lt, script_lang, &script_bytes);
 
@@ -1808,6 +1812,31 @@ def run():
         let (nodes, _) = parse("simple.py", src);
         let file_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::File).collect();
         assert_eq!(file_nodes.len(), 1, "should have exactly one File node");
+    }
+
+    // -----------------------------------------------------------------------
+    // Unsupported extension returns Ok with empty results (no panic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unsupported_extension_returns_ok_empty() {
+        let parser = CodeParser::new();
+        for filename in &["data.json", "readme.md", "image.png", "archive.tar.gz", "noextension"] {
+            let result = parser.parse_bytes(std::path::Path::new(filename), b"some content");
+            assert!(
+                result.is_ok(),
+                "parse_bytes should not error on unknown extension '{filename}'"
+            );
+            let (nodes, edges) = result.unwrap();
+            assert!(
+                nodes.is_empty(),
+                "nodes should be empty for unknown extension '{filename}'"
+            );
+            assert!(
+                edges.is_empty(),
+                "edges should be empty for unknown extension '{filename}'"
+            );
+        }
     }
 
 }
