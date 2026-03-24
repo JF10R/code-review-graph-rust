@@ -220,20 +220,36 @@ pub struct ImpactResult {
 // ---------------------------------------------------------------------------
 
 /// Convert a GraphNode to a JSON-serializable map.
-pub fn node_to_dict(node: &GraphNode) -> serde_json::Value {
-    serde_json::json!({
-        "name": node.name,
-        "qualified_name": node.qualified_name,
-        "kind": node.kind.as_str(),
-        "file_path": node.file_path,
-        "line_start": node.line_start,
-        "line_end": node.line_end,
-        "language": node.language,
-        "is_test": node.is_test,
-        "docstring": node.docstring,
-        "signature": node.signature,
-        "body_hash": node.body_hash,
-    })
+///
+/// When `compact` is true, only the 7 most useful fields are included,
+/// reducing response size by ~40%. When false, the full 11-field output
+/// is returned unchanged.
+pub fn node_to_dict(node: &GraphNode, compact: bool) -> serde_json::Value {
+    if compact {
+        serde_json::json!({
+            "name": node.name,
+            "qualified_name": node.qualified_name,
+            "kind": node.kind.as_str(),
+            "file_path": node.file_path,
+            "line_start": node.line_start,
+            "line_end": node.line_end,
+            "signature": node.signature,
+        })
+    } else {
+        serde_json::json!({
+            "name": node.name,
+            "qualified_name": node.qualified_name,
+            "kind": node.kind.as_str(),
+            "file_path": node.file_path,
+            "line_start": node.line_start,
+            "line_end": node.line_end,
+            "language": node.language,
+            "is_test": node.is_test,
+            "docstring": node.docstring,
+            "signature": node.signature,
+            "body_hash": node.body_hash,
+        })
+    }
 }
 
 /// Convert a GraphEdge to a JSON-serializable map.

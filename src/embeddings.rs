@@ -810,12 +810,13 @@ pub fn semantic_search(
     store: &GraphStore,
     emb_store: &mut EmbeddingStore,
     limit: usize,
+    compact: bool,
 ) -> Result<Vec<serde_json::Value>> {
     let provider = match &emb_store.provider {
         Some(p) => p,
         None => {
             let nodes = store.search_nodes(query, limit)?;
-            return Ok(nodes.iter().map(node_to_dict).collect());
+            return Ok(nodes.iter().map(|n| node_to_dict(n, compact)).collect());
         }
     };
 
@@ -832,7 +833,7 @@ pub fn semantic_search(
                     .into_iter()
                     .map(|(qn, s)| (qn, s as f64))
                     .collect::<Vec<_>>();
-                return nodes_from_scored(scored, store);
+                return nodes_from_scored(scored, store, compact);
             }
             Err(e) => {
                 log::warn!("HNSW index build failed ({}); falling back to linear scan", e);
@@ -849,18 +850,19 @@ pub fn semantic_search(
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
-    nodes_from_scored(scored, store)
+    nodes_from_scored(scored, store, compact)
 }
 
 /// Resolve a ranked `(qualified_name, score)` list to full node dicts.
 fn nodes_from_scored(
     scored: Vec<(String, f64)>,
     store: &GraphStore,
+    compact: bool,
 ) -> Result<Vec<serde_json::Value>> {
     let mut results = Vec::with_capacity(scored.len());
     for (qn, score) in scored {
         if let Some(node) = store.get_node(&qn)? {
-            let mut d = node_to_dict(&node);
+            let mut d = node_to_dict(&node, compact);
             d["similarity_score"] =
                 serde_json::Value::from((score * 10_000.0).round() / 10_000.0);
             results.push(d);

@@ -55,6 +55,9 @@ struct ImpactRadiusParams {
     #[schemars(description = "Git ref for auto-detecting changes")]
     #[serde(default = "default_base")]
     base: String,
+    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
+    #[serde(default)]
+    compact: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -66,6 +69,9 @@ struct QueryGraphParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
+    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
+    #[serde(default)]
+    compact: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -88,6 +94,9 @@ struct ReviewContextParams {
     #[schemars(description = "Git ref for change detection")]
     #[serde(default = "default_base")]
     base: String,
+    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
+    #[serde(default)]
+    compact: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -103,6 +112,9 @@ struct SemanticSearchParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
+    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
+    #[serde(default)]
+    compact: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -142,6 +154,9 @@ struct LargeFunctionsParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
+    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
+    #[serde(default)]
+    compact: bool,
 }
 
 // Default value helpers
@@ -235,6 +250,7 @@ impl CodeReviewServer {
                 p.max_depth,
                 repo_root.as_deref(),
                 &p.base,
+                p.compact,
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())
@@ -258,6 +274,7 @@ impl CodeReviewServer {
                 &p.pattern,
                 &p.target,
                 repo_root.as_deref(),
+                p.compact,
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())
@@ -284,6 +301,7 @@ impl CodeReviewServer {
                 p.max_lines_per_file,
                 repo_root.as_deref(),
                 &p.base,
+                p.compact,
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())
@@ -308,6 +326,7 @@ impl CodeReviewServer {
                 p.kind.as_deref(),
                 p.limit,
                 repo_root.as_deref(),
+                p.compact,
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())
@@ -392,6 +411,7 @@ impl CodeReviewServer {
                 p.file_path_pattern.as_deref(),
                 p.limit,
                 repo_root.as_deref(),
+                p.compact,
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())
