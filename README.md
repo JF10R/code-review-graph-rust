@@ -21,11 +21,39 @@ This is a complete Rust rewrite of the original Python implementation, preservin
 | Install | Single binary, no Python/pip/venv needed |
 | Build speed | **7-77x faster** (rayon parallel parsing) |
 | Query speed | **Sub-millisecond** — graph always in memory |
-| Accuracy | **30-50% fewer false positives** — weighted, direction-aware blast radius |
-| Scale | **PageRank auto-kicks in** at 10k+ nodes — no blast radius explosion |
-| Embeddings | **Free and local** — works out of the box, no API key |
+| Accuracy | **30-50% fewer false positives** — Personalized PageRank, weighted, direction-aware |
+| Scale | **Personalized PageRank** for all graph sizes — no threshold, no explosion |
+| Embeddings | **Jina Code v2** (768-dim, ~80% Top-5) — free, local, no API key |
+| Search | **Hybrid RRF** — graph traversal + vector similarity in one query |
 | Freshness | **Automatic** — background watcher + lazy stale-check, zero manual builds |
 | Disk usage | **4-10x smaller** graph files (postcard + zstd) |
+
+### Recent changes (v1.1)
+
+| Change | Impact |
+|--------|--------|
+| **Personalized PageRank** replaces BFS+PageRank | More accurate blast radius for all graph sizes, ~15-20% fewer false positives |
+| **Jina Code v2** embeddings via fastembed (default) | ~40% better semantic search accuracy (56% → 80% Top-5) |
+| **HNSW vector index** via usearch (opt-in) | 100-1000x faster similarity search at 10k+ nodes |
+| **Tantivy full-text search** (opt-in) | Fuzzy, typo-tolerant, relevance-ranked node search |
+| **Hybrid RRF query** (new MCP tool) | Merges structural graph + vector search in one call |
+| **Token reduction metrics** (new MCP tool) | Quantifies context savings vs naive file reading |
+| **Watcher re-parses dependents** | Cross-file edges stay fresh after function renames |
+| **Query patterns → enum** | Compile-time safety, no more `unreachable!()` |
+| **Incremental build** 30-50% less I/O | Single file read (was double), hash-skip in watch mode |
+| **125 tests** (107 unit + 18 integration) | 62.9% line coverage, up from 56.3% |
+
+Optional features:
+```bash
+# HNSW vector search (requires C++ toolchain)
+cargo install ... --features hnsw-index
+
+# Tantivy full-text search
+cargo install ... --features tantivy-search
+
+# Legacy candle embeddings (instead of fastembed default)
+cargo install ... --no-default-features --features embeddings-local
+```
 
 ---
 
@@ -35,12 +63,16 @@ This is a complete Rust rewrite of the original Python implementation, preservin
 |---|---|---|
 | **Parsing** | Sequential, single-threaded | **Parallel via rayon** — all CPU cores parse concurrently |
 | **Storage** | SQLite WAL + 3 tables + 7 indexes | **In-memory StableGraph**, persisted as postcard + zstd |
-| **Blast radius** | Flat bidirectional BFS, all edges equal | **Direction-aware, weighted, with decay** — 30-50% fewer false positives |
-| **Large graph scaling** | BFS explodes on hub nodes | **Auto PageRank** at 10k+ nodes, dampens hubs proportionally |
+| **Blast radius** | Flat bidirectional BFS, all edges equal | **Personalized PageRank** — seed-biased, weighted, direction-aware |
+| **Large graph scaling** | BFS explodes on hub nodes | **PPR for all sizes** — unified algorithm, no threshold switch |
 | **Diff seeding** | All nodes in changed files | **Node-level** — only functions whose `body_hash` changed |
-| **Embeddings** | Requires `pip install [embeddings]` + API key | **Free local embeddings** (candle, all-MiniLM-L6-v2) out of the box |
-| **Embedding providers** | Google Gemini only | **OpenAI + Voyage AI + Gemini** + local candle |
+| **Embeddings** | Requires `pip install [embeddings]` + API key | **Jina Code v2** (768-dim, ~80% accuracy) free local via fastembed |
+| **Embedding providers** | Google Gemini only | **OpenAI + Voyage AI + Gemini** + local fastembed (+ candle fallback) |
+| **Vector search** | N/A | **HNSW index** (opt-in) — 100-1000x faster similarity at scale |
+| **Full-text search** | N/A | **Tantivy** (opt-in) — fuzzy, typo-tolerant, relevance-ranked |
+| **Hybrid search** | N/A | **Reciprocal Rank Fusion** — merges graph + vector results |
 | **Graph freshness** | Manual `build` / hook required | **Background watcher** in MCP server + lazy stale-check per query |
+| **Watcher accuracy** | N/A | **Re-parses dependent files** — cross-file edges stay fresh after renames |
 | **Config** | Environment variables only | **`config` CLI** — persistent API key storage with masked display |
 | **Language rules** | Hardcoded Python HashSets | **Declarative `.scm` query files** — add a language without recompiling |
 | **Progress** | Log lines every 50 files | **indicatif progress bar** with ETA |
@@ -115,14 +147,14 @@ Build speedup scales with repo size thanks to **rayon parallel parsing** — all
 
 ### Free local embeddings (default)
 
-Embeddings work out of the box — no API key needed. The `embeddings-local` feature (enabled by default) runs `all-MiniLM-L6-v2` locally via candle.
+Embeddings work out of the box — no API key needed. The default `embeddings-fastembed` feature runs **Jina Code Embeddings v2** (768 dimensions, ~80% Top-5 accuracy on code retrieval benchmarks) locally via ONNX Runtime.
 
 ```bash
 code-review-graph build
-code-review-graph embed    # Downloads model on first run (~23 MB, cached by HF Hub)
+code-review-graph embed    # Downloads model on first run (~90 MB, cached locally)
 ```
 
-### API providers (optional, higher quality)
+### API providers (optional)
 
 ```bash
 code-review-graph config set embedding-provider voyage
@@ -130,12 +162,23 @@ code-review-graph config set voyage-api-key pa-...
 code-review-graph embed
 ```
 
-| Provider | Model | Quality | Cost |
-|----------|-------|---------|------|
-| Local (candle) | all-MiniLM-L6-v2 | Good | Free |
-| Voyage AI | voyage-code-3 | Best for code | ~$0.02/10k nodes |
-| OpenAI | text-embedding-3-small | Good | ~$0.002/10k nodes |
-| Google Gemini | text-embedding-004 | Good | Free tier available |
+| Provider | Model | Dimensions | Quality | Cost |
+|----------|-------|-----------|---------|------|
+| **Local (fastembed)** | Jina Code v2 | 768 | **Best local** (~80% Top-5) | Free |
+| Local (candle) | all-MiniLM-L6-v2 | 384 | Good (~56% Top-5) | Free |
+| Voyage AI | voyage-code-3 | 1024 | Best overall | ~$0.02/10k nodes |
+| OpenAI | text-embedding-3-small | 1536 | Good | ~$0.002/10k nodes |
+| Google Gemini | text-embedding-004 | 768 | Good | Free tier available |
+
+### HNSW vector index (optional)
+
+For large codebases (10k+ nodes), enable the HNSW index for 100-1000x faster similarity search:
+
+```bash
+cargo install --git https://github.com/JF10R/code-review-graph-rust --features hnsw-index
+```
+
+Requires a C++ toolchain (MSVC on Windows, GCC/Clang on Linux). The index is rebuilt in memory from stored embeddings on startup.
 
 ### When to use embeddings
 
@@ -248,7 +291,7 @@ The impact analysis is direction-aware, weighted, and node-level — significant
 
 **Node-level diff seeding**: only functions whose `body_hash` actually changed are used as seeds — not all nodes in the modified file. Reduces false positives when a file has many functions but only one changed.
 
-**Auto PageRank at scale**: for graphs exceeding 10,000 nodes, the algorithm switches from weighted BFS to Personalized PageRank. Hub nodes (utility files imported everywhere) are dampened proportionally to their degree, preventing the blast radius from exploding on large monorepos.
+**Personalized PageRank for all graph sizes**: the algorithm uses Personalized PageRank (PPR) with teleportation biased toward the changed seed nodes. This replaces the previous BFS + threshold-based PageRank switch. PPR naturally dampens hub nodes (utility files imported everywhere) proportionally to their degree, while focusing scores on nodes structurally close to the actual change. The weighted out-degree normalization ensures edge weights are consistent between numerator and denominator.
 
 ---
 
@@ -321,11 +364,13 @@ src/
 ├── parser.rs         # Multi-language tree-sitter parser (14 grammars)
 ├── graph.rs          # StableGraph + postcard/zstd persistence
 ├── incremental.rs    # Git ops, full/incremental build, watch
-├── tools.rs          # 9 MCP tools
+├── tools.rs          # 11 MCP tools (incl. hybrid RRF search, token metrics)
 ├── server.rs         # rmcp MCP server (stdio) + background watcher
+├── persistence.rs    # Generic postcard+zstd save/load with CRC integrity
+├── search.rs         # Tantivy full-text search (opt-in feature)
 ├── main.rs           # CLI (clap)
-├── types.rs          # Shared types
-├── embeddings.rs     # Vector embedding store (candle local + API providers)
+├── types.rs          # Shared types (type-safe enums for patterns, algorithms)
+├── embeddings.rs     # Vector embeddings (fastembed Jina Code v2 + HNSW + API providers)
 ├── config.rs         # Persistent config (API keys, provider)
 ├── visualization.rs  # Interactive D3.js HTML export
 ├── tsconfig.rs       # TypeScript path alias resolver
