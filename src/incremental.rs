@@ -3,7 +3,7 @@
 //! Detects changed files via git diff, re-parses only changed + impacted files,
 //! and updates the graph accordingly. Also provides full build and watch mode.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -556,13 +556,23 @@ pub fn incremental_update(
     let mut errors = Vec::new();
     let mut changed_qualified_names: Vec<String> = Vec::new();
 
+    // Two-phase incremental store: parse all files, insert nodes first,
+    // then edges — so cross-file edges within the batch resolve correctly.
+    struct ParsedFile {
+        abs_path_str: String,
+        old_hashes: HashMap<String, String>,
+        nodes: Vec<crate::types::NodeInfo>,
+        edges: Vec<EdgeInfo>,
+        fhash: String,
+    }
+    let mut parsed_files: Vec<ParsedFile> = Vec::new();
+
     for rel_path in &all_files {
         if should_ignore(rel_path, &ignore_patterns) {
             continue;
         }
         let abs_path = repo_root.join(rel_path);
         if !abs_path.is_file() {
-            // File deleted
             let _ = store.remove_file_data(&abs_path.to_string_lossy());
             continue;
         }
@@ -584,26 +594,53 @@ pub fn incremental_update(
 
         let old_hashes = store.get_body_hashes(&abs_path_str);
 
-        match parse_and_store_file(&parser, repo_root, rel_path, &source, &fhash, store) {
-            Ok((n, e)) => {
-                total_nodes += n;
-                total_edges += e;
-
-                let new_hashes = store.get_body_hashes(&abs_path_str);
-                for (qn, new_hash) in &new_hashes {
-                    let old_hash = old_hashes.get(qn).map(String::as_str).unwrap_or("");
-                    if old_hash != new_hash.as_str() {
-                        changed_qualified_names.push(qn.clone());
-                    }
-                }
-                // Deleted nodes also count as changed (callers must be re-checked)
-                for qn in old_hashes.keys() {
-                    if !new_hashes.contains_key(qn) {
-                        changed_qualified_names.push(qn.clone());
-                    }
-                }
+        match parser.parse_bytes(&abs_path, &source) {
+            Ok((nodes, edges)) => {
+                parsed_files.push(ParsedFile {
+                    abs_path_str,
+                    old_hashes,
+                    nodes,
+                    edges,
+                    fhash,
+                });
             }
-            Err(err) => errors.push(err),
+            Err(e) => {
+                warn!("Error parsing {}: {}", rel_path, e);
+                errors.push(BuildError {
+                    file: rel_path.to_owned(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    // Phase 1: insert all nodes (populates node_index for cross-file edges)
+    for pf in &parsed_files {
+        if let Err(err) = store.store_file_nodes_only(&pf.abs_path_str, &pf.nodes, &pf.fhash) {
+            errors.push(BuildError {
+                file: pf.abs_path_str.clone(),
+                error: err.to_string(),
+            });
+        }
+    }
+
+    // Phase 2: insert all edges (cross-file targets now resolvable)
+    for pf in &parsed_files {
+        store.insert_edges(&pf.edges, false);
+        total_nodes += pf.nodes.len();
+        total_edges += pf.edges.len();
+
+        let new_hashes = store.get_body_hashes(&pf.abs_path_str);
+        for (qn, new_hash) in &new_hashes {
+            let old_hash = pf.old_hashes.get(qn).map(String::as_str).unwrap_or("");
+            if old_hash != new_hash.as_str() {
+                changed_qualified_names.push(qn.clone());
+            }
+        }
+        for qn in pf.old_hashes.keys() {
+            if !new_hashes.contains_key(qn) {
+                changed_qualified_names.push(qn.clone());
+            }
         }
     }
 
