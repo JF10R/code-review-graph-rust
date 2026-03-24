@@ -1081,6 +1081,239 @@ fn emit_tested_by_edges(nodes: &[NodeInfo], edges: &[EdgeInfo]) -> Vec<EdgeInfo>
 }
 
 // ---------------------------------------------------------------------------
+// Post-pass: framework-aware edge inference
+// ---------------------------------------------------------------------------
+
+/// JS/TS languages that may contain framework-specific patterns.
+const JS_LANGS: &[&str] = &["javascript", "typescript", "tsx"];
+
+/// Common Express/Koa/router object names for middleware detection.
+const EXPRESS_OBJECTS: &[&str] = &["app", "router", "server", "api", "express"];
+
+/// HTTP method names used by Express/Koa route registration.
+const HTTP_METHODS: &[&str] = &["use", "get", "post", "put", "delete", "patch", "all"];
+
+/// Event-listener registration method names.
+const EVENT_LISTENER_METHODS: &[&str] = &["on", "once", "addEventListener"];
+
+/// Find the enclosing function node (smallest Function/Test node whose line
+/// range contains `line`) and return its qualified name, or the file path if
+/// none is found.
+fn enclosing_fn_qname(line: usize, nodes: &[NodeInfo], file_path: &str) -> String {
+    let mut best: Option<&NodeInfo> = None;
+    for node in nodes {
+        if !matches!(node.kind, NodeKind::Function | NodeKind::Test) {
+            continue;
+        }
+        if node.file_path != file_path {
+            continue;
+        }
+        if node.line_start <= line && line <= node.line_end {
+            // Prefer the narrowest (smallest) enclosing function.
+            let is_narrower = best
+                .map(|b| (node.line_end - node.line_start) < (b.line_end - b.line_start))
+                .unwrap_or(true);
+            if is_narrower {
+                best = Some(node);
+            }
+        }
+    }
+    best.map(|n| n.qualified_name.clone())
+        .unwrap_or_else(|| file_path.to_string())
+}
+
+/// Try to resolve a bare name against the local node list; fall back to the
+/// bare name itself (graph.rs resolves it at insertion time via qname lookup).
+fn resolve_target(name: &str, nodes: &[NodeInfo]) -> String {
+    nodes
+        .iter()
+        .find(|n| n.name == name)
+        .map(|n| n.qualified_name.clone())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Extract the last identifier argument from an `arguments` AST node, if any.
+fn last_identifier_arg<'s>(args_node: &Node, source: &'s [u8]) -> Option<&'s str> {
+    let mut cur = args_node.walk();
+    args_node
+        .children(&mut cur)
+        .filter(|n| n.kind() == "identifier")
+        .last()
+        .map(|n| node_text(&n, source))
+}
+
+/// Emit a CALLS edge from the enclosing function to a named handler.
+fn push_handler_edge(
+    handler_name: &str,
+    call_line: usize,
+    nodes: &[NodeInfo],
+    file_path: &str,
+    edges: &mut Vec<EdgeInfo>,
+) {
+    let source_qname = enclosing_fn_qname(call_line, nodes, file_path);
+    let target = resolve_target(handler_name, nodes);
+    edges.push(EdgeInfo {
+        source_qualified: source_qname,
+        target_qualified: target,
+        kind: EdgeKind::Calls,
+        file_path: file_path.to_string(),
+        line: call_line,
+    });
+}
+
+/// Recursively walk the AST looking for framework-specific call patterns and
+/// collect synthetic CALLS edges. Only called for JS/TS languages.
+fn walk_for_framework_edges(
+    node: &Node,
+    source: &[u8],
+    nodes: &[NodeInfo],
+    file_path: &str,
+    edges: &mut Vec<EdgeInfo>,
+) {
+    let node_type = node.kind();
+
+    // Pattern 1: JSX component instantiation — <ComponentName /> or <ComponentName>
+    // Only PascalCase names; lowercase are HTML intrinsics and skipped.
+    if matches!(node_type, "jsx_self_closing_element" | "jsx_opening_element") {
+        let mut cur = node.walk();
+        let component_name: Option<String> = node.children(&mut cur).find_map(|child| {
+            let text = node_text(&child, source);
+            if matches!(child.kind(), "identifier" | "member_expression")
+                && text.chars().next().map_or(false, |c| c.is_uppercase())
+            {
+                Some(text.to_string())
+            } else {
+                None
+            }
+        });
+
+        if let Some(comp) = component_name {
+            let line = node.start_position().row + 1;
+            push_handler_edge(&comp, line, nodes, file_path, edges);
+        }
+    }
+
+    // Patterns 2 & 3: `obj.method(...)` call expressions — Express routes and event emitters.
+    if node_type == "call_expression" {
+        let mut cur = node.walk();
+        let children: Vec<Node> = node.children(&mut cur).collect();
+
+        if let Some(callee) = children.first() {
+            if callee.kind() == "member_expression" {
+                let mut c2 = callee.walk();
+                let callee_children: Vec<Node> = callee.children(&mut c2).collect();
+
+                let obj_name = callee_children
+                    .first()
+                    .filter(|n| n.kind() == "identifier")
+                    .map(|n| node_text(n, source));
+                let method_name = callee_children
+                    .iter()
+                    .rev()
+                    .find(|n| matches!(n.kind(), "property_identifier" | "identifier"))
+                    .map(|n| node_text(n, source));
+
+                let args_node = children.iter().find(|n| n.kind() == "arguments");
+
+                // Pattern 2: Express/Koa route handler — app.get('/path', handler)
+                let is_express_route = obj_name.map_or(false, |o| EXPRESS_OBJECTS.contains(&o))
+                    && method_name.map_or(false, |m| HTTP_METHODS.contains(&m));
+
+                if is_express_route {
+                    if let Some(args) = args_node {
+                        if let Some(handler_name) = last_identifier_arg(args, source) {
+                            let line = node.start_position().row + 1;
+                            push_handler_edge(handler_name, line, nodes, file_path, edges);
+                        }
+                    }
+                }
+
+                // Pattern 3: Event emitter — emitter.on('event', handler)
+                let is_event_listener =
+                    method_name.map_or(false, |m| EVENT_LISTENER_METHODS.contains(&m));
+
+                if is_event_listener {
+                    if let Some(args) = args_node {
+                        if let Some(handler_name) = last_identifier_arg(args, source) {
+                            let line = node.start_position().row + 1;
+                            push_handler_edge(handler_name, line, nodes, file_path, edges);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        walk_for_framework_edges(&child, source, nodes, file_path, edges);
+    }
+}
+
+/// Post-processing pass: detect framework-specific call patterns and emit
+/// synthetic CALLS edges that the main AST walk misses.
+///
+/// Currently detects:
+/// - JSX component instantiation (tsx/jsx: `<ComponentName />` → CALLS edge)
+/// - Express/Koa route handlers (`app.use/get/post` → CALLS edge)
+/// - Event emitter registrations (`.on('event', handler)` → CALLS edge)
+/// - Pytest fixtures (Python test param names matching defined functions)
+fn framework_edges_pass(
+    nodes: &[NodeInfo],
+    tree_root: &Node,
+    source: &[u8],
+    language: &str,
+    file_path: &str,
+) -> Vec<EdgeInfo> {
+    let mut edges: Vec<EdgeInfo> = Vec::new();
+
+    if JS_LANGS.contains(&language) {
+        walk_for_framework_edges(tree_root, source, nodes, file_path, &mut edges);
+    }
+
+    // Pytest fixtures: match test-function param names against locally-defined functions.
+    if language == "python" {
+        let fixture_fns: HashMap<&str, &str> = nodes
+            .iter()
+            .filter(|n| {
+                matches!(n.kind, NodeKind::Function)
+                    && !n.is_test
+                    && n.file_path == file_path
+            })
+            .map(|n| (n.name.as_str(), n.qualified_name.as_str()))
+            .collect();
+
+        for node in nodes {
+            if !node.is_test || node.file_path != file_path {
+                continue;
+            }
+            let sig = node.signature.trim();
+            if sig.is_empty() {
+                continue;
+            }
+            let inner = sig.trim_start_matches('(').trim_end_matches(')');
+            for param in inner.split(',') {
+                let param_name = param.trim().split(':').next().unwrap_or("").trim();
+                if param_name.is_empty() || matches!(param_name, "self" | "cls") {
+                    continue;
+                }
+                if let Some(&fixture_qname) = fixture_fns.get(param_name) {
+                    edges.push(EdgeInfo {
+                        source_qualified: node.qualified_name.clone(),
+                        target_qualified: fixture_qname.to_string(),
+                        kind: EdgeKind::Calls,
+                        file_path: file_path.to_string(),
+                        line: node.line_start,
+                    });
+                }
+            }
+        }
+    }
+
+    edges
+}
+
+// ---------------------------------------------------------------------------
 // Vue SFC script-block extraction (regex-based fallback)
 // ---------------------------------------------------------------------------
 //
@@ -1223,6 +1456,9 @@ impl CodeParser {
 
         edges = resolve_call_targets_pass(&nodes, edges);
 
+        // Framework-aware edge inference (JSX, Express, event emitters, pytest)
+        edges.extend(framework_edges_pass(&nodes, &tree.root_node(), source, language, file_path));
+
         if test_file {
             let tested_by = emit_tested_by_edges(&nodes, &edges);
             edges.extend(tested_by);
@@ -1310,6 +1546,9 @@ impl CodeParser {
         edges.extend(script_edges);
 
         edges = resolve_call_targets_pass(&nodes, edges);
+
+        // Framework-aware edge inference for the Vue script block.
+        edges.extend(framework_edges_pass(&nodes, &root, &script_bytes, script_lang, file_path));
 
         if test_file {
             let tested_by = emit_tested_by_edges(&nodes, &edges);
@@ -1839,4 +2078,95 @@ def run():
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Framework-aware edge inference tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jsx_component_emits_calls_edge() {
+        if !grammar_available("tsx") { return; }
+        let src = r#"
+function Button() { return null; }
+function App() {
+    return <Button />;
+}
+"#;
+        let (_, edges) = parse("app.tsx", src);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target_qualified.contains("Button"))
+            .collect();
+        assert!(!calls.is_empty(), "expected CALLS edge from App to Button via JSX");
+    }
+
+    #[test]
+    fn jsx_lowercase_element_no_edge() {
+        if !grammar_available("tsx") { return; }
+        // HTML intrinsics like <div> should NOT produce CALLS edges.
+        let src = r#"
+function App() {
+    return <div className="container" />;
+}
+"#;
+        let (_, edges) = parse("app.tsx", src);
+        let calls_to_div: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target_qualified.contains("div"))
+            .collect();
+        assert!(calls_to_div.is_empty(), "lowercase JSX elements should not produce CALLS edges");
+    }
+
+    #[test]
+    fn express_route_handler_emits_calls_edge() {
+        if !grammar_available("js") { return; }
+        let src = r#"
+function handleHome() {}
+const app = {};
+app.get('/home', handleHome);
+"#;
+        let (_, edges) = parse("server.js", src);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target_qualified.contains("handleHome"))
+            .collect();
+        assert!(!calls.is_empty(), "expected CALLS edge to Express handler handleHome");
+    }
+
+    #[test]
+    fn event_emitter_on_emits_calls_edge() {
+        if !grammar_available("js") { return; }
+        let src = r#"
+function onData() {}
+const emitter = {};
+emitter.on('data', onData);
+"#;
+        let (_, edges) = parse("events.js", src);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target_qualified.contains("onData"))
+            .collect();
+        assert!(!calls.is_empty(), "expected CALLS edge to event handler onData");
+    }
+
+    #[test]
+    fn pytest_fixture_emits_calls_edge() {
+        if !grammar_available("py") { return; }
+        let src = r#"
+def db_connection():
+    return None
+
+def test_query(db_connection):
+    pass
+"#;
+        let (_, edges) = parse("tests/test_db.py", src);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Calls
+                    && e.source_qualified.contains("test_query")
+                    && e.target_qualified.contains("db_connection")
+            })
+            .collect();
+        assert!(!calls.is_empty(), "expected CALLS edge from test_query to pytest fixture db_connection");
+    }
 }
