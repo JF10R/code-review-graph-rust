@@ -30,6 +30,8 @@ enum Commands {
     Build {
         #[arg(long)]
         repo: Option<String>,
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Incremental update (only changed files)
     Update {
@@ -37,6 +39,8 @@ enum Commands {
         base: String,
         #[arg(long)]
         repo: Option<String>,
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Show graph statistics
     Status {
@@ -92,30 +96,34 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
     use code_review_graph::incremental;
 
     match cmd {
-        Commands::Build { repo } => {
+        Commands::Build { repo, quiet } => {
             let root = resolve_project_root(repo.as_deref(), false)?;
             let db_path = incremental::get_db_path(&root);
             let mut store = code_review_graph::graph::GraphStore::new(&db_path)?;
             let result = incremental::full_build(&root, &mut store)?;
-            println!(
-                "Full build: {} files, {} nodes, {} edges",
-                result.files_parsed, result.total_nodes, result.total_edges
-            );
+            if !quiet {
+                println!(
+                    "Full build: {} files, {} nodes, {} edges",
+                    result.files_parsed, result.total_nodes, result.total_edges
+                );
+            }
             if !result.errors.is_empty() {
-                println!("Errors: {}", result.errors.len());
+                eprintln!("Errors: {}", result.errors.len());
             }
             store.close()?;
         }
 
-        Commands::Update { base, repo } => {
+        Commands::Update { base, repo, quiet } => {
             let root = resolve_project_root(repo.as_deref(), true)?;
             let db_path = incremental::get_db_path(&root);
             let mut store = code_review_graph::graph::GraphStore::new(&db_path)?;
             let result = incremental::incremental_update(&root, &mut store, &base, None)?;
-            println!(
-                "Incremental: {} files updated, {} nodes, {} edges",
-                result.files_updated, result.total_nodes, result.total_edges
-            );
+            if !quiet {
+                println!(
+                    "Incremental: {} files updated, {} nodes, {} edges",
+                    result.files_updated, result.total_nodes, result.total_edges
+                );
+            }
             store.close()?;
         }
 
