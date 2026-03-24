@@ -198,11 +198,20 @@ impl GraphStore {
     }
 
     /// Persist in-memory state to disk.
-    ///
-    /// Previously a no-op (rusqlite auto-committed). Now triggers a real
-    /// atomic file write.
     pub fn commit(&self) -> Result<()> {
         save(&self.data, &self.bin_path)
+    }
+
+    /// Compact the in-memory graph by saving to disk and reloading.
+    ///
+    /// StableGraph uses tombstones for removed nodes — they never shrink.
+    /// After many incremental updates, the internal Vec accumulates vacant
+    /// slots.  A save+reload cycle naturally compacts because postcard only
+    /// serializes live data, and deserialization builds a fresh graph.
+    pub fn compact(&mut self) -> Result<()> {
+        self.commit()?;
+        self.data = load(&self.bin_path)?;
+        Ok(())
     }
 
     // -- Read operations --

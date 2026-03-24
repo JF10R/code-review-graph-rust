@@ -17,7 +17,7 @@
 //! Stores embeddings in a `.embeddings.bin.zst` file using the same
 //! postcard/zstd pattern as `graph.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "hnsw-index")]
@@ -741,6 +741,27 @@ pub fn embed_all_nodes(
         Some(p) => p,
         None => return Ok(0),
     };
+
+    // GC: remove embeddings for nodes no longer in the graph.
+    let live_qns: HashSet<String> = store
+        .get_all_files()?
+        .iter()
+        .flat_map(|f| store.get_nodes_by_file(f).unwrap_or_default())
+        .map(|n| n.qualified_name.clone())
+        .collect();
+    let stale_keys: Vec<String> = emb_store
+        .data
+        .vectors
+        .keys()
+        .filter(|k| !live_qns.contains(k.as_str()))
+        .cloned()
+        .collect();
+    if !stale_keys.is_empty() {
+        log::info!("Embedding GC: removing {} stale vector(s)", stale_keys.len());
+        for k in &stale_keys {
+            emb_store.data.vectors.remove(k);
+        }
+    }
 
     // (qualified_name, text, hash) — hash computed once here, reused on insert
     let mut to_embed: Vec<(String, String, String)> = vec![];

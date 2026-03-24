@@ -378,38 +378,6 @@ fn parse_file_parallel(parser: &CodeParser, repo_root: &Path, rel_path: &str) ->
     Ok((rel_path.to_owned(), nodes, edges, fhash))
 }
 
-/// Parse `rel_path` (relative to `repo_root`) and store its nodes/edges.
-///
-/// `source` and `fhash` are pre-computed by the caller to avoid a second disk read.
-/// Returns `(node_count, edge_count)` on success, or a `BuildError` on failure.
-/// Used by `incremental_update` (sequential, store access required per file).
-fn parse_and_store_file(
-    parser: &CodeParser,
-    repo_root: &Path,
-    rel_path: &str,
-    source: &[u8],
-    fhash: &str,
-    store: &mut GraphStore,
-) -> std::result::Result<(usize, usize), BuildError> {
-    let full_path = repo_root.join(rel_path);
-    let (nodes, edges) = parser.parse_bytes(&full_path, source).map_err(|e| {
-        warn!("Error parsing {}: {}", rel_path, e);
-        BuildError {
-            file: rel_path.to_owned(),
-            error: e.to_string(),
-        }
-    })?;
-    let n = nodes.len();
-    let e = edges.len();
-    store
-        .store_file_nodes_edges(&full_path.to_string_lossy(), &nodes, &edges, fhash)
-        .map_err(|err| BuildError {
-            file: rel_path.to_owned(),
-            error: err.to_string(),
-        })?;
-    Ok((n, e))
-}
-
 /// Full rebuild of the entire graph.
 pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResult> {
     let parser = CodeParser::new();
@@ -680,6 +648,9 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
 
     info!("Watching {} for changes... (Ctrl+C to stop)", repo_root.display());
 
+    let mut batch_count: u32 = 0;
+    const COMPACT_INTERVAL: u32 = 50;
+
     for result in rx {
         let events = match result {
             Ok(evts) => evts,
@@ -762,6 +733,16 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
                     }
                 }
                 Err(err) => error!("Error reading {}: {}", path.display(), err),
+            }
+        }
+
+        // Periodic compaction: save+reload to reclaim StableGraph tombstones
+        batch_count += 1;
+        if batch_count % COMPACT_INTERVAL == 0 {
+            if let Err(e) = store.compact() {
+                warn!("Compaction failed: {}", e);
+            } else {
+                info!("Compacted graph after {} batches", batch_count);
             }
         }
     }
