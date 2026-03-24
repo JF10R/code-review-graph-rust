@@ -579,12 +579,12 @@ pub fn semantic_search_nodes(
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
     let emb_db_path = incremental::get_embeddings_db_path(&root);
-    let emb_store = EmbeddingStore::new(&emb_db_path)?;
+    let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
     let search_mode;
 
     let results: Vec<Value> = if emb_store.available() && emb_store.count()? > 0 {
         search_mode = "semantic";
-        let mut raw = semantic_search(query, &store, &emb_store, limit * 2)?;
+        let mut raw = semantic_search(query, &store, &mut emb_store, limit * 2)?;
         if let Some(k) = kind {
             raw.retain(|r| r.get("kind").and_then(|v| v.as_str()) == Some(k));
         }
@@ -668,7 +668,6 @@ pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
         .unwrap_or(0);
     summary_parts.push(String::new());
     summary_parts.push(format!("Embeddings: {emb_count} nodes embedded"));
-    summary_parts.push("  (no sentence-transformers equivalent in Rust yet)".to_string());
 
     store.close()?;
     Ok(json!({
@@ -692,19 +691,19 @@ pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
 pub fn embed_graph(repo_root: Option<&str>) -> Result<Value> {
     let (store, root) = get_store(repo_root)?;
     let emb_db_path = incremental::get_embeddings_db_path(&root);
-    let emb_store = EmbeddingStore::new(&emb_db_path)?;
+    let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
 
     if !emb_store.available() {
         emb_store.close()?;
         store.close()?;
         return Ok(json!({
             "status": "error",
-            "error": "No embedding provider is available in the Rust build yet. \
-                      Semantic search falls back to keyword matching.",
+            "error": "No embedding provider configured. Set EMBEDDING_PROVIDER=openai|voyage|gemini \
+                      and the corresponding API key. Semantic search falls back to keyword matching.",
         }));
     }
 
-    let newly_embedded = embed_all_nodes(&store, &emb_store)?;
+    let newly_embedded = embed_all_nodes(&store, &mut emb_store)?;
     let total = emb_store.count()?;
     emb_store.close()?;
     store.close()?;
@@ -990,4 +989,165 @@ fn generate_review_guidance(impact: &crate::types::ImpactResult) -> String {
     }
 
     parts.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Create a temp dir with a .git dir (so validate_repo_root accepts it)
+    /// and return (dir, root_path_string).
+    fn make_git_repo() -> (TempDir, String) {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_repo_root
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_repo_root_rejects_nonexistent() {
+        let result = validate_repo_root(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_repo_root_rejects_dir_without_git() {
+        let dir = TempDir::new().unwrap();
+        // No .git, no .code-review-graph
+        let result = validate_repo_root(dir.path());
+        assert!(result.is_err(), "dir without .git should be rejected");
+    }
+
+    #[test]
+    fn validate_repo_root_accepts_git_repo() {
+        let (dir, _) = make_git_repo();
+        let result = validate_repo_root(dir.path());
+        assert!(result.is_ok(), "dir with .git should be accepted");
+    }
+
+    #[test]
+    fn validate_repo_root_accepts_code_review_graph_dir() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join(".code-review-graph")).unwrap();
+        let result = validate_repo_root(dir.path());
+        assert!(result.is_ok(), "dir with .code-review-graph should be accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_builtin_call
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_builtin_call_identifies_builtins() {
+        assert!(is_builtin_call("map"));
+        assert!(is_builtin_call("filter"));
+        assert!(is_builtin_call("forEach"));
+        assert!(is_builtin_call("reduce"));
+        assert!(is_builtin_call("push"));
+        assert!(is_builtin_call("then"));
+        assert!(is_builtin_call("catch"));
+        assert!(is_builtin_call("log"));
+    }
+
+    #[test]
+    fn is_builtin_call_rejects_non_builtins() {
+        assert!(!is_builtin_call("myCustomFunction"));
+        assert!(!is_builtin_call("processPayment"));
+        assert!(!is_builtin_call("authenticate"));
+        assert!(!is_builtin_call("buildGraph"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_or_update_graph
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_or_update_graph_returns_ok_status() {
+        let (dir, path) = make_git_repo();
+        // Write a Python file to parse
+        fs::write(dir.path().join("hello.py"), b"def hello(): pass\n").unwrap();
+
+        let result = build_or_update_graph(true, Some(&path), "HEAD");
+        assert!(result.is_ok(), "build_or_update_graph should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        assert_eq!(val["build_type"], "full");
+    }
+
+    // -----------------------------------------------------------------------
+    // list_graph_stats
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_graph_stats_returns_correct_structure() {
+        let (dir, path) = make_git_repo();
+        fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
+        // First build so stats are non-trivial
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = list_graph_stats(Some(&path));
+        assert!(result.is_ok(), "list_graph_stats should succeed");
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        assert!(val["total_nodes"].is_number());
+        assert!(val["total_edges"].is_number());
+        assert!(val["nodes_by_kind"].is_object());
+        assert!(val["edges_by_kind"].is_object());
+    }
+
+    // -----------------------------------------------------------------------
+    // query_graph — unknown pattern returns error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn query_graph_unknown_pattern_returns_error() {
+        let (dir, path) = make_git_repo();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = query_graph("totally_unknown_pattern", "some_target", Some(&path));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "error");
+        assert!(val["error"].as_str().unwrap().contains("totally_unknown_pattern"));
+    }
+
+    #[test]
+    fn query_graph_known_pattern_not_found_returns_not_found() {
+        let (dir, path) = make_git_repo();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = query_graph("callers_of", "definitely_not_a_real_function_xyz", Some(&path));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        // Could be "not_found" or "ok" with empty results
+        let status = val["status"].as_str().unwrap();
+        assert!(
+            status == "not_found" || status == "ok",
+            "unexpected status: {status}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // get_docs_section — unknown section returns not_found
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_docs_section_unknown_section_returns_not_found() {
+        let (dir, path) = make_git_repo();
+        let result = get_docs_section("completely_unknown_section_xyz", Some(&path));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "not_found");
+        assert!(val["error"].as_str().unwrap().contains("completely_unknown_section_xyz"));
+    }
 }

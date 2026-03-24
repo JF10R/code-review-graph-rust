@@ -60,6 +60,9 @@ sha2 = "0.10"
 walkdir = "2"
 glob = "0.3"
 
+# HTTP client for embedding providers
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
 # Utilities
 regex = "1"
 log = "0.4"
