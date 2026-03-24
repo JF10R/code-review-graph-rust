@@ -1,245 +1,142 @@
 # code-review-graph (Rust)
 
-> Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-graph) by Tirth Kanani. Single binary, zero dependencies, 50-200x faster queries.
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
+[![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
 
-**Stop burning tokens. Start reviewing smarter.**
-
-Claude Code re-reads your entire codebase on every task. `code-review-graph` fixes that. It builds a structural map of your code with [Tree-sitter](https://tree-sitter.github.io/tree-sitter/), tracks changes incrementally, and gives Claude precise context so it reads only what matters.
-
-This is a complete rewrite in Rust of the original Python implementation, preserving full API compatibility while delivering dramatically better performance and distribution.
+Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-graph) by Tirth Kanani. Single binary, zero runtime dependencies.
 
 ---
 
-## Why this exists
+## What this is
 
-### Without code-review-graph
+`code-review-graph` builds a structural knowledge graph of your codebase using Tree-sitter, then exposes it to Claude Code via MCP. Instead of scanning entire files, Claude queries the graph to find exactly which functions, classes, and tests are impacted by a change — reducing token usage by 6.8x on average (up to 49x on monorepos).
 
-Claude Code reads **every changed file plus context** on each task. On a 1,000-file project, that's thousands of tokens burned just finding the right 5 files. On a monorepo, it's catastrophic.
-
-### With code-review-graph (Python)
-
-The original Python version solves this with a structural knowledge graph — Tree-sitter parses your code into nodes (functions, classes, imports) and edges (calls, inheritance, test coverage). Claude queries the graph instead of scanning files. **6.8x fewer tokens on average, up to 49x on monorepos.**
-
-### With code-review-graph (Rust) — this version
-
-Same solution, fundamentally better execution:
-
-| | Without code-review-graph | Python (original) | **Rust (this version)** |
-|---|---|---|---|
-| Token usage | Full scan every time | **6.8x reduction** | **6.8x reduction** (same graph) |
-| Installation | N/A | Python 3.10+ venv, ~150 MB | **Single 28 MB binary** |
-| Startup | N/A | ~150-300 ms | **~2-5 ms** |
-| `list_graph_stats` | N/A | ~5 ms (SQL) | **<0.1 ms** (O(1) in-memory) |
-| `get_impact_radius` first call | N/A | ~200 ms (build cache) | **<1 ms** (always in memory) |
-| `query_graph callers_of` | N/A | ~10 ms (SQL + cache) | **<0.5 ms** (direct HashMap) |
-| Incremental update (5 files) | N/A | ~200 ms | **~50 ms** |
-| Graph on disk (1k files) | N/A | ~2 MB (SQLite) | **~200 KB** (bincode+zstd) |
-| Graph on disk (10k files) | N/A | ~20 MB | **~2 MB** |
-| Runtime dependencies | N/A | Python + pip + venv | **None** |
-| Auto-update graph | N/A | Manual hook | **Background watcher + lazy stale-check** |
+This is a complete Rust rewrite of the original Python implementation, preserving full API compatibility. See the [original project](https://github.com/tirth8205/code-review-graph) for architecture details and benchmarks.
 
 ---
 
 ## Quick Start
 
-### Download the binary
-
 ```bash
-# From GitHub releases (coming soon)
-# or build from source:
-cargo install --path .
-```
+# Install
+cargo install --git https://github.com/JF10R/code-review-graph-rust
 
-### Initialize
-
-```bash
+# Set up in your project
 cd your-project
-code-review-graph install   # Creates .mcp.json for Claude Code
-code-review-graph build     # Parses the codebase (~10s for 500 files)
+code-review-graph install
+
+# Build the graph
+code-review-graph build
+
+# Restart Claude Code — done!
 ```
 
-Restart Claude Code after installation.
+The MCP server starts automatically when Claude Code launches and keeps the graph fresh via a background watcher.
 
-### Use
+---
 
-The graph updates **automatically**:
-- The MCP server starts a **background watcher** that re-indexes modified files in real time
-- Each tool request checks **graph freshness** and runs an incremental update if needed
-- The `--quiet` flag enables integration with Claude Code PostToolUse hooks
+## How it works
+
+Tree-sitter parses your code into a graph of nodes (functions, classes, imports) and edges (calls, inheritance, test coverage). When you ask Claude to review a change, it queries the graph for the blast radius — which callers, dependents, and tests are affected — then reads only those files. The graph updates incrementally on every file save.
+
+---
+
+## Performance vs Python
+
+| Metric | Python | Rust |
+|--------|--------|------|
+| Startup | 150-300 ms | 2-5 ms |
+| First query (cold start) | ~200 ms | <1 ms |
+| Graph on disk (1k files) | ~2 MB (SQLite) | ~200 KB (bincode+zstd) |
+| Binary size | ~150 MB (with venv) | 28 MB |
+| Runtime dependencies | Python 3.10+ | None |
+
+---
+
+## Embeddings
+
+### Free local embeddings (default)
+
+Embeddings work out of the box — no API key needed. The `embeddings-local` feature (enabled by default) runs `all-MiniLM-L6-v2` locally via candle.
+
+```bash
+code-review-graph build
+code-review-graph embed    # Downloads model on first run (~23 MB, cached by HF Hub)
+```
+
+### API providers (optional, higher quality)
+
+```bash
+code-review-graph config set embedding-provider voyage
+code-review-graph config set voyage-api-key pa-...
+code-review-graph embed
+```
+
+| Provider | Model | Quality | Cost |
+|----------|-------|---------|------|
+| Local (candle) | all-MiniLM-L6-v2 | Good | Free |
+| Voyage AI | voyage-code-3 | Best for code | ~$0.02/10k nodes |
+| OpenAI | text-embedding-3-small | Good | ~$0.002/10k nodes |
+| Google Gemini | text-embedding-004 | Good | Free tier available |
+
+### When to use embeddings
+
+- **Without embeddings**: `semantic_search` falls back to keyword matching (exact name substring). Sufficient for most projects.
+- **With embeddings**: `semantic_search` uses vector similarity. Finds functions by meaning, not just name. Worth enabling for large codebases (>500 files) where exact matching misses relevant results.
+
+### Minimal binary (no embeddings)
+
+```bash
+cargo install --git https://github.com/JF10R/code-review-graph-rust --no-default-features
+```
+
+---
+
+## CLI Reference
 
 ```
-# Ask Claude:
-Review my recent changes using the code graph
-```
-
----
-
-## Advantages vs the Python version
-
-### Performance
-
-| Operation | Python | Rust | Speedup |
-|---|---|---|---|
-| MCP server startup | 150-300 ms (interpreter + imports) | 2-5 ms | **30-60x** |
-| First query (cold start) | 200+ ms (build NetworkX cache from SQLite) | <1 ms (graph already in memory) | **200x** |
-| Graph stats | 5 ms (COUNT SQL queries) | <0.1 ms (O(1) `.node_count()`) | **50x** |
-| Node search | 10 ms (SQL LIKE) | <0.5 ms (HashMap iteration) | **20x** |
-| Save after build | 100 ms (INSERT SQLite) | 20 ms (serialize+zstd+write) | **5x** |
-| Full build (tree-sitter) | ~3s | ~2.5s | 1.2x (tree-sitter dominates) |
-| Blast radius precision | Over-reports ~30-50% | Direction-aware + weighted + PageRank | **2-3x fewer false positives** |
-
-### Architecture
-
-| Aspect | Python | Rust |
-|---|---|---|
-| Storage | SQLite WAL + 3 tables + 7 indexes + lazy petgraph cache | **In-memory StableGraph**, persisted as bincode+zstd |
-| On-disk format | `.code-review-graph/graph.db` (SQLite) | `.code-review-graph/graph.bin.zst` (4-10x smaller) |
-| Graph cache | Lazy — rebuilt on first `get_impact_radius()` | **Always in memory** — zero cold start |
-| Concurrency | SQLite WAL (multiple readers) | Arc\<Mutex\> in memory (single-writer, zero I/O for reads) |
-| Integrity | SQLite journal | CRC-32 header + magic bytes + atomic write (tempfile+rename) |
-| Embeddings | SQLite table | bincode/zstd (same format as graph) |
-
-### Distribution
-
-| Aspect | Python | Rust |
-|---|---|---|
-| Install size | ~150 MB (Python + venv + tree-sitter + SQLite) | **28 MB** (single static binary) |
-| Dependencies | Python 3.10+, pip, venv, tree-sitter C libs | **None** |
-| Installation | `pip install` + `code-review-graph install` | Download binary + `code-review-graph install` |
-| Cross-platform | Platform-specific wheels | Compiled binary per target |
-| Build time | ~50s (C compilation of SQLite + tree-sitter) | **~20s** (no SQLite) |
-
-### Added features
-
-| Feature | Python | Rust |
-|---|---|---|
-| Background watcher in MCP server | No (separate command) | **Yes** — auto-starts on `serve` |
-| Lazy stale-check per request | No | **Yes** — `git status` before each query |
-| `--quiet` flag for hooks | No | **Yes** — `code-review-graph update -q` |
-| Graph compression | No | **zstd level 3** — 4-5x ratio |
-| Integrity checksum | No | **CRC-32** + magic bytes + auto-rebuild on corruption |
-| Atomic writes | No | **tempfile + rename** — no corruption on crash |
-| Weighted blast radius | No (flat BFS, all edges equal) | **Yes** — direction-aware, edge-weighted, decay scoring |
-| Node-level diff seeding | No (all nodes in changed files) | **Yes** — only changed functions as seeds |
-| PageRank for scale | No | **Yes** — auto-switches at 10k+ nodes |
-
----
-
-## Advantages vs Claude Code without code-review-graph
-
-Without the graph, Claude Code must:
-1. Read **all changed files** plus their likely dependencies
-2. Guess the blast radius of a change
-3. Scan thousands of tokens to find the 5 relevant files
-
-With code-review-graph:
-- **6.8x fewer tokens on average** (up to 49x on monorepos)
-- **Precise blast radius** — knows exactly which functions/classes/tests are impacted
-- **Higher review quality** — scored 8.8/10 vs 7.2/10 on benchmarks
-- **14 languages supported** (including Kotlin) with full extraction of functions, classes, imports, calls, inheritance, and tests
-
-Benchmarks from the original project (reproduced with permission):
-
-| Repo | Size | Standard tokens | Tokens with graph | Reduction | Quality |
-|---|---:|---:|---:|---:|---|
-| httpx | 125 files | 12,507 | 458 | **26.2x** | 9.0 vs 7.0 |
-| FastAPI | 2,915 files | 5,495 | 871 | **8.1x** | 8.5 vs 7.5 |
-| Next.js | 27,732 files | 21,614 | 4,457 | **6.0x** | 9.0 vs 7.0 |
-
----
-
-## Blast Radius Algorithm
-
-The Rust version implements a significantly smarter impact analysis than the original Python BFS:
-
-### Direction-aware traversal
-
-Not all edges matter equally when code changes:
-- **Reverse callers** (who calls the changed function?) → high impact
-- **Forward callees** (what does the changed function call?) → not impacted (dependencies didn't change)
-
-The Python version traverses both directions equally, causing ~30-50% false positives. The Rust version only propagates impact through reverse dependency edges.
-
-### Weighted edges
-
-| Edge type | Weight | Rationale |
-|-----------|--------|-----------|
-| INHERITS | 1.2 | Liskov substitution risk — subclass contracts may break |
-| CALLS | 1.0 | Direct dependency on changed behavior |
-| IMPLEMENTS | 1.0 | Interface contract may have changed |
-| TESTED_BY | 0.8 | Test should be re-run to verify |
-| IMPORTS_FROM | 0.5 | May only import types/constants |
-| CONTAINS | 0.1 | Structural relationship, rarely semantic impact |
-
-Impact scores decay with distance (0.7x per hop), producing a ranked list instead of a flat set.
-
-### Node-level diff seeding
-
-Instead of flagging all nodes in a changed file, only nodes whose `body_hash` actually changed are used as seeds. This dramatically reduces the blast radius when a file has 50 functions but only 1 was modified.
-
-### Personalized PageRank for large codebases
-
-For graphs exceeding 10,000 nodes, the algorithm automatically switches from weighted BFS to Personalized PageRank:
-- Hub nodes (utility files imported everywhere) are dampened proportionally to their degree
-- Impact scores converge naturally without hard depth cutoffs
-- Returns a ranked top-N instead of an exploding set
-
-| Codebase size | Python BFS result | Rust weighted result |
-|---|---|---|
-| 100 files | ~50 impacted (many false+) | ~20 ranked by score |
-| 1,000 files | ~500 impacted (unusable) | ~50 ranked by score |
-| 10,000+ files | Explodes (everything is "impacted") | Top-50 via PageRank |
-
----
-
-## Supported languages
-
-Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, C#, Ruby, PHP, Swift, Vue, Kotlin
-
----
-
-## CLI
-
-```
-code-review-graph install     # Register MCP server (.mcp.json)
-code-review-graph build       # Full codebase parse
+code-review-graph install     # Register MCP server (creates .mcp.json)
+code-review-graph build       # Full parse of all files
 code-review-graph update      # Incremental update (changed files only)
 code-review-graph status      # Graph statistics
 code-review-graph watch       # Auto-update on file changes
 code-review-graph visualize   # Generate interactive HTML visualization
 code-review-graph serve       # Start MCP server (stdio)
+code-review-graph config set <key> <value>
+code-review-graph config get <key>
+code-review-graph config list
+code-review-graph config reset
 ```
 
-Useful options:
-- `--repo PATH` — specify project directory
-- `--quiet` / `-q` — silent mode (for hooks)
-- `--base REF` — git ref for incremental diff (default: `HEAD~1`)
+Global flags (most commands):
 
----
-
-## MCP Tools
-
-Claude uses these tools automatically once the graph is built.
-
-| Tool | Description |
-|---|---|
-| `build_or_update_graph` | Build or update the graph |
-| `get_impact_radius` | Blast radius of changed files |
-| `get_review_context` | Token-optimized review context |
-| `query_graph` | Callers, callees, imports, inheritance, tests |
-| `semantic_search_nodes` | Search by name or similarity |
-| `embed_graph` | Compute vector embeddings |
-| `list_graph_stats` | Graph size and health |
-| `get_docs_section` | Documentation sections |
-| `find_large_functions` | Functions/classes exceeding a line-count threshold |
+- `--repo PATH` — specify project directory (defaults to git root or cwd)
+- `--quiet` / `-q` — suppress output (for PostToolUse hooks)
+- `--base REF` — git ref for incremental diff (default: `HEAD~1`, `update` only)
+- `--dry-run` — preview without writing (`install` only)
 
 ---
 
 ## Configuration
 
+### Config keys
+
+| Key | Description |
+|-----|-------------|
+| `embedding-provider` | `openai`, `voyage`, `gemini`, or `none` |
+| `openai-api-key` | OpenAI API key |
+| `voyage-api-key` | Voyage AI API key |
+| `gemini-api-key` | Google Gemini API key |
+| `embedding-model` | Override the provider's default model |
+
+Config is stored at `~/.config/code-review-graph/config.json` (Linux/Mac) or `%APPDATA%/code-review-graph/config.json` (Windows). API keys are masked in `config list` output.
+
+Environment variables (`EMBEDDING_PROVIDER`, `OPENAI_API_KEY`, `VOYAGE_API_KEY`, `GEMINI_API_KEY`, `EMBEDDING_MODEL`) take priority over the config file.
+
 ### Exclude files
 
-Create `.code-review-graphignore` at the project root:
+Create `.code-review-graphignore` at the project root (same syntax as `.gitignore`):
 
 ```
 generated/**
@@ -249,7 +146,7 @@ vendor/**
 
 ### PostToolUse hook (always-fresh graph)
 
-Add to `.claude/settings.json`:
+Add to `.claude/settings.json` to update the graph after every file edit:
 
 ```json
 {
@@ -264,14 +161,38 @@ Add to `.claude/settings.json`:
 
 ---
 
-## Architecture
+## Supported languages
 
-```
-.code-review-graph/
-├── graph.bin.zst         # StableGraph + indexes (bincode + zstd)
-├── embeddings.bin.zst    # Vector embeddings (same format)
-└── .gitignore            # Auto-generated
-```
+Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, C#, Ruby, PHP, Swift, Vue, Kotlin
+
+Kotlin support uses `tree-sitter-kotlin-ng` (the actively maintained fork).
+
+---
+
+## Blast Radius Algorithm
+
+The impact analysis is direction-aware, weighted, and node-level — significantly more precise than the original Python BFS.
+
+**Direction-aware traversal**: only reverse dependency edges propagate impact. Callers of the changed function are affected; callees are not (they didn't change).
+
+**Weighted edges**: impact decays by 0.7x per hop, and edge weights reflect semantic risk:
+
+| Edge type | Weight | Rationale |
+|-----------|--------|-----------|
+| INHERITS | 1.2 | Liskov substitution risk |
+| CALLS | 1.0 | Direct dependency |
+| IMPLEMENTS | 1.0 | Interface contract |
+| TESTED_BY | 0.8 | Tests should be re-run |
+| IMPORTS_FROM | 0.5 | May be types/constants only |
+| CONTAINS | 0.1 | Structural, rarely semantic |
+
+**Node-level diff seeding**: only functions whose `body_hash` actually changed are used as seeds — not all nodes in the modified file. Reduces false positives when a file has many functions but only one changed.
+
+**Auto PageRank at scale**: for graphs exceeding 10,000 nodes, the algorithm switches from weighted BFS to Personalized PageRank. Hub nodes (utility files imported everywhere) are dampened proportionally to their degree, preventing the blast radius from exploding on large monorepos.
+
+---
+
+## Architecture
 
 ```
 src/
@@ -282,7 +203,8 @@ src/
 ├── server.rs         # rmcp MCP server (stdio) + background watcher
 ├── main.rs           # CLI (clap)
 ├── types.rs          # Shared types
-├── embeddings.rs     # Vector embedding store
+├── embeddings.rs     # Vector embedding store (candle + API providers)
+├── config.rs         # Persistent config (API keys, provider)
 ├── visualization.rs  # Interactive D3.js HTML export
 ├── tsconfig.rs       # TypeScript path alias resolver
 ├── error.rs          # Error types
