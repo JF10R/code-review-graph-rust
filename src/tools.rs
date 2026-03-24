@@ -11,7 +11,9 @@
 //! 8. get_docs_section
 //! 9. find_large_functions
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
@@ -23,46 +25,54 @@ use crate::types::{edge_to_dict, node_to_dict, EdgeKind};
 
 /// Common JS/TS builtin method names filtered from callers_of results.
 /// "Who calls .map()?" returns hundreds of hits and is never useful.
-static BUILTIN_CALL_NAMES: &[&str] = &[
-    "map", "filter", "reduce", "reduceRight", "forEach", "find", "findIndex",
-    "some", "every", "includes", "indexOf", "lastIndexOf",
-    "push", "pop", "shift", "unshift", "splice", "slice",
-    "concat", "join", "flat", "flatMap", "sort", "reverse", "fill",
-    "keys", "values", "entries", "from", "isArray", "of", "at",
-    "trim", "trimStart", "trimEnd", "split", "replace", "replaceAll",
-    "match", "matchAll", "search", "substring", "substr",
-    "toLowerCase", "toUpperCase", "startsWith", "endsWith",
-    "padStart", "padEnd", "repeat", "charAt", "charCodeAt",
-    "assign", "freeze", "defineProperty", "getOwnPropertyNames",
-    "hasOwnProperty", "create", "is", "fromEntries",
-    "log", "warn", "error", "info", "debug", "trace", "dir", "table",
-    "time", "timeEnd", "assert", "clear", "count",
-    "then", "catch", "finally", "resolve", "reject", "all", "allSettled", "race", "any",
-    "parse", "stringify",
-    "floor", "ceil", "round", "random", "max", "min", "abs", "pow", "sqrt",
-    "addEventListener", "removeEventListener", "querySelector", "querySelectorAll",
-    "getElementById", "createElement", "appendChild", "removeChild",
-    "setAttribute", "getAttribute", "preventDefault", "stopPropagation",
-    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
-    "toString", "valueOf", "toJSON", "toISOString",
-    "getTime", "getFullYear", "now",
-    "isNaN", "parseInt", "parseFloat", "toFixed",
-    "encodeURIComponent", "decodeURIComponent",
-    "call", "apply", "bind", "next",
-    "emit", "on", "off", "once",
-    "pipe", "write", "read", "end", "close", "destroy",
-    "send", "status", "json", "redirect",
-    "set", "get", "delete", "has",
-    "findUnique", "findFirst", "findMany", "createMany",
-    "update", "updateMany", "deleteMany", "upsert",
-    "aggregate", "groupBy", "transaction",
-    "describe", "it", "test", "expect", "beforeEach", "afterEach",
-    "beforeAll", "afterAll", "mock", "spyOn",
-    "require", "fetch",
-];
+static BUILTIN_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+fn builtin_call_set() -> &'static HashSet<&'static str> {
+    BUILTIN_SET.get_or_init(|| {
+        [
+            "map", "filter", "reduce", "reduceRight", "forEach", "find", "findIndex",
+            "some", "every", "includes", "indexOf", "lastIndexOf",
+            "push", "pop", "shift", "unshift", "splice", "slice",
+            "concat", "join", "flat", "flatMap", "sort", "reverse", "fill",
+            "keys", "values", "entries", "from", "isArray", "of", "at",
+            "trim", "trimStart", "trimEnd", "split", "replace", "replaceAll",
+            "match", "matchAll", "search", "substring", "substr",
+            "toLowerCase", "toUpperCase", "startsWith", "endsWith",
+            "padStart", "padEnd", "repeat", "charAt", "charCodeAt",
+            "assign", "freeze", "defineProperty", "getOwnPropertyNames",
+            "hasOwnProperty", "create", "is", "fromEntries",
+            "log", "warn", "error", "info", "debug", "trace", "dir", "table",
+            "time", "timeEnd", "assert", "clear", "count",
+            "then", "catch", "finally", "resolve", "reject", "all", "allSettled", "race", "any",
+            "parse", "stringify",
+            "floor", "ceil", "round", "random", "max", "min", "abs", "pow", "sqrt",
+            "addEventListener", "removeEventListener", "querySelector", "querySelectorAll",
+            "getElementById", "createElement", "appendChild", "removeChild",
+            "setAttribute", "getAttribute", "preventDefault", "stopPropagation",
+            "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+            "toString", "valueOf", "toJSON", "toISOString",
+            "getTime", "getFullYear", "now",
+            "isNaN", "parseInt", "parseFloat", "toFixed",
+            "encodeURIComponent", "decodeURIComponent",
+            "call", "apply", "bind", "next",
+            "emit", "on", "off", "once",
+            "pipe", "write", "read", "end", "close", "destroy",
+            "send", "status", "json", "redirect",
+            "set", "get", "delete", "has",
+            "findUnique", "findFirst", "findMany", "createMany",
+            "update", "updateMany", "deleteMany", "upsert",
+            "aggregate", "groupBy", "transaction",
+            "describe", "it", "test", "expect", "beforeEach", "afterEach",
+            "beforeAll", "afterAll", "mock", "spyOn",
+            "require", "fetch",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
 
 fn is_builtin_call(name: &str) -> bool {
-    BUILTIN_CALL_NAMES.contains(&name)
+    builtin_call_set().contains(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -123,9 +133,9 @@ fn maybe_auto_update(store: &mut GraphStore, repo_root: &Path) {
         return;
     }
     // Only update if there are actually changed files not yet in the graph
-    let _ = crate::incremental::incremental_update(
-        repo_root, store, "HEAD", Some(changed),
-    );
+    if let Err(e) = crate::incremental::incremental_update(repo_root, store, "HEAD", Some(changed)) {
+        log::warn!("auto-update failed: {}", e);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,19 +291,59 @@ pub fn get_impact_radius(
 // Tool 3: query_graph
 // ---------------------------------------------------------------------------
 
-const QUERY_PATTERNS: &[(&str, &str)] = &[
-    ("callers_of",   "Find all functions that call a given function"),
-    ("callees_of",   "Find all functions called by a given function"),
-    ("imports_of",   "Find all imports of a given file or module"),
-    ("importers_of", "Find all files that import a given file or module"),
-    ("children_of",  "Find all nodes contained in a file or class"),
-    ("tests_for",    "Find all tests for a given function or class"),
-    ("inheritors_of","Find all classes that inherit from a given class"),
-    ("file_summary", "Get a summary of all nodes in a file"),
-];
+/// Strongly-typed enum for query patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryPattern {
+    CallersOf,
+    CalleesOf,
+    ImportsOf,
+    ImportersOf,
+    ChildrenOf,
+    TestsFor,
+    InheritorsOf,
+    FileSummary,
+}
 
-fn pattern_description(pattern: &str) -> Option<&'static str> {
-    QUERY_PATTERNS.iter().find(|(p, _)| *p == pattern).map(|(_, d)| *d)
+impl QueryPattern {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "callers_of" => Some(Self::CallersOf),
+            "callees_of" => Some(Self::CalleesOf),
+            "imports_of" => Some(Self::ImportsOf),
+            "importers_of" => Some(Self::ImportersOf),
+            "children_of" => Some(Self::ChildrenOf),
+            "tests_for" => Some(Self::TestsFor),
+            "inheritors_of" => Some(Self::InheritorsOf),
+            "file_summary" => Some(Self::FileSummary),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CallersOf => "callers_of",
+            Self::CalleesOf => "callees_of",
+            Self::ImportsOf => "imports_of",
+            Self::ImportersOf => "importers_of",
+            Self::ChildrenOf => "children_of",
+            Self::TestsFor => "tests_for",
+            Self::InheritorsOf => "inheritors_of",
+            Self::FileSummary => "file_summary",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::CallersOf => "Find all functions that call a given function",
+            Self::CalleesOf => "Find all functions called by a given function",
+            Self::ImportsOf => "Find all imports of a given file or module",
+            Self::ImportersOf => "Find all files that import a given file or module",
+            Self::ChildrenOf => "Find all nodes contained in a file or class",
+            Self::TestsFor => "Find all tests for a given function or class",
+            Self::InheritorsOf => "Find all classes that inherit from a given class",
+            Self::FileSummary => "Get a summary of all nodes in a file",
+        }
+    }
 }
 
 pub fn query_graph(
@@ -304,20 +354,24 @@ pub fn query_graph(
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
 
-    let description = match pattern_description(pattern) {
-        Some(d) => d,
+    let qp = match QueryPattern::from_str(pattern) {
+        Some(p) => p,
         None => {
             store.close()?;
-            let available: Vec<&str> = QUERY_PATTERNS.iter().map(|(p, _)| *p).collect();
+            let available = [
+                "callers_of", "callees_of", "imports_of", "importers_of",
+                "children_of", "tests_for", "inheritors_of", "file_summary",
+            ];
             return Ok(json!({
                 "status": "error",
                 "error": format!("Unknown pattern '{}'. Available: {:?}", pattern, available),
             }));
         }
     };
+    let description = qp.description();
 
     // Filter common builtins for callers_of
-    if pattern == "callers_of" && is_builtin_call(target) && !target.contains("::") {
+    if qp == QueryPattern::CallersOf && is_builtin_call(target) && !target.contains("::") {
         store.close()?;
         return Ok(json!({
             "status": "ok",
@@ -330,7 +384,7 @@ pub fn query_graph(
         }));
     }
 
-    // Resolve the target node
+    // Resolve the target node (file_summary bypasses ambiguous-node early return)
     let mut target_name = target.to_string();
     let node_opt = resolve_target_node(&store, target, &root)?;
 
@@ -339,21 +393,19 @@ pub fn query_graph(
             target_name = n.qualified_name.clone();
             Some(n)
         }
-        ResolveResult::Ambiguous(candidates) => {
-            if pattern != "file_summary" {
-                store.close()?;
-                return Ok(json!({
-                    "status": "ambiguous",
-                    "summary": format!("Multiple matches for '{}'. Please use a qualified name.", target),
-                    "candidates": candidates,
-                }));
-            }
-            None
+        ResolveResult::Ambiguous(candidates) if qp != QueryPattern::FileSummary => {
+            store.close()?;
+            return Ok(json!({
+                "status": "ambiguous",
+                "summary": format!("Multiple matches for '{}'. Please use a qualified name.", target),
+                "candidates": candidates,
+            }));
         }
+        ResolveResult::Ambiguous(_) => None,
         ResolveResult::NotFound => None,
     };
 
-    if node.is_none() && pattern != "file_summary" {
+    if node.is_none() && qp != QueryPattern::FileSummary {
         store.close()?;
         return Ok(json!({
             "status": "not_found",
@@ -366,8 +418,8 @@ pub fn query_graph(
     let mut results: Vec<Value> = vec![];
     let mut edges_out: Vec<Value> = vec![];
 
-    match pattern {
-        "callers_of" => {
+    match qp {
+        QueryPattern::CallersOf => {
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(caller) = store.get_node(&e.source_qualified)? {
@@ -388,7 +440,7 @@ pub fn query_graph(
                 }
             }
         }
-        "callees_of" => {
+        QueryPattern::CalleesOf => {
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(callee) = store.get_node(&e.target_qualified)? {
@@ -398,7 +450,7 @@ pub fn query_graph(
                 }
             }
         }
-        "imports_of" => {
+        QueryPattern::ImportsOf => {
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::ImportsFrom {
                     results.push(json!({ "import_target": e.target_qualified }));
@@ -406,7 +458,7 @@ pub fn query_graph(
                 }
             }
         }
-        "importers_of" => {
+        QueryPattern::ImportersOf => {
             let abs_target = node.as_ref()
                 .map(|n| n.file_path.clone())
                 .unwrap_or_else(|| root.join(target).to_string_lossy().into_owned());
@@ -417,7 +469,7 @@ pub fn query_graph(
                 }
             }
         }
-        "children_of" => {
+        QueryPattern::ChildrenOf => {
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Contains {
                     if let Some(child) = store.get_node(&e.target_qualified)? {
@@ -426,7 +478,7 @@ pub fn query_graph(
                 }
             }
         }
-        "tests_for" => {
+        QueryPattern::TestsFor => {
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::TestedBy {
                     if let Some(t) = store.get_node(&e.source_qualified)? {
@@ -436,7 +488,7 @@ pub fn query_graph(
             }
             // Naming convention fallback
             let name = node.as_ref().map(|n| n.name.as_str()).unwrap_or(target);
-            let seen: std::collections::HashSet<String> = results.iter()
+            let seen: HashSet<String> = results.iter()
                 .filter_map(|r| r.get("qualified_name").and_then(|v| v.as_str()).map(|s| s.to_string()))
                 .collect();
             for prefix in &[format!("test_{name}"), format!("Test{name}")] {
@@ -447,7 +499,7 @@ pub fn query_graph(
                 }
             }
         }
-        "inheritors_of" => {
+        QueryPattern::InheritorsOf => {
             for e in store.get_edges_by_target(&qn)? {
                 if matches!(e.kind, EdgeKind::Inherits | EdgeKind::Implements) {
                     if let Some(child) = store.get_node(&e.source_qualified)? {
@@ -457,22 +509,21 @@ pub fn query_graph(
                 }
             }
         }
-        "file_summary" => {
+        QueryPattern::FileSummary => {
             let abs_path = root.join(target).to_string_lossy().into_owned();
             for n in store.get_nodes_by_file(&abs_path)? {
                 results.push(node_to_dict(&n));
             }
         }
-        _ => unreachable!("pattern already validated above"),
     }
 
     store.close()?;
     Ok(json!({
         "status": "ok",
-        "pattern": pattern,
+        "pattern": qp.as_str(),
         "target": target_name,
         "description": description,
-        "summary": format!("Found {} result(s) for {}('{}')", results.len(), pattern, target_name),
+        "summary": format!("Found {} result(s) for {}('{}')", results.len(), qp.as_str(), target_name),
         "results": results,
         "edges": edges_out,
     }))
@@ -843,6 +894,121 @@ pub fn find_large_functions(
 }
 
 // ---------------------------------------------------------------------------
+// Tool 10: hybrid_query
+// ---------------------------------------------------------------------------
+
+/// Merge graph keyword search and semantic search via Reciprocal Rank Fusion.
+pub fn hybrid_query(query: &str, limit: usize, repo_root: Option<&str>) -> Result<Value> {
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+    let emb_db_path = incremental::get_embeddings_db_path(&root);
+    let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
+
+    // Graph keyword search
+    let kw_nodes = store.search_nodes(query, limit * 2)?;
+
+    // Semantic search (if available)
+    let (sem_results, method) = if emb_store.available() && emb_store.count()? > 0 {
+        let r = semantic_search(query, &store, &mut emb_store, limit * 2)?;
+        (r, "hybrid")
+    } else {
+        (vec![], "keyword_only")
+    };
+
+    // Reciprocal Rank Fusion: score = sum(1 / (60 + rank)) across all lists
+    let mut rrf_scores: HashMap<String, f64> = HashMap::new();
+    let mut result_map: HashMap<String, Value> = HashMap::new();
+
+    for (rank, node) in kw_nodes.iter().enumerate() {
+        let item = node_to_dict(node);
+        *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += 1.0 / (60.0 + (rank + 1) as f64);
+        result_map.entry(node.qualified_name.clone()).or_insert(item);
+    }
+    for (rank, item) in sem_results.iter().enumerate() {
+        if let Some(qn) = item.get("qualified_name").and_then(|v| v.as_str()) {
+            *rrf_scores.entry(qn.to_string()).or_insert(0.0) += 1.0 / (60.0 + (rank + 1) as f64);
+            result_map.entry(qn.to_string()).or_insert_with(|| item.clone());
+        }
+    }
+
+    let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(limit);
+
+    let results: Vec<Value> = ranked.iter()
+        .filter_map(|(qn, _)| result_map.remove(qn))
+        .collect();
+
+    emb_store.close()?;
+    store.close()?;
+    Ok(json!({
+        "status": "ok",
+        "query": query,
+        "method": method,
+        "summary": format!("Found {} result(s) via {} search for '{}'", results.len(), method, query),
+        "results": results,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Tool 11: measure_token_reduction
+// ---------------------------------------------------------------------------
+
+/// Measure how much context is saved versus naively reading all changed files.
+pub fn measure_token_reduction(
+    changed_files: Option<Vec<String>>,
+    repo_root: Option<&str>,
+    base: &str,
+) -> Result<Value> {
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+
+    let files = resolve_changed_files(changed_files, &root, base);
+
+    // Naive context: sum of raw file sizes
+    let naive_bytes: usize = files.iter().map(|f| {
+        std::fs::read(root.join(f)).map(|b| b.len()).unwrap_or(0)
+    }).sum();
+
+    // Graph context: serialize the review context JSON payload
+    let abs_files: Vec<String> = files.iter()
+        .map(|f| root.join(f).to_string_lossy().into_owned())
+        .collect();
+    let impact = store.get_impact_radius(&abs_files, 3, 500, None)?;
+    let context_val = json!({
+        "changed_files": files,
+        "impacted_files": impact.impacted_files,
+        "graph": {
+            "changed_nodes": impact.changed_nodes.iter().map(node_to_dict).collect::<Vec<_>>(),
+            "impacted_nodes": impact.impacted_nodes.iter().map(node_to_dict).collect::<Vec<_>>(),
+            "edges": impact.edges.iter().map(edge_to_dict).collect::<Vec<_>>(),
+        },
+    });
+    let context_bytes = serde_json::to_vec(&context_val)
+        .map(|b| b.len())
+        .unwrap_or(0);
+
+    let reduction = if naive_bytes > 0 {
+        (1.0 - (context_bytes as f64 / naive_bytes as f64)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let reduction_percent = (reduction * 100.0).round();
+
+    store.close()?;
+    Ok(json!({
+        "status": "ok",
+        "naive_bytes": naive_bytes,
+        "context_bytes": context_bytes,
+        "reduction_percent": reduction_percent,
+        "summary": format!(
+            "Graph context uses {} bytes vs {} bytes naive ({:.0}% reduction for {} file(s)).",
+            context_bytes, naive_bytes, reduction_percent, files.len()
+        ),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -929,12 +1095,7 @@ fn extract_relevant_lines(
         if !parts.is_empty() {
             parts.push("...".to_string());
         }
-        for (i, line) in lines
-            .iter()
-            .enumerate()
-            .take(end.min(lines.len()))
-            .skip(start)
-        {
+        for (i, line) in lines.iter().enumerate().take(end.min(lines.len())).skip(start) {
             parts.push(format!("{}: {}", i + 1, line));
         }
     }

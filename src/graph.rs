@@ -272,7 +272,7 @@ impl GraphStore {
         limit: usize,
     ) -> Result<Vec<GraphNode>> {
         let pattern_lower = file_path_pattern.map(|p| p.to_lowercase());
-        let kind_filter = kind.and_then(NodeKind::from_str);
+        let kind_filter = kind.and_then(|k| k.parse::<NodeKind>().ok());
 
         let mut results: Vec<GraphNode> = self
             .data
@@ -489,16 +489,14 @@ impl GraphStore {
         let total_nodes = self.data.graph.node_count();
         let total_edges = self.data.graph.edge_count();
 
-        let mut nodes_by_kind: HashMap<String, usize> = HashMap::new();
-        let mut edges_by_kind: HashMap<String, usize> = HashMap::new();
+        let mut nodes_by_kind: HashMap<NodeKind, usize> = HashMap::new();
+        let mut edges_by_kind: HashMap<EdgeKind, usize> = HashMap::new();
         let mut languages: HashSet<String> = HashSet::new();
         let mut files_count = 0usize;
 
         for idx in self.data.graph.node_indices() {
             let node = &self.data.graph[idx];
-            *nodes_by_kind
-                .entry(node.kind.as_str().to_string())
-                .or_insert(0) += 1;
+            *nodes_by_kind.entry(node.kind).or_insert(0) += 1;
             if node.kind == NodeKind::File {
                 files_count += 1;
             }
@@ -508,9 +506,7 @@ impl GraphStore {
         }
 
         for edge_ref in (&self.data.graph).edge_references() {
-            *edges_by_kind
-                .entry(edge_ref.weight().as_str().to_string())
-                .or_insert(0) += 1;
+            *edges_by_kind.entry(*edge_ref.weight()).or_insert(0) += 1;
         }
 
         let last_updated = self.data.metadata.get("last_updated").cloned();
@@ -1243,9 +1239,9 @@ mod tests {
         let stats = store.get_stats().unwrap();
         assert_eq!(stats.total_nodes, 2);
         assert_eq!(stats.total_edges, 1);
-        assert!(stats.nodes_by_kind.contains_key("Class"));
-        assert!(stats.nodes_by_kind.contains_key("Function"));
-        assert!(stats.edges_by_kind.contains_key("CONTAINS"));
+        assert!(stats.nodes_by_kind.contains_key(&NodeKind::Class));
+        assert!(stats.nodes_by_kind.contains_key(&NodeKind::Function));
+        assert!(stats.edges_by_kind.contains_key(&EdgeKind::Contains));
     }
 
     // -----------------------------------------------------------------------

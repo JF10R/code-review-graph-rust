@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Node kinds
@@ -27,22 +29,25 @@ impl NodeKind {
             Self::Test => "Test",
         }
     }
+}
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for NodeKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "File" => Some(Self::File),
-            "Class" => Some(Self::Class),
-            "Function" => Some(Self::Function),
-            "Type" => Some(Self::Type),
-            "Test" => Some(Self::Test),
-            _ => None,
+            "File" => Ok(Self::File),
+            "Class" => Ok(Self::Class),
+            "Function" => Ok(Self::Function),
+            "Type" => Ok(Self::Type),
+            "Test" => Ok(Self::Test),
+            _ => Err(format!("unknown NodeKind: '{s}'")),
         }
     }
 }
 
-impl std::fmt::Display for NodeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for NodeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -73,23 +78,26 @@ impl EdgeKind {
             Self::TestedBy => "TESTED_BY",
         }
     }
+}
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for EdgeKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "CALLS" => Some(Self::Calls),
-            "IMPORTS_FROM" => Some(Self::ImportsFrom),
-            "CONTAINS" => Some(Self::Contains),
-            "INHERITS" => Some(Self::Inherits),
-            "IMPLEMENTS" => Some(Self::Implements),
-            "TESTED_BY" => Some(Self::TestedBy),
-            _ => None,
+            "CALLS" => Ok(Self::Calls),
+            "IMPORTS_FROM" => Ok(Self::ImportsFrom),
+            "CONTAINS" => Ok(Self::Contains),
+            "INHERITS" => Ok(Self::Inherits),
+            "IMPLEMENTS" => Ok(Self::Implements),
+            "TESTED_BY" => Ok(Self::TestedBy),
+            _ => Err(format!("unknown EdgeKind: '{s}'")),
         }
     }
 }
 
-impl std::fmt::Display for EdgeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for EdgeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -160,11 +168,32 @@ pub struct GraphEdge {
 pub struct GraphStats {
     pub total_nodes: usize,
     pub total_edges: usize,
-    pub nodes_by_kind: HashMap<String, usize>,
-    pub edges_by_kind: HashMap<String, usize>,
+    pub nodes_by_kind: HashMap<NodeKind, usize>,
+    pub edges_by_kind: HashMap<EdgeKind, usize>,
     pub languages: Vec<String>,
     pub files_count: usize,
     pub last_updated: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Algorithm kind
+// ---------------------------------------------------------------------------
+
+/// Algorithm used for impact radius computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlgorithmKind {
+    WeightedBfs,
+    PersonalizedPageRank,
+}
+
+impl fmt::Display for AlgorithmKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WeightedBfs => f.write_str("weighted_bfs"),
+            Self::PersonalizedPageRank => f.write_str("personalized_pagerank"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +211,7 @@ pub struct ImpactResult {
     pub edges: Vec<GraphEdge>,
     pub truncated: bool,
     pub total_impacted: usize,
-    /// Algorithm used: "weighted_bfs" or "pagerank".
+    /// Algorithm used for this analysis.
     pub algorithm: String,
 }
 
