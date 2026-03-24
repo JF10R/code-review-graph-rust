@@ -10,7 +10,24 @@ rust-version = "1.75"
 name = "code-review-graph"
 path = "src/main.rs"
 
+[features]
+default = ["embeddings-local"]
+embeddings-local = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
+
 [dependencies]
+# Local embeddings (default — free, no API key needed)
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+hf-hub = { version = "0.5", optional = true, features = ["tokio"] }
+
 # MCP server
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 
@@ -62,6 +79,9 @@ glob = "0.3"
 
 # HTTP client for embedding providers
 reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# Config dir resolution
+dirs = "6"
 
 # Utilities
 regex = "1"

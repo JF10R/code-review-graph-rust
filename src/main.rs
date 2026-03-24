@@ -8,6 +8,10 @@
 //!   code-review-graph visualize [--repo PATH]
 //!   code-review-graph serve [--repo PATH]
 //!   code-review-graph install [--repo PATH] [--dry-run]
+//!   code-review-graph config set <key> <value>
+//!   code-review-graph config get <key>
+//!   code-review-graph config list
+//!   code-review-graph config reset
 
 use std::path::PathBuf;
 
@@ -69,6 +73,31 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Manage configuration (API keys, embedding provider)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Set a configuration value
+    Set {
+        /// Config key (e.g., embedding-provider, openai-api-key)
+        key: String,
+        /// Value to set
+        value: String,
+    },
+    /// Get a configuration value
+    Get {
+        /// Config key
+        key: String,
+    },
+    /// List all configuration values (API keys are masked)
+    List,
+    /// Reset (delete) the configuration file
+    Reset,
 }
 
 #[tokio::main]
@@ -164,6 +193,10 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
         Commands::Install { repo, dry_run } => {
             handle_install(repo.as_deref(), dry_run)?;
+        }
+
+        Commands::Config { action } => {
+            handle_config(action)?;
         }
 
         // Serve is handled in main() before reaching here.
@@ -283,6 +316,51 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn handle_config(action: ConfigAction) -> anyhow::Result<()> {
+    use code_review_graph::config::{AppConfig, display_value, validate_config_key};
+
+    match action {
+        ConfigAction::Set { key, value } => {
+            validate_config_key(&key)?;
+            let mut config = AppConfig::load();
+            let display = display_value(&key, &value);
+            config.set(&key, &value);
+            config.save()?;
+            println!("Set {} = {}", key, display);
+            println!("Config: {}", AppConfig::config_path().display());
+        }
+        ConfigAction::Get { key } => {
+            let config = AppConfig::load();
+            match config.get(&key) {
+                Some(v) => println!("{}: {}", key, display_value(&key, v)),
+                None => println!("{}: (not set)", key),
+            }
+        }
+        ConfigAction::List => {
+            let config = AppConfig::load();
+            if config.values.is_empty() {
+                println!("No configuration set.");
+                println!("Run: code-review-graph config set embedding-provider openai");
+                return Ok(());
+            }
+            for (k, v) in &config.values {
+                println!("  {}: {}", k, display_value(k, v));
+            }
+        }
+        ConfigAction::Reset => {
+            let path = AppConfig::config_path();
+            match std::fs::remove_file(&path) {
+                Ok(()) => println!("Configuration reset."),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("No configuration file found.");
+                }
+                Err(e) => anyhow::bail!("Failed to reset config: {e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
     println!(
@@ -301,6 +379,7 @@ fn print_banner() {
     status      Show graph statistics
     visualize   Generate interactive HTML graph
     serve       Start MCP server
+    config      Manage API keys and preferences
 
   Run code-review-graph <command> --help for details
 "#,

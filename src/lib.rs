@@ -3,6 +3,7 @@
 //! Parses codebases with tree-sitter, builds a structural graph in SQLite,
 //! and provides smart impact analysis via MCP tools.
 
+pub mod config;
 pub mod embeddings;
 pub mod error;
 pub mod graph;

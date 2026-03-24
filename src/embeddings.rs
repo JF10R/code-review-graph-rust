@@ -1,10 +1,11 @@
 //! Vector embedding support for semantic search.
 //!
-//! Supports OpenAI, Voyage AI, and Gemini embedding APIs.
-//! Configured via environment variables:
+//! The default provider is a local candle-based all-MiniLM-L6-v2 model — no
+//! API key required.  API providers (OpenAI, Voyage, Gemini) take priority when
+//! `EMBEDDING_PROVIDER` is set explicitly.
 //!
 //! ```text
-//! EMBEDDING_PROVIDER=openai|voyage|gemini   (default: none → available()=false)
+//! EMBEDDING_PROVIDER=openai|voyage|gemini|none   (unset → local candle model)
 //! OPENAI_API_KEY=sk-...
 //! VOYAGE_API_KEY=pa-...
 //! GEMINI_API_KEY=...
@@ -348,43 +349,231 @@ impl EmbeddingProvider for GeminiProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Candle local provider (default when embeddings-local feature is enabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embeddings-local")]
+mod candle_impl {
+    use super::*;
+
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::VarBuilder;
+    use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+    use hf_hub::{api::sync::Api, Repo, RepoType};
+    use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
+
+    pub struct CandleProvider {
+        model: BertModel,
+        tokenizer: Tokenizer,
+        device: Device,
+    }
+
+    impl CandleProvider {
+        pub fn new() -> Result<Self> {
+            let device = Device::Cpu;
+
+            let api = Api::new()
+                .map_err(|e| CrgError::Other(format!("HF Hub init: {e}")))?;
+            let repo = api.repo(Repo::with_revision(
+                "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+                RepoType::Model,
+                "main".to_string(),
+            ));
+
+            let model_path = repo
+                .get("model.safetensors")
+                .map_err(|e| CrgError::Other(format!("Download model weights: {e}")))?;
+            let tokenizer_path = repo
+                .get("tokenizer.json")
+                .map_err(|e| CrgError::Other(format!("Download tokenizer: {e}")))?;
+            let config_path = repo
+                .get("config.json")
+                .map_err(|e| CrgError::Other(format!("Download config: {e}")))?;
+
+            let config: Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)
+                .map_err(|e| CrgError::Other(format!("Parse config.json: {e}")))?;
+
+            // Safety: file is not mutated while the process runs
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[model_path], DTYPE, &device)
+                    .map_err(|e| CrgError::Other(format!("Load weights: {e}")))?
+            };
+
+            let model = BertModel::load(vb, &config)
+                .map_err(|e| CrgError::Other(format!("Build BERT model: {e}")))?;
+
+            let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| CrgError::Other(format!("Load tokenizer: {e}")))?;
+            // Pad all sequences in a batch to the longest one so Tensor::stack works
+            tokenizer.with_padding(Some(PaddingParams {
+                strategy: PaddingStrategy::BatchLongest,
+                ..Default::default()
+            }));
+
+            Ok(Self { model, tokenizer, device })
+        }
+    }
+
+    impl EmbeddingProvider for CandleProvider {
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            let mut all_embeddings = Vec::with_capacity(texts.len());
+
+            for chunk in texts.chunks(32) {
+                let encodings = self
+                    .tokenizer
+                    .encode_batch(chunk.to_vec(), true)
+                    .map_err(|e| CrgError::Other(format!("Tokenize batch: {e}")))?;
+
+                // Single pass: build all three tensor lists (tokenizer already padded to batch-longest)
+                let n = chunk.len();
+                let mut ids_list = Vec::with_capacity(n);
+                let mut type_ids_list = Vec::with_capacity(n);
+                let mut mask_list = Vec::with_capacity(n);
+                for enc in &encodings {
+                    ids_list.push(
+                        Tensor::new(enc.get_ids(), &self.device)
+                            .map_err(|e| CrgError::Other(format!("Tensor ids: {e}")))?,
+                    );
+                    type_ids_list.push(
+                        Tensor::new(enc.get_type_ids(), &self.device)
+                            .map_err(|e| CrgError::Other(format!("Tensor type_ids: {e}")))?,
+                    );
+                    mask_list.push(
+                        Tensor::new(enc.get_attention_mask(), &self.device)
+                            .map_err(|e| CrgError::Other(format!("Tensor mask: {e}")))?,
+                    );
+                }
+
+                let input_ids = Tensor::stack(&ids_list, 0)
+                    .map_err(|e| CrgError::Other(format!("Stack ids: {e}")))?;
+                let token_type_ids = Tensor::stack(&type_ids_list, 0)
+                    .map_err(|e| CrgError::Other(format!("Stack type_ids: {e}")))?;
+                let attention_mask = Tensor::stack(&mask_list, 0)
+                    .map_err(|e| CrgError::Other(format!("Stack mask: {e}")))?;
+
+                let output = self
+                    .model
+                    .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+                    .map_err(|e| CrgError::Other(format!("BERT forward: {e}")))?;
+
+                // Mean pooling over non-padding tokens, then L2-normalise
+                let mask_f32 = attention_mask
+                    .to_dtype(DType::F32)
+                    .map_err(|e| CrgError::Other(format!("Mask to f32: {e}")))?;
+                let mask_expanded = mask_f32
+                    .unsqueeze(2)
+                    .and_then(|m| m.broadcast_as(output.shape()))
+                    .map_err(|e| CrgError::Other(format!("Expand mask: {e}")))?;
+                let mean_pooled = output
+                    .broadcast_mul(&mask_expanded)
+                    .and_then(|t| t.sum(1))
+                    .map_err(|e| CrgError::Other(format!("Sum pooling: {e}")))?
+                    .broadcast_div(
+                        &mask_expanded
+                            .sum(1)
+                            .map_err(|e| CrgError::Other(format!("Sum mask: {e}")))?,
+                    )
+                    .map_err(|e| CrgError::Other(format!("Mean pool div: {e}")))?;
+                let normalized = mean_pooled
+                    .broadcast_div(
+                        &mean_pooled
+                            .sqr()
+                            .and_then(|s| s.sum_keepdim(1))
+                            .and_then(|s| s.sqrt())
+                            .map_err(|e| CrgError::Other(format!("L2 norm: {e}")))?,
+                    )
+                    .map_err(|e| CrgError::Other(format!("L2 div: {e}")))?;
+
+                for i in 0..n {
+                    let row = normalized
+                        .get(i)
+                        .map_err(|e| CrgError::Other(format!("Get row {i}: {e}")))?;
+                    all_embeddings.push(
+                        row.to_vec1()
+                            .map_err(|e| CrgError::Other(format!("Row to vec: {e}")))?,
+                    );
+                }
+            }
+
+            Ok(all_embeddings)
+        }
+
+        fn dimensions(&self) -> usize {
+            384
+        }
+
+        fn name(&self) -> &str {
+            "candle-minilm"
+        }
+    }
+}
+
+#[cfg(feature = "embeddings-local")]
+use candle_impl::CandleProvider;
+
+// ---------------------------------------------------------------------------
 // Provider detection from environment
 // ---------------------------------------------------------------------------
 
 fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
-    let provider_name = std::env::var("EMBEDDING_PROVIDER")
-        .unwrap_or_default()
-        .to_lowercase();
+    let config = crate::config::AppConfig::load();
 
-    match provider_name.as_str() {
-        "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY").ok()?;
-            let model = std::env::var("EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-            log::info!("Embedding provider: OpenAI (model={})", model);
-            Some(Box::new(OpenAiProvider::new(api_key, model)))
-        }
-        "voyage" => {
-            let api_key = std::env::var("VOYAGE_API_KEY").ok()?;
-            let model = std::env::var("EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "voyage-code-3".to_string());
-            log::info!("Embedding provider: Voyage AI (model={})", model);
-            Some(Box::new(VoyageProvider::new(api_key, model)))
-        }
-        "gemini" => {
-            let api_key = std::env::var("GEMINI_API_KEY").ok()?;
-            let model = std::env::var("EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "text-embedding-004".to_string());
-            log::info!("Embedding provider: Gemini (model={})", model);
-            Some(Box::new(GeminiProvider::new(api_key, model)))
-        }
-        _ => {
-            if !provider_name.is_empty() {
-                log::warn!("Unknown EMBEDDING_PROVIDER='{}'; ignoring", provider_name);
+    // Helper: env var first, then config file fallback.
+    let get = |env_key: &str, config_key: &str| -> Option<String> {
+        std::env::var(env_key)
+            .ok()
+            .or_else(|| config.get(config_key).map(|s| s.to_string()))
+    };
+
+    // Explicit provider (env var or config) takes priority over local candle default.
+    if let Some(provider) = get("EMBEDDING_PROVIDER", "embedding-provider") {
+        match provider.to_lowercase().as_str() {
+            "openai" => {
+                let api_key = get("OPENAI_API_KEY", "openai-api-key")?;
+                let model = get("EMBEDDING_MODEL", "embedding-model")
+                    .unwrap_or_else(|| "text-embedding-3-small".to_string());
+                log::info!("Embedding provider: OpenAI (model={})", model);
+                return Some(Box::new(OpenAiProvider::new(api_key, model)));
             }
-            None
+            "voyage" => {
+                let api_key = get("VOYAGE_API_KEY", "voyage-api-key")?;
+                let model = get("EMBEDDING_MODEL", "embedding-model")
+                    .unwrap_or_else(|| "voyage-code-3".to_string());
+                log::info!("Embedding provider: Voyage AI (model={})", model);
+                return Some(Box::new(VoyageProvider::new(api_key, model)));
+            }
+            "gemini" => {
+                let api_key = get("GEMINI_API_KEY", "gemini-api-key")?;
+                let model = get("EMBEDDING_MODEL", "embedding-model")
+                    .unwrap_or_else(|| "text-embedding-004".to_string());
+                log::info!("Embedding provider: Gemini (model={})", model);
+                return Some(Box::new(GeminiProvider::new(api_key, model)));
+            }
+            "none" | "disabled" => {
+                log::info!("Embeddings explicitly disabled via embedding-provider=none");
+                return None;
+            }
+            other => {
+                log::warn!("Unknown embedding-provider='{}'; falling back to local", other);
+            }
         }
     }
+
+    // Default: free local provider via candle (all-MiniLM-L6-v2)
+    #[cfg(feature = "embeddings-local")]
+    {
+        match CandleProvider::new() {
+            Ok(p) => {
+                log::info!("Embedding provider: candle-minilm (all-MiniLM-L6-v2, local, free)");
+                return Some(Box::new(p));
+            }
+            Err(e) => {
+                log::warn!("Local embedding provider unavailable: {}; embeddings disabled", e);
+            }
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
