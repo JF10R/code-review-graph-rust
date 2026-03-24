@@ -1,11 +1,13 @@
 //! Vector embedding support for semantic search.
 //!
-//! The default provider is a local candle-based all-MiniLM-L6-v2 model — no
-//! API key required.  API providers (OpenAI, Voyage, Gemini) take priority when
-//! `EMBEDDING_PROVIDER` is set explicitly.
+//! The default provider is a local fastembed JinaEmbeddingsV2BaseCode model
+//! (`embeddings-fastembed` feature) — no API key required, 768-dimensional
+//! code-optimised embeddings.  Falls back to the candle all-MiniLM-L6-v2 model
+//! (`embeddings-local` feature) if fastembed is unavailable.  API providers
+//! (OpenAI, Voyage, Gemini) take priority when `EMBEDDING_PROVIDER` is set.
 //!
 //! ```text
-//! EMBEDDING_PROVIDER=openai|voyage|gemini|none   (unset → local candle model)
+//! EMBEDDING_PROVIDER=openai|voyage|gemini|none   (unset → fastembed local model)
 //! OPENAI_API_KEY=sk-...
 //! VOYAGE_API_KEY=pa-...
 //! GEMINI_API_KEY=...
@@ -17,6 +19,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "hnsw-index")]
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 use serde::{Deserialize, Serialize};
 
@@ -304,7 +309,47 @@ impl EmbeddingProvider for GeminiProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Candle local provider (default when embeddings-local feature is enabled)
+// FastEmbed provider (default when embeddings-fastembed feature is enabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "embeddings-fastembed")]
+struct FastEmbedProvider {
+    model: fastembed::TextEmbedding,
+}
+
+#[cfg(feature = "embeddings-fastembed")]
+impl FastEmbedProvider {
+    fn new() -> Result<Self> {
+        let model = fastembed::TextEmbedding::try_new(
+            fastembed::InitOptions::new(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode)
+                .with_show_download_progress(true),
+        )
+        .map_err(|e| CrgError::Other(format!("fastembed init: {e}")))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "embeddings-fastembed")]
+impl EmbeddingProvider for FastEmbedProvider {
+    fn name(&self) -> &str {
+        "fastembed-jina-v2-code"
+    }
+
+    fn dimensions(&self) -> usize {
+        768
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let embeddings = self
+            .model
+            .embed(texts.to_vec(), None)
+            .map_err(|e| CrgError::Other(format!("fastembed embed: {e}")))?;
+        Ok(embeddings)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Candle local provider (legacy when embeddings-local feature is enabled)
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "embeddings-local")]
@@ -513,7 +558,21 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
         }
     }
 
-    // Default: free local provider via candle (all-MiniLM-L6-v2)
+    // Default: fastembed (JinaEmbeddingsV2BaseCode, local, free)
+    #[cfg(feature = "embeddings-fastembed")]
+    {
+        match FastEmbedProvider::new() {
+            Ok(p) => {
+                log::info!("Embedding provider: fastembed-jina-v2-code (local, free)");
+                return Some(Box::new(p));
+            }
+            Err(e) => {
+                log::warn!("fastembed init failed: {}; trying candle fallback", e);
+            }
+        }
+    }
+
+    // Fallback: candle all-MiniLM-L6-v2
     #[cfg(feature = "embeddings-local")]
     {
         match CandleProvider::new() {
@@ -599,6 +658,74 @@ impl EmbeddingStore {
 }
 
 // ---------------------------------------------------------------------------
+// HNSW index (optional — accelerated approximate nearest-neighbour search)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "hnsw-index")]
+pub struct HnswIndex {
+    index: Index,
+    key_to_name: HashMap<u64, String>,
+}
+
+#[cfg(feature = "hnsw-index")]
+impl HnswIndex {
+    /// Build an HNSW index from an existing `EmbeddingStore`.
+    pub fn build(emb_store: &EmbeddingStore) -> Result<Self> {
+        let dims = emb_store
+            .data
+            .vectors
+            .values()
+            .next()
+            .map(|(v, _, _)| v.len())
+            .unwrap_or(768);
+
+        let options = IndexOptions {
+            dimensions: dims,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        };
+
+        let index = Index::new(&options)
+            .map_err(|e| CrgError::Other(format!("HNSW init: {e}")))?;
+        index
+            .reserve(emb_store.data.vectors.len())
+            .map_err(|e| CrgError::Other(format!("HNSW reserve: {e}")))?;
+
+        let mut key_to_name = HashMap::new();
+        for (i, (qn, (vec, _, _))) in emb_store.data.vectors.iter().enumerate() {
+            let key = i as u64;
+            index
+                .add(key, vec)
+                .map_err(|e| CrgError::Other(format!("HNSW add: {e}")))?;
+            key_to_name.insert(key, qn.clone());
+        }
+
+        Ok(Self { index, key_to_name })
+    }
+
+    /// Search for the `k` nearest neighbours of `query_vec`.
+    ///
+    /// Returns `(qualified_name, cosine_similarity)` pairs sorted by
+    /// descending similarity (1.0 = identical, 0.0 = orthogonal).
+    pub fn search(&self, query_vec: &[f32], k: usize) -> Vec<(String, f32)> {
+        match self.index.search(query_vec, k) {
+            Ok(results) => results
+                .keys
+                .iter()
+                .zip(results.distances.iter())
+                .filter_map(|(&key, &dist)| {
+                    self.key_to_name
+                        .get(&key)
+                        .map(|name| (name.clone(), 1.0 - dist))
+                })
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
 
@@ -674,6 +801,25 @@ pub fn semantic_search(
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
     let query_vec = &query_vecs[0];
 
+    // Use HNSW approximate nearest-neighbour search when the feature is compiled in.
+    #[cfg(feature = "hnsw-index")]
+    {
+        match HnswIndex::build(emb_store) {
+            Ok(idx) => {
+                let scored = idx
+                    .search(query_vec, limit)
+                    .into_iter()
+                    .map(|(qn, s)| (qn, s as f64))
+                    .collect::<Vec<_>>();
+                return nodes_from_scored(scored, store);
+            }
+            Err(e) => {
+                log::warn!("HNSW index build failed ({}); falling back to linear scan", e);
+            }
+        }
+    }
+
+    // Linear scan (also the only path without hnsw-index feature).
     let mut scored: Vec<(String, f64)> = emb_store
         .data
         .vectors
@@ -682,8 +828,15 @@ pub fn semantic_search(
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
+    nodes_from_scored(scored, store)
+}
 
-    let mut results = Vec::new();
+/// Resolve a ranked `(qualified_name, score)` list to full node dicts.
+fn nodes_from_scored(
+    scored: Vec<(String, f64)>,
+    store: &GraphStore,
+) -> Result<Vec<serde_json::Value>> {
+    let mut results = Vec::with_capacity(scored.len());
     for (qn, score) in scored {
         if let Some(node) = store.get_node(&qn)? {
             let mut d = node_to_dict(&node);
@@ -696,6 +849,10 @@ pub fn semantic_search(
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        log::error!("cosine_similarity: dimension mismatch {} vs {}", a.len(), b.len());
+        return 0.0;
+    }
     let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
     let norm_a: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
     let norm_b: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();

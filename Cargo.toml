@@ -11,7 +11,8 @@ name = "code-review-graph"
 path = "src/main.rs"
 
 [features]
-default = ["embeddings-local"]
+default = ["embeddings-fastembed"]
+embeddings-fastembed = ["dep:fastembed"]
 embeddings-local = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -19,9 +20,16 @@ embeddings-local = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+hnsw-index = ["dep:usearch"]
 
 [dependencies]
-# Local embeddings (default — free, no API key needed)
+# Fast local embeddings via fastembed (default — free, no API key needed)
+fastembed = { version = "4", optional = true }
+
+# HNSW vector index (optional accelerated search)
+usearch = { version = "2", optional = true }
+
+# Local embeddings via candle (legacy fallback)
 candle-core = { version = "0.9", optional = true }
 candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.9", optional = true }
