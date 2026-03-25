@@ -117,6 +117,7 @@ chrono = { version = "0.4", features = ["serde"] }
 assert_cmd = "2"
 predicates = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
+insta = { version = "1", features = ["json", "redactions"] }
 
 [[bench]]
 name = "benchmarks"

@@ -1,0 +1,62 @@
+---
+source: tests/integration.rs
+expression: result
+---
+{
+  "algorithm": "personalized_pagerank",
+  "changed_files": [
+    "utils.py"
+  ],
+  "changed_nodes": [
+    {
+      "file_path": "utils.py",
+      "kind": "File",
+      "line_end": 7,
+      "line_start": 1,
+      "name": "[path]",
+      "qualified_name": "utils.py",
+      "signature": ""
+    },
+    {
+      "file_path": "utils.py",
+      "kind": "Function",
+      "line_end": 3,
+      "line_start": 2,
+      "name": "add",
+      "qualified_name": "utils.py::add",
+      "signature": "(a, b)"
+    },
+    {
+      "file_path": "utils.py",
+      "kind": "Function",
+      "line_end": 6,
+      "line_start": 5,
+      "name": "subtract",
+      "qualified_name": "utils.py::subtract",
+      "signature": "(a, b)"
+    }
+  ],
+  "edges": [
+    {
+      "file_path": "[path]",
+      "kind": "CONTAINS",
+      "line": 0,
+      "source_qualified": "[path]",
+      "target_qualified": "[path]"
+    },
+    {
+      "file_path": "[path]",
+      "kind": "CONTAINS",
+      "line": 0,
+      "source_qualified": "[path]",
+      "target_qualified": "[path]"
+    }
+  ],
+  "impact_scores": [],
+  "impacted_files": [],
+  "impacted_nodes": [],
+  "status": "ok",
+  "summary": "[summary]",
+  "total_impacted": 0,
+  "truncated": false
+}

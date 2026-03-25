@@ -1,0 +1,24 @@
+---
+source: tests/integration.rs
+expression: result
+---
+{
+  "edges_by_kind": {
+    "Contains": 5
+  },
+  "embeddings_count": 0,
+  "files_count": 3,
+  "languages": [
+    "python",
+    "typescript"
+  ],
+  "last_updated": "[timestamp]",
+  "nodes_by_kind": {
+    "File": 3,
+    "Function": 5
+  },
+  "status": "ok",
+  "summary": "[summary]",
+  "total_edges": 5,
+  "total_nodes": 8
+}

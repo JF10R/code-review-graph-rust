@@ -1,0 +1,100 @@
+---
+source: tests/integration.rs
+expression: result
+---
+{
+  "min_lines": 1,
+  "results": [
+    {
+      "file_path": "service.ts",
+      "kind": "File",
+      "line_count": 9,
+      "line_end": 9,
+      "line_start": 1,
+      "name": "[path]",
+      "qualified_name": "service.ts",
+      "relative_path": "[path]",
+      "signature": ""
+    },
+    {
+      "file_path": "main.py",
+      "kind": "File",
+      "line_count": 8,
+      "line_end": 8,
+      "line_start": 1,
+      "name": "[path]",
+      "qualified_name": "main.py",
+      "relative_path": "[path]",
+      "signature": ""
+    },
+    {
+      "file_path": "utils.py",
+      "kind": "File",
+      "line_count": 7,
+      "line_end": 7,
+      "line_start": 1,
+      "name": "[path]",
+      "qualified_name": "utils.py",
+      "relative_path": "[path]",
+      "signature": ""
+    },
+    {
+      "file_path": "utils.py",
+      "kind": "Function",
+      "line_count": 2,
+      "line_end": 3,
+      "line_start": 2,
+      "name": "add",
+      "qualified_name": "utils.py::add",
+      "relative_path": "[path]",
+      "signature": "(a, b)"
+    },
+    {
+      "file_path": "service.ts",
+      "kind": "Function",
+      "line_count": 3,
+      "line_end": 8,
+      "line_start": 6,
+      "name": "farewell",
+      "qualified_name": "service.ts::farewell",
+      "relative_path": "[path]",
+      "signature": "(name: string) -> : string"
+    },
+    {
+      "file_path": "service.ts",
+      "kind": "Function",
+      "line_count": 3,
+      "line_end": 4,
+      "line_start": 2,
+      "name": "greet",
+      "qualified_name": "service.ts::greet",
+      "relative_path": "[path]",
+      "signature": "(name: string) -> : string"
+    },
+    {
+      "file_path": "main.py",
+      "kind": "Function",
+      "line_count": 4,
+      "line_end": 7,
+      "line_start": 4,
+      "name": "run",
+      "qualified_name": "main.py::run",
+      "relative_path": "[path]",
+      "signature": "()"
+    },
+    {
+      "file_path": "utils.py",
+      "kind": "Function",
+      "line_count": 2,
+      "line_end": 6,
+      "line_start": 5,
+      "name": "subtract",
+      "qualified_name": "utils.py::subtract",
+      "relative_path": "[path]",
+      "signature": "(a, b)"
+    }
+  ],
+  "status": "ok",
+  "summary": "[summary]",
+  "total_found": 8
+}

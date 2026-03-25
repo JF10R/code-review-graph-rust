@@ -1,0 +1,49 @@
+---
+source: tests/integration.rs
+expression: result
+---
+{
+  "candidates": [
+    {
+      "body_hash": "16ce0c541a7c88341af2bf4b18327c3b0885e924b39910d01ef237752d323a84",
+      "docstring": "",
+      "file_path": "[path]",
+      "is_test": false,
+      "kind": "File",
+      "language": "python",
+      "line_end": 7,
+      "line_start": 1,
+      "name": "[path]",
+      "qualified_name": "[path]",
+      "signature": ""
+    },
+    {
+      "body_hash": "8f75a68646c879fd0cff5c02708c010fb1c01d67ef9930d4e419106feb7897aa",
+      "docstring": "",
+      "file_path": "[path]",
+      "is_test": false,
+      "kind": "Function",
+      "language": "python",
+      "line_end": 3,
+      "line_start": 2,
+      "name": "add",
+      "qualified_name": "[path]",
+      "signature": "(a, b)"
+    },
+    {
+      "body_hash": "58503bef65c62ed04279dcca0a154139c1e574aea5c321413eec60cab10e3e76",
+      "docstring": "",
+      "file_path": "[path]",
+      "is_test": false,
+      "kind": "Function",
+      "language": "python",
+      "line_end": 6,
+      "line_start": 5,
+      "name": "subtract",
+      "qualified_name": "[path]",
+      "signature": "(a, b)"
+    }
+  ],
+  "status": "ambiguous",
+  "summary": "[summary]"
+}

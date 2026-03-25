@@ -1,0 +1,11 @@
+---
+source: tests/integration.rs
+expression: result
+---
+{
+  "query": "add function",
+  "results": [],
+  "search_mode": "keyword",
+  "status": "ok",
+  "summary": "[summary]"
+}
