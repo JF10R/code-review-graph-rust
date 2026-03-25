@@ -444,13 +444,14 @@ impl CodeReviewServer {
         .map_err(|e| e.to_string())?
     }
 
-    /// Find the shortest call path between two functions — use AFTER
-    /// semantic_search identifies two related functions to understand HOW
-    /// they connect. Returns the complete chain of intermediate function
-    /// calls. Example: after finding 'mergeManifest' and 'getLinkAndScriptTags'
-    /// via search, use this to map the full call flow between them.
-    /// Replaces manual hop-by-hop file reading. Tries callee direction first,
-    /// then caller direction.
+    /// Trace how data flows between two functions — finds the shortest
+    /// chain of function calls connecting them. Use when you know WHERE
+    /// two pieces of code are but need to understand HOW they connect.
+    /// Example: trace_call_chain(from: "parseConfig", to: "renderPage")
+    /// returns the full intermediate call path. This REPLACES reading
+    /// files one-by-one to manually follow call chains. Try this BEFORE
+    /// reading multiple files — it often answers "how does A reach B?"
+    /// in one call. Tries callee direction first, then caller direction.
     #[tool(name = "trace_call_chain")]
     async fn trace_call_chain_tool(
         &self,
@@ -488,9 +489,9 @@ impl ServerHandler for CodeReviewServer {
         .with_instructions(
             "Persistent incremental knowledge graph for token-efficient code reviews.\n\n\
              RECOMMENDED WORKFLOW:\n\
-             1. semantic_search_nodes — find code by concept (faster than grep for discovery)\n\
-             2. query_graph(callers_of/callees_of) — explore relationships (replaces grepping for function names)\n\
-             3. trace_call_chain — map call paths between distant functions (replaces manual hop-by-hop tracing)\n\
+             1. semantic_search_nodes — find code by concept (use INSTEAD OF grep for discovery)\n\
+             2. trace_call_chain(from, to) — when you know two function names, trace the call path between them (use INSTEAD OF reading files one-by-one)\n\
+             3. query_graph(callers_of/callees_of) — explore who calls what (use INSTEAD OF grepping for function names)\n\
              4. Use Read tool (not bash cat) and Grep tool (not bash grep) for examining file contents\n\n\
              Always pass compact: true to reduce response size. \
              Use these tools for discovery, then switch to Read/Grep for detailed analysis.",
