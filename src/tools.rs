@@ -22,7 +22,10 @@ use crate::embeddings::{embed_all_nodes, semantic_search, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
-use crate::types::{edge_to_dict, node_to_dict, EdgeKind};
+use crate::types::{edge_to_dict, node_to_dict, EdgeKind, NodeKind};
+
+/// RRF constant: standard k=60 from the original RRF paper.
+const RRF_K: f64 = 60.0;
 
 /// Build a node dict.
 fn node_dict(node: &crate::types::GraphNode, compact: bool, _root: &Utf8Path) -> Value {
@@ -981,12 +984,83 @@ pub fn get_docs_section(section_name: &str, repo_root: Option<&str>) -> Result<V
 /// Falls back to keyword-only when no embeddings are available, and sets
 /// `method: "keyword_only"` in the returned JSON to signal this.
 /// CC mode also falls back to RRF when embeddings are unavailable.
+// ---------------------------------------------------------------------------
+// Query classification for adaptive routing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum QueryRoute {
+    ExactSymbol,  // camelCase, PascalCase, snake_case identifiers
+    FilePath,     // contains / or file extensions
+    Causal,       // "why", "how does", "where does" patterns
+    ConfigLookup, // config-related terms
+    General,      // default fallback
+}
+
+pub(crate) struct Classification {
+    pub route: QueryRoute,
+    pub confidence: f64, // 0.0 to 1.0
+}
+
+pub(crate) fn classify_query(query: &str) -> Classification {
+    let trimmed = query.trim();
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+
+    // Single token that looks like an identifier (camelCase, PascalCase, snake_case)
+    if words.len() == 1 {
+        let word = words[0];
+        let has_uppercase = word.chars().any(|c| c.is_uppercase());
+        let has_lowercase = word.chars().any(|c| c.is_lowercase());
+        let has_underscore = word.contains('_');
+        if (has_uppercase && has_lowercase) || has_underscore {
+            return Classification { route: QueryRoute::ExactSymbol, confidence: 0.9 };
+        }
+    }
+
+    // Contains file path indicators
+    if trimmed.contains('/')
+        || trimmed.contains(".ts")
+        || trimmed.contains(".js")
+        || trimmed.contains(".tsx")
+        || trimmed.contains(".rs")
+    {
+        return Classification { route: QueryRoute::FilePath, confidence: 0.85 };
+    }
+
+    // Causal/architectural patterns
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("why ")
+        || lower.starts_with("how does ")
+        || lower.starts_with("where does ")
+        || lower.starts_with("what causes ")
+        || lower.contains("included in")
+        || lower.contains("loaded by")
+    {
+        return Classification { route: QueryRoute::Causal, confidence: 0.8 };
+    }
+
+    // Config-related terms
+    let config_terms = ["config", "option", "setting", "experimental", "flag", "enable", "disable"];
+    let config_matches = config_terms.iter().filter(|t| lower.contains(*t)).count();
+    if config_matches >= 2 {
+        return Classification { route: QueryRoute::ConfigLookup, confidence: 0.75 };
+    }
+    if config_matches == 1 && words.len() <= 4 {
+        return Classification { route: QueryRoute::ConfigLookup, confidence: 0.6 };
+    }
+
+    // Default: general hybrid
+    Classification { route: QueryRoute::General, confidence: 0.5 }
+}
+
 pub fn hybrid_query(
     query: &str,
     limit: usize,
     repo_root: Option<&str>,
     compact: bool,
     fusion: Option<&str>,
+    route: Option<&str>,
+    debug: Option<bool>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1002,7 +1076,7 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
@@ -1018,6 +1092,8 @@ pub fn hybrid_query_with_store(
     compact: bool,
     fusion: Option<&str>,
     keyword_hits: Option<Vec<crate::types::GraphNode>>,
+    route: Option<&str>,
+    debug: Option<bool>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1028,7 +1104,39 @@ pub fn hybrid_query_with_store(
         }));
     }
 
-    // Keyword results (used by both fusion modes)
+    let route_param = route.unwrap_or("auto");
+
+    // Validate route parameter
+    if !["auto", "legacy", "exact", "semantic", "path"].contains(&route_param) {
+        return Ok(json!({
+            "status": "error",
+            "message": format!("Unknown route '{}'; expected 'auto', 'legacy', 'exact', 'semantic', or 'path'", route_param),
+        }));
+    }
+
+    let classification = if route_param == "auto" {
+        classify_query(query)
+    } else {
+        // Explicit route override
+        Classification {
+            route: match route_param {
+                "exact" => QueryRoute::ExactSymbol,
+                "semantic" => QueryRoute::Causal,
+                "path" => QueryRoute::FilePath,
+                _ => QueryRoute::General, // "legacy"
+            },
+            confidence: 1.0,
+        }
+    };
+
+    // Low confidence → fall back to legacy behavior
+    let effective_route = if classification.confidence < 0.6 {
+        QueryRoute::General
+    } else {
+        classification.route
+    };
+
+    // Keyword results (used by most routes)
     let keyword_hits = match keyword_hits {
         Some(hits) => hits,
         None => store.search_nodes(query, limit * 2)?,
@@ -1043,84 +1151,133 @@ pub fn hybrid_query_with_store(
         }));
     }
 
-    // Convex combination (CC): inverse-rank scores min-max normalised to [0,1],
-    // then linearly combined as alpha*kw + (1-alpha)*sem.
-    // Falls through to RRF when embeddings are unavailable.
-    let (method, ranked): (&str, Vec<(String, f64)>) = if fusion_method == "cc" && embeddings_available {
-        const ALPHA: f64 = 0.5;
-
-        let mut keyword_scores: HashMap<String, f64> = HashMap::new();
-        for (rank, node) in keyword_hits.iter().enumerate() {
-            keyword_scores.insert(node.qualified_name.clone(), 1.0 / (1.0 + rank as f64));
-        }
-
-        let mut semantic_scores: HashMap<String, f64> = HashMap::new();
-        let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
-        for (rank, hit) in semantic_hits.iter().enumerate() {
-            if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
-                semantic_scores.insert(qn.to_string(), 1.0 / (1.0 + rank as f64));
-            }
-        }
-
-        // Min-max normalise a score map to [0, 1]. All-equal scores map to 1.
-        let normalize = |scores: &HashMap<String, f64>| -> HashMap<String, f64> {
-            if scores.is_empty() {
-                return HashMap::new();
-            }
-            let min = scores.values().cloned().fold(f64::INFINITY, f64::min);
-            let max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let range = max - min;
-            if range < f64::EPSILON {
-                scores.keys().map(|k| (k.clone(), 1.0)).collect()
-            } else {
-                scores.iter().map(|(k, v)| (k.clone(), (v - min) / range)).collect()
-            }
-        };
-
-        let kw_norm = normalize(&keyword_scores);
-        let sem_norm = normalize(&semantic_scores);
-
-        let all_qns: HashSet<&String> = kw_norm.keys().chain(sem_norm.keys()).collect();
-        let mut combined: Vec<(String, f64)> = all_qns
-            .into_iter()
-            .map(|qn| {
-                let kw = kw_norm.get(qn).copied().unwrap_or(0.0);
-                let sem = sem_norm.get(qn).copied().unwrap_or(0.0);
-                (qn.clone(), ALPHA * kw + (1.0 - ALPHA) * sem)
-            })
-            .collect();
-
-        combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        combined.truncate(limit);
-        ("hybrid_cc", combined)
-    } else {
-        // RRF score formula: Σ 1 / (k + rank_i) where k = 60 (standard constant)
-        const RRF_K: f64 = 60.0;
-
-        let mut rrf_scores: HashMap<String, f64> = HashMap::new();
-
-        for (rank, node) in keyword_hits.iter().enumerate() {
-            let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-            *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
-        }
-
-        let method = if embeddings_available {
-            let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
-            for (rank, hit) in semantic_hits.iter().enumerate() {
-                if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
+    let (method, ranked): (&str, Vec<(String, f64)>) = match effective_route {
+        QueryRoute::ExactSymbol => {
+            // Keyword-only: no semantic search needed for exact identifiers
+            let mut scores: Vec<(String, f64)> = keyword_hits
+                .iter()
+                .enumerate()
+                .map(|(rank, node)| {
                     let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-                    *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
-                }
-            }
-            "hybrid_rrf"
-        } else {
-            "keyword_only"
-        };
+                    (node.qualified_name.clone(), score)
+                })
+                .collect();
+            scores.truncate(limit);
+            ("keyword_only", scores)
+        }
 
-        let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(limit);
-        (method, ranked)
+        QueryRoute::FilePath => {
+            // Keyword search, boost file-kind nodes
+            let mut scores: Vec<(String, f64)> = keyword_hits
+                .iter()
+                .enumerate()
+                .map(|(rank, node)| {
+                    let base = 1.0 / (RRF_K + rank as f64 + 1.0);
+                    let boost = if node.qualified_name.contains('/') || node.qualified_name.contains('.') {
+                        1.5
+                    } else {
+                        1.0
+                    };
+                    (node.qualified_name.clone(), base * boost)
+                })
+                .collect();
+            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(limit);
+            ("keyword_path_boosted", scores)
+        }
+
+        QueryRoute::ConfigLookup => {
+            // Keyword search, prefer Type-kind nodes
+            let mut scores: Vec<(String, f64)> = keyword_hits
+                .iter()
+                .enumerate()
+                .map(|(rank, node)| {
+                    let base = 1.0 / (RRF_K + rank as f64 + 1.0);
+                    let boost = if matches!(node.kind, NodeKind::Type) { 1.5 } else { 1.0 };
+                    (node.qualified_name.clone(), base * boost)
+                })
+                .collect();
+            scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scores.truncate(limit);
+            ("keyword_config_boosted", scores)
+        }
+
+        QueryRoute::Causal | QueryRoute::General => {
+            // Full hybrid: existing keyword + semantic + fusion (legacy behavior)
+            if fusion_method == "cc" && embeddings_available {
+                const ALPHA: f64 = 0.5;
+
+                let mut keyword_scores: HashMap<String, f64> = HashMap::new();
+                for (rank, node) in keyword_hits.iter().enumerate() {
+                    keyword_scores.insert(node.qualified_name.clone(), 1.0 / (1.0 + rank as f64));
+                }
+
+                let mut semantic_scores: HashMap<String, f64> = HashMap::new();
+                let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
+                for (rank, hit) in semantic_hits.iter().enumerate() {
+                    if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
+                        semantic_scores.insert(qn.to_string(), 1.0 / (1.0 + rank as f64));
+                    }
+                }
+
+                // Min-max normalise a score map to [0, 1]. All-equal scores map to 1.
+                let normalize = |scores: &HashMap<String, f64>| -> HashMap<String, f64> {
+                    if scores.is_empty() {
+                        return HashMap::new();
+                    }
+                    let min = scores.values().cloned().fold(f64::INFINITY, f64::min);
+                    let max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let range = max - min;
+                    if range < f64::EPSILON {
+                        scores.keys().map(|k| (k.clone(), 1.0)).collect()
+                    } else {
+                        scores.iter().map(|(k, v)| (k.clone(), (v - min) / range)).collect()
+                    }
+                };
+
+                let kw_norm = normalize(&keyword_scores);
+                let sem_norm = normalize(&semantic_scores);
+
+                let all_qns: HashSet<&String> = kw_norm.keys().chain(sem_norm.keys()).collect();
+                let mut combined: Vec<(String, f64)> = all_qns
+                    .into_iter()
+                    .map(|qn| {
+                        let kw = kw_norm.get(qn).copied().unwrap_or(0.0);
+                        let sem = sem_norm.get(qn).copied().unwrap_or(0.0);
+                        (qn.clone(), ALPHA * kw + (1.0 - ALPHA) * sem)
+                    })
+                    .collect();
+
+                combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                combined.truncate(limit);
+                ("hybrid_cc", combined)
+            } else {
+                let mut rrf_scores: HashMap<String, f64> = HashMap::new();
+
+                for (rank, node) in keyword_hits.iter().enumerate() {
+                    let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                    *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
+                }
+
+                let method = if embeddings_available {
+                    let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
+                    for (rank, hit) in semantic_hits.iter().enumerate() {
+                        if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
+                            let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                            *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
+                        }
+                    }
+                    "hybrid_rrf"
+                } else {
+                    "keyword_only"
+                };
+
+                let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                ranked.truncate(limit);
+                (method, ranked)
+            }
+        }
     };
 
     // Derive score field from the algorithm actually executed, not the requested fusion —
@@ -1138,12 +1295,22 @@ pub fn hybrid_query_with_store(
         })
         .collect();
 
-    Ok(json!({
+    let mut response = json!({
         "status": "ok",
         "query": query,
         "method": method,
         "results": results,
-    }))
+    });
+
+    if debug.unwrap_or(false) {
+        response["_debug"] = json!({
+            "route": format!("{:?}", effective_route),
+            "confidence": classification.confidence,
+            "requested_route": route_param,
+        });
+    }
+
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,7 +1870,7 @@ fn generate_review_guidance(impact: &crate::types::ImpactResult) -> String {
 
     // Untested changed functions
     let changed_funcs: Vec<_> = impact.changed_nodes.iter()
-        .filter(|n| n.kind == crate::types::NodeKind::Function)
+        .filter(|n| n.kind == NodeKind::Function)
         .collect();
     let tested_sources: std::collections::HashSet<&str> = impact.edges.iter()
         .filter(|e| e.kind == EdgeKind::TestedBy)
@@ -1929,7 +2096,7 @@ mod tests {
         fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("", 10, Some(&path), false, None);
+        let result = hybrid_query("", 10, Some(&path), false, None, None, None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1947,7 +2114,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("add", 5, Some(&path), false, None);
+        let result = hybrid_query("add", 5, Some(&path), false, None, None, None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1968,7 +2135,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("square", 5, Some(&path), false, None);
+        let result = hybrid_query("square", 5, Some(&path), false, None, None, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1994,7 +2161,7 @@ mod tests {
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         // Explicit "rrf" fusion — no embeddings, so falls back to keyword_only
-        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"));
+        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2017,7 +2184,7 @@ mod tests {
 
         // CC mode without embeddings: embeddings_available = false, so falls into RRF branch
         // which returns "keyword_only" (since no embeddings are present)
-        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"));
+        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2038,7 +2205,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"));
+        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None);
         assert!(result.is_ok(), "cc fusion hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2113,5 +2280,76 @@ mod tests {
         let changed = val["changed_files"].as_array().unwrap();
         assert_eq!(changed.len(), 1, "should report exactly 1 changed file");
         assert_eq!(changed[0], "utils.py");
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_camel_case_as_exact_symbol() {
+        let c = classify_query("turbopackUseBuiltinSass");
+        assert!(matches!(c.route, QueryRoute::ExactSymbol));
+        assert!(c.confidence >= 0.8);
+    }
+
+    #[test]
+    fn classify_pascal_case_as_exact_symbol() {
+        let c = classify_query("GraphStore");
+        assert!(matches!(c.route, QueryRoute::ExactSymbol));
+        assert!(c.confidence >= 0.8);
+    }
+
+    #[test]
+    fn classify_snake_case_as_exact_symbol() {
+        let c = classify_query("get_store");
+        assert!(matches!(c.route, QueryRoute::ExactSymbol));
+        assert!(c.confidence >= 0.8);
+    }
+
+    #[test]
+    fn classify_file_path_query() {
+        let c = classify_query("config-shared.ts");
+        assert!(matches!(c.route, QueryRoute::FilePath));
+        assert!(c.confidence >= 0.8);
+    }
+
+    #[test]
+    fn classify_path_with_slash() {
+        let c = classify_query("src/tools.rs");
+        assert!(matches!(c.route, QueryRoute::FilePath));
+    }
+
+    #[test]
+    fn classify_causal_query() {
+        let c = classify_query("why does not-found CSS get included globally");
+        assert!(matches!(c.route, QueryRoute::Causal));
+        assert!(c.confidence >= 0.7);
+    }
+
+    #[test]
+    fn classify_how_does_query() {
+        let c = classify_query("how does the cache invalidation work");
+        assert!(matches!(c.route, QueryRoute::Causal));
+    }
+
+    #[test]
+    fn classify_config_query() {
+        let c = classify_query("sassOptions experimental config");
+        assert!(matches!(c.route, QueryRoute::ConfigLookup));
+        assert!(c.confidence >= 0.6);
+    }
+
+    #[test]
+    fn classify_general_query() {
+        let c = classify_query("CSS chunk splitting optimization");
+        assert!(matches!(c.route, QueryRoute::General));
+    }
+
+    #[test]
+    fn low_confidence_falls_back_to_general() {
+        let c = classify_query("something");
+        // Single lowercase word with no uppercase or underscore → General or low confidence
+        assert!(c.confidence < 0.6 || matches!(c.route, QueryRoute::General));
     }
 }
