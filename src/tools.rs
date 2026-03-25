@@ -96,6 +96,10 @@ struct NodeEvidence {
     line_end: usize,
     score: f64,
     sources: Vec<String>,
+    /// Which query terms (symbols or domain_terms) matched this node's name/qualified_name.
+    matched_terms: Vec<String>,
+    /// Whether this node is a test node.
+    is_test: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1393,8 +1397,9 @@ fn aggregate_to_files(
             let multi_source = 1.0 + 0.15 * (n_unique_sources.saturating_sub(1)) as f64;
 
             // Symbol-in-path boost: 1.3x if any query symbol appears as a substring of the path.
+            let file_path_lower = file_path.to_lowercase();
             let symbol_path = if parts.symbols.iter().any(|sym| {
-                file_path.to_lowercase().contains(&sym.to_lowercase())
+                file_path_lower.contains(&sym.to_lowercase())
             }) {
                 1.3
             } else {
@@ -1407,14 +1412,32 @@ fn aggregate_to_files(
             let top_nodes: Vec<NodeEvidence> = nodes
                 .iter()
                 .take(3)
-                .map(|n| NodeEvidence {
-                    name: n.qualified_name.split("::").last().unwrap_or(&n.qualified_name).to_string(),
-                    qualified_name: n.qualified_name.clone(),
-                    kind: n.kind.as_str().to_string(),
-                    line_start: 0, // populated below from the store if needed; see note
-                    line_end: 0,
-                    score: n.score,
-                    sources: n.sources.iter().map(|s| s.as_str().to_string()).collect(),
+                .map(|n| {
+                    let short_name = n.qualified_name.split("::").last().unwrap_or(&n.qualified_name).to_string();
+                    let name_lower = short_name.to_lowercase();
+                    let qn_lower = n.qualified_name.to_lowercase();
+                    // symbols are original-case; domain_terms are already lowercase (from decompose_query).
+                    let matched_terms: Vec<String> = parts.symbols.iter()
+                        .filter(|sym| {
+                            let s = sym.to_lowercase();
+                            name_lower.contains(&s) || qn_lower.contains(&s) || file_path_lower.contains(&s)
+                        })
+                        .chain(parts.domain_terms.iter().filter(|t| {
+                            name_lower.contains(t.as_str()) || qn_lower.contains(t.as_str()) || file_path_lower.contains(t.as_str())
+                        }))
+                        .cloned()
+                        .collect();
+                    NodeEvidence {
+                        name: short_name,
+                        qualified_name: n.qualified_name.clone(),
+                        kind: n.kind.as_str().to_string(),
+                        line_start: 0, // populated below from the store if needed; see note
+                        line_end: 0,
+                        score: n.score,
+                        sources: n.sources.iter().map(|s| s.as_str().to_string()).collect(),
+                        matched_terms,
+                        is_test: n.is_test,
+                    }
                 })
                 .collect();
 
@@ -1459,6 +1482,8 @@ fn file_results_to_json(
                     "line_end": n.line_end,
                     "score": n.score,
                     "sources": srcs,
+                    "matched_terms": n.matched_terms,
+                    "is_test": n.is_test,
                 })
             }).collect();
             json!({
@@ -3203,5 +3228,77 @@ mod tests {
         assert!(debug.get("query_parts").is_some(), "_debug must contain query_parts");
         assert!(debug.get("total_candidates").is_some(), "_debug must contain total_candidates");
         assert!(debug.get("files_scored").is_some(), "_debug must contain files_scored");
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeEvidence: matched_terms and is_test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evidence_includes_matched_terms() {
+        // Node whose name matches a query symbol should have that symbol in matched_terms.
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+        candidates.insert(
+            "reducers::serverPatchReducer".to_string(),
+            make_candidate(
+                "reducers::serverPatchReducer",
+                "src/reducers/serverPatchReducer.ts",
+                NodeKind::Function,
+                0.1,
+                CandidateSource::KeywordExact,
+            ),
+        );
+
+        // symbols=["serverPatchReducer"], domain_terms=["history"]
+        let parts = decompose_query("serverPatchReducer history");
+        assert!(
+            parts.symbols.contains(&"serverPatchReducer".to_string()),
+            "serverPatchReducer should be detected as a symbol"
+        );
+
+        let results = aggregate_to_files(candidates, &parts, 10);
+        assert!(!results.is_empty(), "should have at least one file result");
+
+        let top = &results[0];
+        assert!(!top.top_nodes.is_empty(), "should have at least one evidence node");
+        let evidence = &top.top_nodes[0];
+
+        assert!(
+            evidence.matched_terms.contains(&"serverPatchReducer".to_string()),
+            "matched_terms should contain 'serverPatchReducer'; got {:?}",
+            evidence.matched_terms
+        );
+    }
+
+    #[test]
+    fn evidence_includes_is_test() {
+        // A NodeCandidate with is_test=true should produce NodeEvidence with is_test=true.
+        let mut sources = HashSet::new();
+        sources.insert(CandidateSource::KeywordRelaxed);
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+        candidates.insert(
+            "tests::testFoo".to_string(),
+            NodeCandidate {
+                qualified_name: "tests::testFoo".to_string(),
+                file_path: "src/__tests__/foo.test.ts".to_string(),
+                kind: NodeKind::Test,
+                is_test: true,
+                score: 0.05,
+                sources,
+            },
+        );
+
+        let parts = decompose_query("foo");
+        let results = aggregate_to_files(candidates, &parts, 10);
+        assert!(!results.is_empty(), "should have at least one file result");
+
+        let top = &results[0];
+        assert!(!top.top_nodes.is_empty(), "should have at least one evidence node");
+        let evidence = &top.top_nodes[0];
+
+        assert!(
+            evidence.is_test,
+            "NodeEvidence.is_test should be true for a test node"
+        );
     }
 }
