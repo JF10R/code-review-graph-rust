@@ -16,3 +16,7 @@
 ; --- Calls ---
 (call_expression) @reference.call
 (new_expression) @reference.call
+
+; --- Types ---
+(interface_declaration) @definition.type
+(type_alias_declaration) @definition.type
