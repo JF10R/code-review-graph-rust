@@ -38,7 +38,7 @@ pub fn save_blob<T: Serialize>(data: &T, path: &Path, label: &str) -> Result<()>
     tmp.persist(path)
         .map_err(|e| CrgError::Io(e.error))?;
 
-    log::debug!("{label}: saved {} bytes to {}", compressed.len() + 8, path.display());
+    tracing::debug!("{label}: saved {} bytes to {}", compressed.len() + 8, path.display());
     Ok(())
 }
 

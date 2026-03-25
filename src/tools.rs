@@ -164,7 +164,7 @@ fn maybe_auto_update(store: &mut GraphStore, repo_root: &Path) {
     }
     // Only update if there are actually changed source files not yet in the graph
     if let Err(e) = crate::incremental::incremental_update(repo_root, store, "HEAD", Some(source_changed)) {
-        log::warn!("auto-update failed: {}", e);
+        tracing::warn!("auto-update failed: {}", e);
     }
 }
 

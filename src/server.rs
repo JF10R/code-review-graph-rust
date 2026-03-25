@@ -594,7 +594,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         .watch(&repo_root, RecursiveMode::Recursive)
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
 
-    log::info!(
+    tracing::info!(
         "Background watcher active — watching {}",
         repo_root.display()
     );
@@ -603,7 +603,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         let events = match result {
             Ok(evts) => evts,
             Err(e) => {
-                log::error!("Watcher error: {:?}", e);
+                tracing::error!("Watcher error: {:?}", e);
                 continue;
             }
         };
@@ -641,7 +641,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         let mut store = match GraphStore::new(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                log::error!("Background watcher: could not open store: {}", e);
+                tracing::error!("Background watcher: could not open store: {}", e);
                 continue;
             }
         };
@@ -650,13 +650,13 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
             let abs_str = path.to_string_lossy().into_owned();
             tree_cache.remove(&abs_str);
             if let Err(e) = store.remove_file_data(&abs_str) {
-                log::error!("Watcher remove {}: {}", abs_str, e);
+                tracing::error!("Watcher remove {}: {}", abs_str, e);
             } else {
                 let rel = path
                     .strip_prefix(&repo_root)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| abs_str.clone());
-                log::info!("Watcher removed: {}", rel);
+                tracing::info!("Watcher removed: {}", rel);
             }
         }
 
@@ -683,7 +683,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         .strip_prefix(&repo_root)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
-                    log::info!(
+                    tracing::info!(
                         "Watcher updated: {} ({} nodes, {} edges, {})",
                         rel, n, e,
                         if incremental { "incremental" } else { "full parse" }
@@ -703,16 +703,16 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                                 if let Some(t) = dep_new_tree {
                                     tree_cache.insert(dep_path.clone(), t);
                                 }
-                                log::debug!(
+                                tracing::debug!(
                                     "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
                                     dep_path, dn, de
                                 );
                             }
-                            Ok(None) => log::debug!(
+                            Ok(None) => tracing::debug!(
                                 "Watcher dependent unchanged (hash match): {}",
                                 dep_path
                             ),
-                            Err(e) => log::warn!("Watcher dependent {}: {}", dep_path, e),
+                            Err(e) => tracing::warn!("Watcher dependent {}: {}", dep_path, e),
                         }
                     }
                 }
@@ -721,18 +721,18 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         .strip_prefix(&repo_root)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
-                    log::debug!("Watcher skipped (hash unchanged): {}", rel);
+                    tracing::debug!("Watcher skipped (hash unchanged): {}", rel);
                 }
-                Err(err) => log::error!("Watcher {}", err),
+                Err(err) => tracing::error!("Watcher {}", err),
             }
         }
 
         if let Err(e) = store.commit() {
-            log::error!("Watcher commit error: {}", e);
+            tracing::error!("Watcher commit error: {}", e);
         }
     }
 
-    log::info!("Background watcher stopped.");
+    tracing::info!("Background watcher stopped.");
     Ok(())
 }
 
@@ -746,11 +746,11 @@ pub async fn run_server(repo_root: Option<String>) -> crate::error::Result<()> {
         let watcher_root = root.clone();
         std::thread::spawn(move || {
             if let Err(e) = run_background_watcher(watcher_root) {
-                log::error!("Background watcher error: {}", e);
+                tracing::error!("Background watcher error: {}", e);
             }
         });
     } else {
-        log::info!("No repo root detected, background watcher disabled");
+        tracing::info!("No repo root detected, background watcher disabled");
     }
 
     let server = CodeReviewServer::new(repo_root);

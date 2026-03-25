@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
 use rayon::prelude::*;
