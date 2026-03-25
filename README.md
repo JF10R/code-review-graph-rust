@@ -29,7 +29,7 @@ The MCP server starts automatically and keeps the graph fresh via a background w
 | Feature | Details |
 |---------|---------|
 | **14 languages** | Python, TypeScript, JavaScript, Vue, Go, Rust, Java, C, C++, C#, Ruby, PHP, Swift, Kotlin |
-| **7-77x faster builds** | Parallel parsing via rayon |
+| **5-62x faster builds** | Parallel parsing via rayon |
 | **Personalized PageRank** | Direction-aware, weighted blast radius — 30-50% fewer false positives than BFS |
 | **Semantic search** | Jina Code v2 embeddings (768-dim, free local) with optional GPU acceleration |
 | **Call chain tracing** | `trace_call_chain` finds shortest path between any two functions |
@@ -41,7 +41,7 @@ The MCP server starts automatically and keeps the graph fresh via a background w
 
 | | Python | Rust |
 |---|--------|------|
-| Build (Next.js, 2382 files) | 305s | **4.3s** (71x) |
+| Build (Next.js, 2382 files) | 305s | **5.0s** (61x) |
 | Graph save/load | 147/120 ms | **2.1/1.1 ms** (70-111x) |
 | Binary size | ~150 MB (venv) | ~40 MB |
 | Startup | 150-300 ms | 2-5 ms |
