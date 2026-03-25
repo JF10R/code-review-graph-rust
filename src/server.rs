@@ -617,6 +617,26 @@ impl CodeReviewServer {
         per_call.or_else(|| self.repo_root.as_deref().map(|s| s.to_string()))
     }
 
+    /// True when the worker thread can handle this request — i.e., the worker
+    /// exists AND the resolved repo_root matches the worker's repo (or is None).
+    /// When the caller asks for a *different* repo, we must bypass the worker
+    /// and use the fallback path which opens its own stores.
+    fn use_worker(&self, resolved_root: &Option<String>) -> bool {
+        if self.worker_tx.is_none() {
+            return false;
+        }
+        match (resolved_root, &self.repo_root) {
+            // No override — use worker's default repo.
+            (None, _) => true,
+            // Override matches worker's repo.
+            (Some(req), Some(default)) => {
+                crate::paths::normalize_path(req) == crate::paths::normalize_path(default)
+            }
+            // Override specified but no default — can't compare, fallback.
+            (Some(_), None) => false,
+        }
+    }
+
     /// Send a command to the worker and await the reply.
     ///
     /// Returns `Err("worker died")` if the channel is closed.
@@ -662,7 +682,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<BuildOrUpdateParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::BuildGraph {
                 full_rebuild: p.full_rebuild,
                 base: p.base,
@@ -685,7 +705,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<ImpactRadiusParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::ImpactRadius {
                 changed_files: p.changed_files,
                 max_depth: p.max_depth,
@@ -712,7 +732,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<QueryGraphParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::QueryGraph {
                 pattern: p.pattern,
                 target: p.target,
@@ -736,7 +756,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<ReviewContextParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::GetReviewContext {
                 changed_files: p.changed_files,
                 max_depth: p.max_depth,
@@ -770,7 +790,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<SemanticSearchParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::SemanticSearch {
                 query: p.query,
                 kind: p.kind,
@@ -795,7 +815,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<StatsParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::ListStats { reply }).await
         } else {
             self.spawn_blocking_fallback(move || {
@@ -815,7 +835,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<EmbedParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::EmbedGraph { reply }).await
         } else {
             self.spawn_blocking_fallback(move || {
@@ -851,7 +871,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<LargeFunctionsParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::FindLargeFunctions {
                 min_lines: p.min_lines,
                 kind: p.kind,
@@ -884,7 +904,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<TraceCallChainParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::TraceCallChain {
                 from: p.from,
                 to: p.to,
@@ -911,7 +931,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<HybridQueryParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::HybridQuery {
                 query: p.query,
                 limit: p.limit,
@@ -936,7 +956,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<OpenNodeContextParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::OpenNodeContext {
                 target: p.target,
                 compact: p.compact,
@@ -958,7 +978,7 @@ impl CodeReviewServer {
         Parameters(p): Parameters<BatchNodeContextParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        if self.worker_tx.is_some() {
+        if self.use_worker(&repo_root) {
             self.worker_call(|reply| WorkerCommand::BatchNodeContext {
                 targets: p.targets,
                 compact: p.compact,
