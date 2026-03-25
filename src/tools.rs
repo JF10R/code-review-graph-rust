@@ -54,6 +54,7 @@ enum CandidateSource {
     ConfigBoosted,
     Semantic,
     Tantivy,
+    Expansion,
 }
 
 impl CandidateSource {
@@ -65,6 +66,7 @@ impl CandidateSource {
             Self::ConfigBoosted => "config_boosted",
             Self::Semantic      => "semantic",
             Self::Tantivy       => "tantivy",
+            Self::Expansion     => "expansion",
         }
     }
 }
@@ -1332,6 +1334,102 @@ fn fanout_retrieve(
     Ok(pool)
 }
 
+/// Expand the candidate pool by following CALLS and CONTAINS edges 1 hop from
+/// the highest-scoring candidates. This surfaces nodes in adjacent files that
+/// the keyword/semantic channels might have missed.
+///
+/// - Seeds: top 20% of candidates by score, or at least the top 5.
+/// - For each seed: follow outgoing CALLS/CONTAINS edges (callees) and incoming
+///   CALLS edges (callers).
+/// - New candidates get score = `0.3 * parent_score` with source `Expansion`.
+/// - Existing candidates with a higher score are never overwritten.
+/// - Total new candidates added is capped at `limit * 2`.
+fn expand_candidates(
+    store: &GraphStore,
+    candidates: &mut HashMap<String, NodeCandidate>,
+    limit: usize,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // Collect and sort by score descending to identify seeds.
+    let mut ranked: Vec<(String, f64)> = candidates
+        .iter()
+        .map(|(qn, c)| (qn.clone(), c.score))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let seed_count = {
+        let twenty_pct = (ranked.len() as f64 * 0.2).ceil() as usize;
+        twenty_pct.max(5).min(ranked.len())
+    };
+    let seeds: Vec<(String, f64)> = ranked.into_iter().take(seed_count).collect();
+
+    let cap = limit * 2;
+    let mut added = 0usize;
+
+    // Insert a new expansion candidate, returning true if the cap is now reached.
+    let mut try_insert = |candidates: &mut HashMap<String, NodeCandidate>,
+                          neighbor_qn: &str,
+                          node: crate::types::GraphNode,
+                          score: f64| {
+        candidates.insert(
+            neighbor_qn.to_owned(),
+            NodeCandidate {
+                qualified_name: neighbor_qn.to_owned(),
+                file_path: node.file_path,
+                kind: node.kind,
+                is_test: node.is_test,
+                score,
+                sources: HashSet::from([CandidateSource::Expansion]),
+            },
+        );
+        added += 1;
+        added >= cap
+    };
+
+    'seeds: for (qn, parent_score) in seeds {
+        let expansion_score = 0.3 * parent_score;
+
+        // Outgoing edges: callees and contained nodes.
+        let out_edges = store.get_edges_by_source(&qn)?;
+        for edge in &out_edges {
+            if !matches!(edge.kind, EdgeKind::Calls | EdgeKind::Contains) {
+                continue;
+            }
+            let neighbor_qn = &edge.target_qualified;
+            if candidates.contains_key(neighbor_qn) {
+                continue;
+            }
+            if let Some(node) = store.get_node(neighbor_qn)? {
+                if try_insert(candidates, neighbor_qn, node, expansion_score) {
+                    break 'seeds;
+                }
+            }
+        }
+
+        // Incoming edges: callers (CALLS only).
+        let in_edges = store.get_edges_by_target(&qn)?;
+        for edge in &in_edges {
+            if !matches!(edge.kind, EdgeKind::Calls) {
+                continue;
+            }
+            let neighbor_qn = &edge.source_qualified;
+            if candidates.contains_key(neighbor_qn) {
+                continue;
+            }
+            if let Some(node) = store.get_node(neighbor_qn)? {
+                if try_insert(candidates, neighbor_qn, node, expansion_score) {
+                    break 'seeds;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Aggregate a candidate pool into file-level results with capped top-k scoring
 /// and conditional priors.
 fn aggregate_to_files(
@@ -1582,7 +1680,8 @@ pub fn hybrid_query_with_store(
     // --- File mode: fanout+rerank early return ---
     if result_mode_str == "file" {
         let parts = decompose_query(query);
-        let candidates = fanout_retrieve(store, emb_store, root, &parts, limit, keyword_hits)?;
+        let mut candidates = fanout_retrieve(store, emb_store, root, &parts, limit, keyword_hits)?;
+        expand_candidates(store, &mut candidates, limit)?;
         let total_candidates = candidates.len();
         let files_scored = {
             let mut files: HashSet<&str> = HashSet::new();
@@ -3203,5 +3302,139 @@ mod tests {
         assert!(debug.get("query_parts").is_some(), "_debug must contain query_parts");
         assert!(debug.get("total_candidates").is_some(), "_debug must contain total_candidates");
         assert!(debug.get("files_scored").is_some(), "_debug must contain files_scored");
+    }
+
+    // -----------------------------------------------------------------------
+    // expand_candidates
+    // -----------------------------------------------------------------------
+
+    fn make_store_node(name: &str, qn: &str, file: &str) -> crate::types::NodeInfo {
+        crate::types::NodeInfo {
+            name: name.to_string(),
+            qualified_name: qn.to_string(),
+            kind: crate::types::NodeKind::Function,
+            file_path: file.to_string(),
+            line_start: 1,
+            line_end: 10,
+            language: "python".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: format!("hash_{name}"),
+        }
+    }
+
+    fn make_store_edge(src: &str, tgt: &str, kind: crate::types::EdgeKind) -> crate::types::EdgeInfo {
+        crate::types::EdgeInfo {
+            source_qualified: src.to_string(),
+            target_qualified: tgt.to_string(),
+            kind,
+            file_path: src.split("::").next().unwrap_or("f.py").to_string(),
+            line: 1,
+        }
+    }
+
+    /// After fanout finds node A (file1.py), expansion should add node B (file2.py)
+    /// as a candidate with source Expansion, because A CALLS B.
+    #[test]
+    fn expand_adds_callee_to_candidates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.bin.zst");
+        let mut store = GraphStore::new(tp(&path)).unwrap();
+
+        let nodes_file1 = vec![make_store_node("func_a", "file1.py::func_a", "file1.py")];
+        let nodes_file2 = vec![make_store_node("func_b", "file2.py::func_b", "file2.py")];
+        let edge = make_store_edge("file1.py::func_a", "file2.py::func_b", crate::types::EdgeKind::Calls);
+
+        // Store file2.py first so func_b is in the graph before the cross-file edge is inserted.
+        store.store_file_nodes_edges("file2.py", &nodes_file2, &[], "h2").unwrap();
+        store.store_file_nodes_edges("file1.py", &nodes_file1, &[edge], "h1").unwrap();
+
+        // Seed candidates with only func_a (as if fanout found it).
+        let mut sources = HashSet::new();
+        sources.insert(CandidateSource::KeywordRelaxed);
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+        candidates.insert(
+            "file1.py::func_a".to_string(),
+            NodeCandidate {
+                qualified_name: "file1.py::func_a".to_string(),
+                file_path: "file1.py".to_string(),
+                kind: crate::types::NodeKind::Function,
+                is_test: false,
+                score: 1.0,
+                sources,
+            },
+        );
+
+        expand_candidates(&store, &mut candidates, 10).unwrap();
+
+        // func_b should now be in candidates via expansion.
+        assert!(
+            candidates.contains_key("file2.py::func_b"),
+            "expansion should add func_b as a candidate"
+        );
+        let expanded = &candidates["file2.py::func_b"];
+        assert!(
+            expanded.sources.contains(&CandidateSource::Expansion),
+            "expanded candidate must have Expansion source"
+        );
+        assert_eq!(expanded.file_path, "file2.py");
+        // Score should be 0.3 * parent score (1.0)
+        assert!(
+            (expanded.score - 0.3).abs() < 1e-9,
+            "expanded score should be 0.3 * parent score, got {}",
+            expanded.score
+        );
+    }
+
+    /// A node with 100 callees must not cause expansion to exceed limit * 2 new candidates.
+    #[test]
+    fn expand_caps_new_candidates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.bin.zst");
+        let mut store = GraphStore::new(tp(&path)).unwrap();
+
+        // Create hub node in file1.py
+        let hub = make_store_node("hub", "file1.py::hub", "file1.py");
+
+        // Create 100 callee nodes in file2.py, each with a CALLS edge from hub.
+        let callee_count = 100usize;
+        let callees: Vec<crate::types::NodeInfo> = (0..callee_count)
+            .map(|i| make_store_node(&format!("callee_{i}"), &format!("file2.py::callee_{i}"), "file2.py"))
+            .collect();
+        let edges: Vec<crate::types::EdgeInfo> = (0..callee_count)
+            .map(|i| make_store_edge("file1.py::hub", &format!("file2.py::callee_{i}"), crate::types::EdgeKind::Calls))
+            .collect();
+
+        // Store callees first so cross-file edges from hub resolve correctly.
+        store.store_file_nodes_edges("file2.py", &callees, &[], "h2").unwrap();
+        store.store_file_nodes_edges("file1.py", &[hub], &edges, "h1").unwrap();
+
+        // Seed with only hub.
+        let mut sources = HashSet::new();
+        sources.insert(CandidateSource::KeywordRelaxed);
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+        candidates.insert(
+            "file1.py::hub".to_string(),
+            NodeCandidate {
+                qualified_name: "file1.py::hub".to_string(),
+                file_path: "file1.py".to_string(),
+                kind: crate::types::NodeKind::Function,
+                is_test: false,
+                score: 1.0,
+                sources,
+            },
+        );
+
+        let limit = 10usize;
+        expand_candidates(&store, &mut candidates, limit).unwrap();
+
+        // Total new candidates added must not exceed limit * 2.
+        let new_candidates = candidates.len() - 1; // subtract the original hub
+        assert!(
+            new_candidates <= limit * 2,
+            "expansion should add at most limit*2={} new candidates, got {new_candidates}",
+            limit * 2
+        );
     }
 }
