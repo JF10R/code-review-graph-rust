@@ -184,11 +184,7 @@ fn sha256_bytes(data: &[u8]) -> String {
 /// Returns true when the stored file hash for `abs_path` matches `fhash`,
 /// meaning the file content is unchanged and re-parsing can be skipped.
 fn file_hash_unchanged(store: &GraphStore, abs_path: &str, fhash: &str) -> bool {
-    store
-        .get_nodes_by_file(abs_path)
-        .unwrap_or_default()
-        .first()
-        .map(|n| n.file_hash.as_str()) == Some(fhash)
+    store.get_file_hash(abs_path) == Some(fhash)
 }
 
 fn now_iso() -> String {
@@ -1463,6 +1459,60 @@ mod tests {
                 || result.dependent_files.iter().any(|f| f.contains("a.py")),
             "a.py should be discovered as a dependent of b.py; dependent_files: {:?}",
             result.dependent_files
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // file_hash_unchanged — direct hash lookup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn file_hash_unchanged_returns_true_for_matching_hash() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(p(dir.path()));
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_path = dir.path().join("test.py").to_string_lossy().into_owned();
+        let node = make_node("foo", "foo", &abs_path);
+        store
+            .store_file_nodes_edges(&abs_path, &[node], &[], "hash123")
+            .unwrap();
+
+        assert!(
+            file_hash_unchanged(&store, &abs_path, "hash123"),
+            "should return true when hash matches"
+        );
+    }
+
+    #[test]
+    fn file_hash_unchanged_returns_false_for_wrong_hash() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(p(dir.path()));
+        let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let abs_path = dir.path().join("test.py").to_string_lossy().into_owned();
+        let node = make_node("foo", "foo", &abs_path);
+        store
+            .store_file_nodes_edges(&abs_path, &[node], &[], "hash123")
+            .unwrap();
+
+        assert!(
+            !file_hash_unchanged(&store, &abs_path, "different_hash"),
+            "should return false when hash does not match"
+        );
+    }
+
+    #[test]
+    fn file_hash_unchanged_returns_false_for_nonexistent_file() {
+        let dir = TempDir::new().unwrap();
+        let db_path = get_db_path(p(dir.path()));
+        let store = crate::graph::GraphStore::new(&db_path).unwrap();
+
+        let nonexistent = dir.path().join("nonexistent.py").to_string_lossy().into_owned();
+
+        assert!(
+            !file_hash_unchanged(&store, &nonexistent, "hash123"),
+            "should return false for a file not in the store"
         );
     }
 }
