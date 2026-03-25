@@ -9,9 +9,9 @@
 - **Parallel incremental parsing** — `incremental_update` now uses `rayon::par_iter` for the tree-sitter parse phase, matching the parallelism already used by `full_build`. **4-8x faster** incremental updates when multiple files change (e.g., branch switches).
 - **Precomputed lowercase search cache** — `search_nodes` no longer calls `to_lowercase()` on every node name per query. A `lowercase_cache` in `GraphData` is maintained incrementally on insert/remove, eliminating N string allocations per keyword search.
 
-### Experimental
+### Bug Fixes
 
-- **Convex combination fusion** — `hybrid_query` accepts `fusion: "cc"` to use min-max normalized convex combination (alpha=0.5) instead of RRF. Based on Pinecone's hybrid retrieval research (arxiv:2210.11934). RRF remains the default; CC is opt-in for evaluation.
+- **`repo_root` parameter respected** — MCP tool calls with an explicit `repo_root` now correctly query that repo's graph instead of always using the server's startup directory.
 
 ## v1.2.0
 

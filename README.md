@@ -55,7 +55,7 @@ The MCP server starts automatically and keeps the graph fresh via a background w
 | **Call chain tracing** | `trace_call_chain` finds shortest path between any two functions |
 | **Framework edges** | JSX components, Express middleware, event emitters, pytest fixtures auto-detected |
 | **Compact mode** | `compact: true` strips paths + low-value fields, reducing response tokens ~40% |
-| **Hybrid search** | RRF or convex combination fusion of keyword + semantic results |
+| **Hybrid search** | Reciprocal Rank Fusion of keyword + semantic results |
 | **Always fresh** | Background watcher + hash-skip + lazy stale-check per query |
 
 ## vs Python version
@@ -125,7 +125,7 @@ Prefer these tools over grep/read for code discovery:
 | `query_graph(callers_of)` | Who calls this function? |
 | `query_graph(callees_of)` | What does this function call? |
 | `get_review_context` | Token-efficient review bundle for changed files |
-| `hybrid_query` | Combined keyword + semantic search (RRF or CC fusion) |
+| `hybrid_query` | Combined keyword + semantic search |
 
 Always pass `compact: true`. Discover with graph tools first, then `Read` only the files you need.
 ```

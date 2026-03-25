@@ -193,7 +193,7 @@ struct HybridQueryParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
-    #[schemars(description = "Fusion method: \"rrf\" (Reciprocal Rank Fusion, default) or \"cc\" (convex combination of normalised scores).")]
+    #[schemars(description = "Internal: fusion method. Leave unset to use the default (RRF).")]
     #[serde(default)]
     fusion: Option<String>,
 }
@@ -919,11 +919,11 @@ impl CodeReviewServer {
         }
     }
 
-    /// Smart search combining keyword matching with semantic similarity.
-    /// Supports two fusion modes via the `fusion` parameter:
-    /// - `"rrf"` (default): Reciprocal Rank Fusion — results include `rrf_score`.
-    /// - `"cc"`: Convex Combination of normalised scores — results include `cc_score`.
-    /// Falls back to keyword-only (RRF scoring) when embeddings are unavailable.
+    /// Smart search combining keyword matching with semantic similarity
+    /// via Reciprocal Rank Fusion (RRF). Prefer this over semantic_search_nodes
+    /// when you want the best of both worlds — exact name matches AND
+    /// conceptual similarity in one ranked result set. Falls back to
+    /// keyword-only when embeddings are unavailable.
     #[tool(name = "hybrid_query")]
     #[tracing::instrument(skip(self))]
     async fn hybrid_query_tool(
