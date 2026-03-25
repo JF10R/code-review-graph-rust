@@ -354,6 +354,42 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
     let parser = crate::parser::CodeParser::new();
     let mut tree_cache: HashMap<String, tree_sitter::Tree> = HashMap::new();
 
+    // Cached Tantivy full-text index — rebuilt after every store mutation.
+    // Eliminates per-query index reconstruction on the keyword search path.
+    #[cfg(feature = "tantivy-search")]
+    let mut tantivy_cache: Option<crate::search::TantivySearchIndex> = None;
+
+    #[cfg(feature = "tantivy-search")]
+    macro_rules! rebuild_tantivy {
+        () => {
+            match crate::search::TantivySearchIndex::build(&store) {
+                Ok(idx) => { tantivy_cache = Some(idx); }
+                Err(e) => tracing::warn!("Worker: tantivy index build failed: {e}"),
+            }
+        };
+    }
+
+    /// Compute pre-built keyword hits from the cached Tantivy index, or `None`
+    /// when the feature is disabled or the index is not yet populated.
+    macro_rules! kw_hits {
+        ($query:expr, $limit:expr) => {{
+            #[cfg(feature = "tantivy-search")]
+            {
+                tantivy_cache.as_ref().and_then(|idx| {
+                    crate::search::search_nodes_indexed(idx, &store, $query, $limit).ok()
+                })
+            }
+            #[cfg(not(feature = "tantivy-search"))]
+            {
+                let _: (&str, usize) = ($query, $limit);
+                None::<Vec<crate::types::GraphNode>>
+            }
+        }};
+    }
+
+    #[cfg(feature = "tantivy-search")]
+    rebuild_tantivy!();
+
     /// Reload the graph store from disk (called after BuildGraph mutations).
     macro_rules! reload_store {
         () => {
@@ -385,8 +421,9 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
 
             WorkerCommand::SemanticSearch { query, kind, limit, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "semantic_search").entered();
+                let kw_hits = kw_hits!(&query, limit * 2);
                 let result = crate::tools::semantic_search_nodes_with_store(
-                    &store, &mut emb_store, &root, &query, kind.as_deref(), limit, compact,
+                    &store, &mut emb_store, &root, &query, kind.as_deref(), limit, compact, kw_hits,
                 ).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
@@ -422,8 +459,10 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
 
             WorkerCommand::HybridQuery { query, limit, compact, fusion, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
-                let result = crate::tools::hybrid_query_with_store(&store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref())
-                    .map_err(|e| e.to_string());
+                let kw_hits = kw_hits!(&query, limit * 2);
+                let result = crate::tools::hybrid_query_with_store(
+                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits,
+                ).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
@@ -459,6 +498,8 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                     .map_err(|e| e.to_string());
                 // Reload worker's in-memory store from disk.
                 reload_store!();
+                #[cfg(feature = "tantivy-search")]
+                rebuild_tantivy!();
                 let _ = reply.send(result);
             }
 
@@ -544,6 +585,8 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 if let Err(e) = store.commit() {
                     tracing::error!("Worker commit error: {e}");
                 }
+                #[cfg(feature = "tantivy-search")]
+                rebuild_tantivy!();
             }
 
             WorkerCommand::WatcherRemove { paths } => {
@@ -560,6 +603,8 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 if let Err(e) = store.commit() {
                     tracing::error!("Worker commit error (remove): {e}");
                 }
+                #[cfg(feature = "tantivy-search")]
+                rebuild_tantivy!();
             }
 
             WorkerCommand::Shutdown => break,

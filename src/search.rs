@@ -125,10 +125,53 @@ pub fn search_nodes_tantivy(
     Ok(nodes)
 }
 
+/// Search nodes using a pre-built Tantivy index.
+///
+/// Unlike `search_nodes_tantivy`, this function does **not** rebuild the index
+/// on every call — the caller is responsible for caching the index and passing
+/// it in.  Returns full `GraphNode` objects with relevance-ranked ordering
+/// (exact match → prefix match → other), identical to
+/// `GraphStore::search_nodes`.
+pub fn search_nodes_indexed(
+    index: &TantivySearchIndex,
+    store: &GraphStore,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<GraphNode>> {
+    if query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let qualified_names = index.search(query, limit)?;
+    let query_lower = query.to_lowercase();
+
+    let mut results: Vec<(u8, GraphNode)> = Vec::new();
+    for qn in qualified_names {
+        let node = match store.get_node(&qn)? {
+            Some(node) => node,
+            None => continue,
+        };
+        let name_lower = node.name.to_lowercase();
+        let qn_lower = node.qualified_name.to_lowercase();
+        let relevance = if name_lower == query_lower || qn_lower == query_lower {
+            0u8
+        } else if name_lower.starts_with(&query_lower) {
+            1u8
+        } else {
+            2u8
+        };
+        results.push((relevance, node));
+    }
+
+    results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    results.truncate(limit);
+    Ok(results.into_iter().map(|(_, n)| n).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{NodeInfo, NodeKind};
+    use camino::Utf8PathBuf;
     use tempfile::TempDir;
 
     /// Build a store containing the given nodes.
@@ -138,7 +181,7 @@ mod tests {
     /// that path, allowing `TantivySearchIndex::build` to find all nodes.
     fn make_store_with_nodes(nodes: Vec<NodeInfo>) -> (GraphStore, TempDir) {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.bin.zst");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("test.bin.zst")).unwrap();
         let mut store = GraphStore::new(&path).unwrap();
 
         let mut by_file: std::collections::HashMap<String, Vec<NodeInfo>> =
@@ -227,7 +270,7 @@ mod tests {
     #[test]
     fn empty_store_returns_empty() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("empty.bin.zst");
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("empty.bin.zst")).unwrap();
         let store = GraphStore::new(&path).unwrap();
 
         let results = search_nodes_tantivy("anything", &store, 10).unwrap();
@@ -250,5 +293,52 @@ mod tests {
             results.iter().any(|n| n.qualified_name == "search::build_index"),
             "must find search::build_index"
         );
+    }
+
+    #[test]
+    fn search_nodes_indexed_returns_matching_nodes() {
+        let nodes = vec![
+            make_fn("parse_file", "src/parser.rs::parse_file", "src/parser.rs", ""),
+            make_fn(
+                "search_nodes",
+                "src/graph.rs::search_nodes",
+                "src/graph.rs",
+                "",
+            ),
+        ];
+        let (store, _dir) = make_store_with_nodes(nodes);
+        let index = TantivySearchIndex::build(&store).unwrap();
+        let results = search_nodes_indexed(&index, &store, "parse", 10).unwrap();
+        assert!(!results.is_empty(), "should find parse_file");
+        assert!(
+            results.iter().any(|n| n.name == "parse_file"),
+            "result must include parse_file"
+        );
+    }
+
+    #[test]
+    fn search_nodes_indexed_empty_query_returns_empty() {
+        let nodes = vec![make_fn("some_func", "mod::some_func", "src/lib.rs", "")];
+        let (store, _dir) = make_store_with_nodes(nodes);
+        let index = TantivySearchIndex::build(&store).unwrap();
+        let results = search_nodes_indexed(&index, &store, "", 10).unwrap();
+        assert!(results.is_empty(), "empty query must return no results");
+        let results_ws = search_nodes_indexed(&index, &store, "   ", 10).unwrap();
+        assert!(results_ws.is_empty(), "whitespace-only query must return no results");
+    }
+
+    #[test]
+    fn search_nodes_indexed_exact_match_ranked_first() {
+        let nodes = vec![
+            make_fn("parse", "mod::parse", "src/lib.rs", ""),
+            make_fn("parse_tokens", "mod::parse_tokens", "src/lib.rs", ""),
+            make_fn("parse_file", "mod::parse_file", "src/lib.rs", ""),
+        ];
+        let (store, _dir) = make_store_with_nodes(nodes);
+        let index = TantivySearchIndex::build(&store).unwrap();
+        let results = search_nodes_indexed(&index, &store, "parse", 10).unwrap();
+        assert!(!results.is_empty());
+        // Exact match should come first
+        assert_eq!(results[0].name, "parse", "exact match must be ranked first");
     }
 }
