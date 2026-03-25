@@ -659,6 +659,12 @@ impl GraphStore {
             return Ok(None);
         };
 
+        // Same node → 0-hop path.
+        if from_idx == to_idx {
+            let node = self.data.graph[from_idx].clone();
+            return Ok(Some(vec![(node, None)]));
+        }
+
         // BFS over Calls edges in `direction`. Returns parent map on success.
         let bfs = |direction: Direction| -> Option<HashMap<NodeIndex, NodeIndex>> {
             let mut queue: VecDeque<(NodeIndex, usize)> = VecDeque::new();

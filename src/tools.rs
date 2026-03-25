@@ -21,13 +21,23 @@ use crate::embeddings::{embed_all_nodes, semantic_search, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
-use crate::types::{edge_to_dict, node_to_dict, strip_paths_prefix, EdgeKind};
+use crate::types::{edge_to_dict, node_to_dict, NormalizedPrefix, EdgeKind};
 
 /// Wrapper: build a node dict, then strip repo-root prefix if compact.
+/// For batch results, prefer `node_dict_batch` with a pre-computed prefix.
 fn node_dict(node: &crate::types::GraphNode, compact: bool, root: &Path) -> Value {
     let mut d = node_to_dict(node, compact);
     if compact {
-        strip_paths_prefix(&mut d, root);
+        NormalizedPrefix::new(root).strip(&mut d);
+    }
+    d
+}
+
+/// Batch-optimized: build a node dict using a pre-computed prefix.
+fn node_dict_batch(node: &crate::types::GraphNode, compact: bool, prefix: &Option<NormalizedPrefix>) -> Value {
+    let mut d = node_to_dict(node, compact);
+    if let Some(p) = prefix {
+        p.strip(&mut d);
     }
     d
 }
@@ -247,8 +257,9 @@ pub fn get_impact_radius(
 
     let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS, None)?;
 
-    let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(|n| node_dict(n, compact, &root)).collect();
-    let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_dict(n, compact, &root)).collect();
+    let prefix = if compact { Some(NormalizedPrefix::new(&root)) } else { None };
+    let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(|n| node_dict_batch(n, compact, &prefix)).collect();
+    let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_dict_batch(n, compact, &prefix)).collect();
     let edge_dicts: Vec<Value> = impact.edges.iter().map(edge_to_dict).collect();
 
     let mut summary_parts = vec![
@@ -573,12 +584,16 @@ pub fn get_review_context(
 
     let impact = store.get_impact_radius(&abs_files, max_depth, 500, None)?;
 
+    let rc_prefix = if compact { Some(NormalizedPrefix::new(&root)) } else { None };
+    let rc_changed: Vec<Value> = impact.changed_nodes.iter().map(|n| node_dict_batch(n, compact, &rc_prefix)).collect();
+    let rc_impacted: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_dict_batch(n, compact, &rc_prefix)).collect();
+
     let mut context = json!({
         "changed_files": files,
         "impacted_files": impact.impacted_files,
         "graph": {
-            "changed_nodes": impact.changed_nodes.iter().map(|n| node_to_dict(n, compact)).collect::<Vec<_>>(),
-            "impacted_nodes": impact.impacted_nodes.iter().map(|n| node_to_dict(n, compact)).collect::<Vec<_>>(),
+            "changed_nodes": rc_changed,
+            "impacted_nodes": rc_impacted,
             "edges": impact.edges.iter().map(edge_to_dict).collect::<Vec<_>>(),
         },
     });

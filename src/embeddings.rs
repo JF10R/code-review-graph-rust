@@ -826,9 +826,10 @@ pub fn semantic_search(
         Some(p) => p,
         None => {
             let nodes = store.search_nodes(query, limit)?;
+            let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
             return Ok(nodes.iter().map(|n| {
                 let mut d = node_to_dict(n, compact);
-                if compact { crate::types::strip_paths_prefix(&mut d, repo_root); }
+                if let Some(ref p) = prefix { p.strip(&mut d); }
                 d
             }).collect());
         }
@@ -874,11 +875,12 @@ fn nodes_from_scored(
     compact: bool,
     repo_root: &std::path::Path,
 ) -> Result<Vec<serde_json::Value>> {
+    let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
     let mut results = Vec::with_capacity(scored.len());
     for (qn, score) in scored {
         if let Some(node) = store.get_node(&qn)? {
             let mut d = node_to_dict(&node, compact);
-            if compact { crate::types::strip_paths_prefix(&mut d, repo_root); }
+            if let Some(ref p) = prefix { p.strip(&mut d); }
             d["similarity_score"] =
                 serde_json::Value::from((score * 10_000.0).round() / 10_000.0);
             results.push(d);

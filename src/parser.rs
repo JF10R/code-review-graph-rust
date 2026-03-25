@@ -1170,6 +1170,20 @@ fn walk_for_framework_edges(
     file_path: &str,
     edges: &mut Vec<EdgeInfo>,
 ) {
+    walk_for_framework_edges_inner(node, source, nodes, file_path, edges, 0);
+}
+
+fn walk_for_framework_edges_inner(
+    node: &Node,
+    source: &[u8],
+    nodes: &[NodeInfo],
+    file_path: &str,
+    edges: &mut Vec<EdgeInfo>,
+    depth: usize,
+) {
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
     let node_type = node.kind();
 
     // Pattern 1: JSX component instantiation — <ComponentName /> or <ComponentName>
@@ -1177,11 +1191,23 @@ fn walk_for_framework_edges(
     if matches!(node_type, "jsx_self_closing_element" | "jsx_opening_element") {
         let mut cur = node.walk();
         let component_name: Option<String> = node.children(&mut cur).find_map(|child| {
-            let text = node_text(&child, source);
-            if matches!(child.kind(), "identifier" | "member_expression")
-                && text.chars().next().map_or(false, |c| c.is_uppercase())
-            {
-                Some(text.to_string())
+            let kind = child.kind();
+            if kind == "identifier" {
+                let text = node_text(&child, source);
+                if text.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    Some(text.to_string())
+                } else {
+                    None
+                }
+            } else if kind == "member_expression" {
+                // <UI.Button /> → extract "Button" (last segment)
+                let full = node_text(&child, source);
+                let last = full.rsplit('.').next().unwrap_or(full);
+                if last.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    Some(last.to_string())
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1246,7 +1272,7 @@ fn walk_for_framework_edges(
 
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        walk_for_framework_edges(&child, source, nodes, file_path, edges);
+        walk_for_framework_edges_inner(&child, source, nodes, file_path, edges, depth + 1);
     }
 }
 
