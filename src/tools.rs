@@ -965,12 +965,17 @@ pub fn get_docs_section(section_name: &str, repo_root: Option<&str>) -> Result<V
 // Tool 10: hybrid_query
 // ---------------------------------------------------------------------------
 
-/// Merge graph keyword search with semantic search via Reciprocal Rank Fusion.
+/// Merge graph keyword search with semantic search via configurable fusion.
 ///
-/// RRF score formula: Σ 1 / (k + rank_i)  where k = 60 (standard constant).
+/// Supports two fusion modes via the `fusion` parameter:
+/// - `"rrf"` (default): Reciprocal Rank Fusion — Σ 1 / (k + rank_i), k = 60.
+///   Results include an `rrf_score` field.
+/// - `"cc"`: Convex Combination — min-max normalised scores combined as
+///   α·keyword + (1-α)·semantic, α = 0.5. Results include a `cc_score` field.
 ///
 /// Falls back to keyword-only when no embeddings are available, and sets
 /// `method: "keyword_only"` in the returned JSON to signal this.
+/// CC mode also falls back to RRF when embeddings are unavailable.
 pub fn hybrid_query(
     query: &str,
     limit: usize,
@@ -1021,6 +1026,12 @@ pub fn hybrid_query_with_store(
     let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
 
     let fusion_method = fusion.unwrap_or("rrf");
+    if fusion_method != "rrf" && fusion_method != "cc" {
+        return Ok(json!({
+            "status": "error",
+            "message": format!("Unknown fusion method '{}'; expected 'rrf' or 'cc'", fusion_method),
+        }));
+    }
 
     // Convex combination (CC): inverse-rank scores min-max normalised to [0,1],
     // then linearly combined as alpha*kw + (1-alpha)*sem.
@@ -1102,9 +1113,9 @@ pub fn hybrid_query_with_store(
         (method, ranked)
     };
 
-    // Use fusion_method (not method) to determine the score field name — method can be
-    // "keyword_only" for both paths when embeddings are absent, so fusion_method is canonical.
-    let score_field = if fusion_method == "cc" { "cc_score" } else { "rrf_score" };
+    // Derive score field from the algorithm actually executed, not the requested fusion —
+    // CC falls back to RRF when embeddings are absent, so method is the source of truth.
+    let score_field = if method == "hybrid_cc" { "cc_score" } else { "rrf_score" };
 
     let results: Vec<Value> = ranked
         .iter()
