@@ -108,16 +108,19 @@ const SCM_SOURCES: &[(&str, &str)] = &[
     ("php",        include_str!("../queries/php.scm")),
 ];
 
+type ScmSets = (HashSet<String>, HashSet<String>, HashSet<String>, HashSet<String>, HashSet<String>);
+
 /// Parse a `.scm` source and collect node-kind names per tag category into
-/// four `HashSet`s: (classes, functions, imports, calls).
+/// five `HashSet`s: (classes, functions, imports, calls, types).
 ///
 /// Only the outermost node kind (first bare word inside the leading `(`) of
 /// each S-expression line is collected; child field constraints are ignored.
-fn parse_scm(scm: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>, HashSet<String>) {
+fn parse_scm(scm: &str) -> ScmSets {
     let mut cls:  HashSet<String> = HashSet::new();
     let mut func: HashSet<String> = HashSet::new();
     let mut imp:  HashSet<String> = HashSet::new();
     let mut call: HashSet<String> = HashSet::new();
+    let mut typ:  HashSet<String> = HashSet::new();
 
     let mut current_kind: Option<String> = None;
 
@@ -149,6 +152,8 @@ fn parse_scm(scm: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>, H
                 imp.insert(kind);
             } else if line.contains("@reference.call") {
                 call.insert(kind);
+            } else if line.contains("@definition.type") {
+                typ.insert(kind);
             } else {
                 // Tag not found on this line yet — put the kind back.
                 current_kind = Some(kind);
@@ -156,7 +161,7 @@ fn parse_scm(scm: &str) -> (HashSet<String>, HashSet<String>, HashSet<String>, H
         }
     }
 
-    (cls, func, imp, call)
+    (cls, func, imp, call, typ)
 }
 
 /// Pre-computed node-kind sets for a single language, derived from the
@@ -167,18 +172,20 @@ struct CompiledQueries {
     func: HashSet<String>,
     imp:  HashSet<String>,
     call: HashSet<String>,
+    typ:  HashSet<String>,
 }
 
 impl CompiledQueries {
     fn from_scm(scm: &str) -> Self {
-        let (cls, func, imp, call) = parse_scm(scm);
-        Self { cls, func, imp, call }
+        let (cls, func, imp, call, typ) = parse_scm(scm);
+        Self { cls, func, imp, call, typ }
     }
 
     #[inline] fn is_class(&self, kind: &str)    -> bool { self.cls.contains(kind)  }
     #[inline] fn is_func(&self, kind: &str)     -> bool { self.func.contains(kind) }
     #[inline] fn is_import(&self, kind: &str)   -> bool { self.imp.contains(kind)  }
     #[inline] fn is_call(&self, kind: &str)     -> bool { self.call.contains(kind) }
+    #[inline] fn is_type(&self, kind: &str)     -> bool { self.typ.contains(kind)  }
 }
 
 // Lazily-built cache: one CompiledQueries per language, constructed at most once.
@@ -909,6 +916,84 @@ fn extract_from_tree(
                 }
 
                 extract_from_tree(&child, ctx, nodes, edges, Some(&name), None, depth + 1);
+                continue;
+            }
+        }
+
+        // --- Types (interfaces, type aliases) ---
+        if lt.is_type(node_type) {
+            if let Some(name) = get_name(&child, language, "type", source) {
+                let line_start = child.start_position().row + 1;
+                let line_end = child.end_position().row + 1;
+                let qualified = qualify(&name, file_path, enclosing_class);
+
+                nodes.push(NodeInfo {
+                    name: name.clone(),
+                    qualified_name: qualified.clone(),
+                    kind: NodeKind::Type,
+                    file_path: file_path.to_string(),
+                    line_start,
+                    line_end,
+                    language: language.to_string(),
+                    is_test: false,
+                    docstring: String::new(),
+                    signature: String::new(),
+                    body_hash: body_hash(&source[child.byte_range()]),
+                });
+
+                edges.push(EdgeInfo {
+                    source_qualified: file_path.to_string(),
+                    target_qualified: qualified.clone(),
+                    kind: EdgeKind::Contains,
+                    file_path: file_path.to_string(),
+                    line: line_start,
+                });
+
+                // For interface declarations, index direct property signatures.
+                if node_type == "interface_declaration" {
+                    // Tree: interface_declaration -> interface_body -> property_signature
+                    // (interface_body is the direct child containing the members)
+                    let mut outer_cur = child.walk();
+                    for body_child in child.children(&mut outer_cur) {
+                        if body_child.kind() == "interface_body" || body_child.kind() == "object_type" {
+                            let mut body_cur = body_child.walk();
+                            for member in body_child.children(&mut body_cur) {
+                                if member.kind() == "property_signature" {
+                                    let prop_name = get_name(&member, language, "type", source)
+                                        .unwrap_or_default();
+                                    if prop_name.is_empty() {
+                                        continue;
+                                    }
+                                    let prop_qn = format!("{file_path}::{name}.{prop_name}");
+                                    let prop_sig = node_text(&member, source).to_string();
+
+                                    nodes.push(NodeInfo {
+                                        name: prop_name,
+                                        qualified_name: prop_qn.clone(),
+                                        kind: NodeKind::Type,
+                                        file_path: file_path.to_string(),
+                                        line_start: member.start_position().row + 1,
+                                        line_end: member.end_position().row + 1,
+                                        language: language.to_string(),
+                                        is_test: false,
+                                        docstring: String::new(),
+                                        signature: prop_sig,
+                                        body_hash: body_hash(&source[member.byte_range()]),
+                                    });
+
+                                    edges.push(EdgeInfo {
+                                        source_qualified: qualified.clone(),
+                                        target_qualified: prop_qn,
+                                        kind: EdgeKind::Contains,
+                                        file_path: file_path.to_string(),
+                                        line: member.start_position().row + 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 continue;
             }
         }
@@ -2262,5 +2347,70 @@ def test_query(db_connection):
             })
             .collect();
         assert!(!calls.is_empty(), "expected CALLS edge from test_query to pytest fixture db_connection");
+    }
+
+    // -----------------------------------------------------------------------
+    // TypeScript: interface / type-alias indexing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn typescript_interface_produces_type_node() {
+        if !grammar_available("ts") { return; }
+        let src = r#"
+export interface UserConfig {
+    name: string;
+    age: number;
+    experimental: {
+        turbopackUseBuiltinSass: boolean;
+    };
+}
+"#;
+        let (nodes, _edges) = parse("config.ts", src);
+        let type_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
+        assert!(!type_nodes.is_empty(), "expected at least one Type node");
+        assert!(type_nodes.iter().any(|n| n.name == "UserConfig"), "expected UserConfig interface");
+    }
+
+    #[test]
+    fn typescript_type_alias_produces_type_node() {
+        if !grammar_available("ts") { return; }
+        let src = r#"
+type Theme = "light" | "dark";
+type Config = { debug: boolean };
+"#;
+        let (nodes, _) = parse("types.ts", src);
+        let type_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
+        assert!(type_nodes.iter().any(|n| n.name == "Theme"), "expected Theme type alias");
+        assert!(type_nodes.iter().any(|n| n.name == "Config"), "expected Config type alias");
+    }
+
+    #[test]
+    fn typescript_interface_properties_indexed() {
+        if !grammar_available("ts") { return; }
+        let src = r#"
+export interface ExperimentalConfig {
+    turbopackUseBuiltinSass: boolean;
+    sassOptions: object;
+    useLightningcss: boolean;
+}
+"#;
+        let (nodes, edges) = parse("config.ts", src);
+        let type_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
+
+        // Parent interface node
+        assert!(type_nodes.iter().any(|n| n.name == "ExperimentalConfig"),
+            "expected ExperimentalConfig interface node");
+
+        // Property nodes
+        assert!(type_nodes.iter().any(|n| n.name == "turbopackUseBuiltinSass"),
+            "expected turbopackUseBuiltinSass property node");
+        assert!(type_nodes.iter().any(|n| n.name == "sassOptions"),
+            "expected sassOptions property node");
+
+        // Contains edges from interface to properties
+        let contains_edges: Vec<_> = edges.iter()
+            .filter(|e| e.kind == EdgeKind::Contains && e.source_qualified.contains("ExperimentalConfig"))
+            .collect();
+        assert!(contains_edges.len() >= 2, "expected Contains edges from interface to properties");
     }
 }
