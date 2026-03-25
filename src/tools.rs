@@ -1136,10 +1136,11 @@ pub fn hybrid_query_with_store(
         classification.route
     };
 
-    // Keyword results (used by most routes)
+    // Keyword results (used by most routes).
+    // Use relaxed OR-matching for natural-language queries when Tantivy is unavailable.
     let keyword_hits = match keyword_hits {
         Some(hits) => hits,
-        None => store.search_nodes(query, limit * 2)?,
+        None => store.search_nodes_relaxed(query, limit * 2)?,
     };
     let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
 
@@ -1151,7 +1152,8 @@ pub fn hybrid_query_with_store(
         }));
     }
 
-    let (method, ranked): (&str, Vec<(String, f64)>) = match effective_route {
+    // Try specialized route first; fall through to General if it returns empty.
+    let (specialized_method, specialized_ranked): (Option<&str>, Vec<(String, f64)>) = match effective_route {
         QueryRoute::ExactSymbol => {
             // Keyword-only: no semantic search needed for exact identifiers
             let mut scores: Vec<(String, f64)> = keyword_hits
@@ -1163,7 +1165,7 @@ pub fn hybrid_query_with_store(
                 })
                 .collect();
             scores.truncate(limit);
-            ("keyword_only", scores)
+            (Some("keyword_only"), scores)
         }
 
         QueryRoute::FilePath => {
@@ -1183,7 +1185,7 @@ pub fn hybrid_query_with_store(
                 .collect();
             scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scores.truncate(limit);
-            ("keyword_path_boosted", scores)
+            (Some("keyword_path_boosted"), scores)
         }
 
         QueryRoute::ConfigLookup => {
@@ -1199,84 +1201,91 @@ pub fn hybrid_query_with_store(
                 .collect();
             scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scores.truncate(limit);
-            ("keyword_config_boosted", scores)
+            (Some("keyword_config_boosted"), scores)
         }
 
-        QueryRoute::Causal | QueryRoute::General => {
-            // Full hybrid: existing keyword + semantic + fusion (legacy behavior)
-            if fusion_method == "cc" && embeddings_available {
-                const ALPHA: f64 = 0.5;
+        QueryRoute::Causal | QueryRoute::General => (None, vec![]),
+    };
 
-                let mut keyword_scores: HashMap<String, f64> = HashMap::new();
-                for (rank, node) in keyword_hits.iter().enumerate() {
-                    keyword_scores.insert(node.qualified_name.clone(), 1.0 / (1.0 + rank as f64));
+    // Use specialized result if non-empty, otherwise fall through to General.
+    let use_general = specialized_method.is_none() || specialized_ranked.is_empty();
+
+    let (method, ranked): (&str, Vec<(String, f64)>) = if !use_general {
+        (specialized_method.unwrap(), specialized_ranked)
+    } else {
+        // General / fallback: full hybrid keyword + semantic + fusion
+        if fusion_method == "cc" && embeddings_available {
+            const ALPHA: f64 = 0.5;
+
+            let mut keyword_scores: HashMap<String, f64> = HashMap::new();
+            for (rank, node) in keyword_hits.iter().enumerate() {
+                keyword_scores.insert(node.qualified_name.clone(), 1.0 / (1.0 + rank as f64));
+            }
+
+            let mut semantic_scores: HashMap<String, f64> = HashMap::new();
+            let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
+            for (rank, hit) in semantic_hits.iter().enumerate() {
+                if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
+                    semantic_scores.insert(qn.to_string(), 1.0 / (1.0 + rank as f64));
                 }
+            }
 
-                let mut semantic_scores: HashMap<String, f64> = HashMap::new();
+            // Min-max normalise a score map to [0, 1]. All-equal scores map to 1.
+            let normalize = |scores: &HashMap<String, f64>| -> HashMap<String, f64> {
+                if scores.is_empty() {
+                    return HashMap::new();
+                }
+                let min = scores.values().cloned().fold(f64::INFINITY, f64::min);
+                let max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let range = max - min;
+                if range < f64::EPSILON {
+                    scores.keys().map(|k| (k.clone(), 1.0)).collect()
+                } else {
+                    scores.iter().map(|(k, v)| (k.clone(), (v - min) / range)).collect()
+                }
+            };
+
+            let kw_norm = normalize(&keyword_scores);
+            let sem_norm = normalize(&semantic_scores);
+
+            let all_qns: HashSet<&String> = kw_norm.keys().chain(sem_norm.keys()).collect();
+            let mut combined: Vec<(String, f64)> = all_qns
+                .into_iter()
+                .map(|qn| {
+                    let kw = kw_norm.get(qn).copied().unwrap_or(0.0);
+                    let sem = sem_norm.get(qn).copied().unwrap_or(0.0);
+                    (qn.clone(), ALPHA * kw + (1.0 - ALPHA) * sem)
+                })
+                .collect();
+
+            combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            combined.truncate(limit);
+            ("hybrid_cc", combined)
+        } else {
+            let mut rrf_scores: HashMap<String, f64> = HashMap::new();
+
+            for (rank, node) in keyword_hits.iter().enumerate() {
+                let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
+            }
+
+            let method = if embeddings_available {
                 let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
                 for (rank, hit) in semantic_hits.iter().enumerate() {
                     if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
-                        semantic_scores.insert(qn.to_string(), 1.0 / (1.0 + rank as f64));
+                        let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                        *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
                     }
                 }
-
-                // Min-max normalise a score map to [0, 1]. All-equal scores map to 1.
-                let normalize = |scores: &HashMap<String, f64>| -> HashMap<String, f64> {
-                    if scores.is_empty() {
-                        return HashMap::new();
-                    }
-                    let min = scores.values().cloned().fold(f64::INFINITY, f64::min);
-                    let max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let range = max - min;
-                    if range < f64::EPSILON {
-                        scores.keys().map(|k| (k.clone(), 1.0)).collect()
-                    } else {
-                        scores.iter().map(|(k, v)| (k.clone(), (v - min) / range)).collect()
-                    }
-                };
-
-                let kw_norm = normalize(&keyword_scores);
-                let sem_norm = normalize(&semantic_scores);
-
-                let all_qns: HashSet<&String> = kw_norm.keys().chain(sem_norm.keys()).collect();
-                let mut combined: Vec<(String, f64)> = all_qns
-                    .into_iter()
-                    .map(|qn| {
-                        let kw = kw_norm.get(qn).copied().unwrap_or(0.0);
-                        let sem = sem_norm.get(qn).copied().unwrap_or(0.0);
-                        (qn.clone(), ALPHA * kw + (1.0 - ALPHA) * sem)
-                    })
-                    .collect();
-
-                combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                combined.truncate(limit);
-                ("hybrid_cc", combined)
+                "hybrid_rrf"
             } else {
-                let mut rrf_scores: HashMap<String, f64> = HashMap::new();
+                "keyword_only"
+            };
 
-                for (rank, node) in keyword_hits.iter().enumerate() {
-                    let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-                    *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
-                }
-
-                let method = if embeddings_available {
-                    let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
-                    for (rank, hit) in semantic_hits.iter().enumerate() {
-                        if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
-                            let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-                            *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
-                        }
-                    }
-                    "hybrid_rrf"
-                } else {
-                    "keyword_only"
-                };
-
-                let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
-                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                ranked.truncate(limit);
-                (method, ranked)
-            }
+            let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.truncate(limit);
+            (method, ranked)
         }
     };
 

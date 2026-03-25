@@ -372,6 +372,111 @@ impl GraphStore {
         Ok(results.into_iter().map(|(_, n)| n).collect())
     }
 
+    /// Search for nodes using relaxed OR-matching suitable for natural-language queries.
+    ///
+    /// Unlike `search_nodes` (AND-logic: all words must match), this method:
+    /// 1. Filters English stop words from the query
+    /// 2. Uses OR logic: nodes matching *any* remaining term qualify
+    /// 3. Scores by match ratio (matched terms / total terms) combined with tier
+    /// 4. Falls back to `search_nodes` for short queries (≤ 3 words after filtering)
+    ///
+    /// Designed for `hybrid_query` where the input is a bug description or
+    /// natural-language question rather than a targeted symbol lookup.
+    pub fn search_nodes_relaxed(&self, query: &str, limit: usize) -> Result<Vec<GraphNode>> {
+        const STOP_WORDS: &[&str] = &[
+            "a", "an", "the", "in", "on", "at", "to", "for", "is", "it", "of",
+            "and", "or", "not", "with", "from", "by", "as", "be", "was", "that",
+            "this", "which", "when", "where", "how", "what", "who", "why", "does",
+            "do", "did", "has", "have", "had", "can", "could", "will", "would",
+            "should", "may", "might", "are", "were", "been", "being", "into",
+            "after", "before", "between", "through", "during", "about", "than",
+            "both", "each", "all", "any", "some", "most", "other", "such", "only",
+            "very", "more", "also", "just", "so", "up", "out", "if", "then", "but",
+            "its", "no", "because", "instead", "due", "via", "using", "causes",
+            "cause", "causing", "breaks", "break", "fails", "fail", "returns",
+            "return", "incorrectly", "correctly",
+        ];
+
+        let words: Vec<String> = query
+            .split_whitespace()
+            .map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w.as_str()))
+            .collect();
+
+        // For short filtered queries, delegate to strict AND search
+        if words.len() <= 3 {
+            return self.search_nodes(query, limit);
+        }
+
+        let total = words.len() as f64;
+
+        // Minimum: at least 1 non-stop-word must match. Scoring (match ratio)
+        // handles ranking; a hard floor > 1 drops too many relevant nodes whose
+        // names share only one domain-specific term with the query.
+        let min_matches = 1usize;
+
+        let mut results: Vec<(f64, GraphNode)> = self
+            .data
+            .node_index
+            .iter()
+            .filter_map(|(_, &idx)| {
+                let (name_lower, qn_lower, path_lower) =
+                    self.data.lowercase_cache.get(&idx)?;
+
+                let match_count = words.iter().filter(|w| {
+                    name_lower.contains(w.as_str())
+                        || qn_lower.contains(w.as_str())
+                        || path_lower.contains(w.as_str())
+                }).count();
+
+                if match_count < min_matches {
+                    return None;
+                }
+
+                let match_ratio = match_count as f64 / total;
+
+                // Tier: name matches score higher than path-only matches
+                let name_matches = words.iter().filter(|w| {
+                    name_lower.contains(w.as_str()) || qn_lower.contains(w.as_str())
+                }).count();
+                let name_ratio = name_matches as f64 / total;
+
+                // Demote compiled/minified paths
+                let compiled_penalty = if path_lower.contains("/compiled/")
+                    || path_lower.starts_with("compiled/")
+                    || path_lower.contains("/node_modules/")
+                    || path_lower.starts_with("node_modules/")
+                    || path_lower.contains("/.next/")
+                    || path_lower.starts_with(".next/")
+                {
+                    0.5
+                } else {
+                    1.0
+                };
+
+                // Demote test nodes slightly (bounded: 0.8x, not a hard filter)
+                let test_penalty = if matches!(self.data.graph[idx].kind, crate::types::NodeKind::Test) {
+                    0.8
+                } else {
+                    1.0
+                };
+
+                // Score: weighted combination of match ratio + name-specificity
+                let score = (0.6 * match_ratio + 0.4 * name_ratio)
+                    * compiled_penalty
+                    * test_penalty;
+
+                Some((score, self.data.graph[idx].clone()))
+            })
+            .collect();
+
+        // Sort by score descending
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name)));
+        results.truncate(limit);
+        Ok(results.into_iter().map(|(_, n)| n).collect())
+    }
+
     /// Get nodes exceeding a line count threshold, ordered by size descending.
     pub fn get_nodes_by_size(
         &self,
@@ -1845,5 +1950,125 @@ mod tests {
         assert_eq!(result.len(), 1, "only A→B should be returned; B→C is excluded");
         assert_eq!(result[0].source_qualified, "f.py::a");
         assert_eq!(result[0].target_qualified, "f.py::b");
+    }
+
+    // -----------------------------------------------------------------------
+    // search_nodes_relaxed — OR-matching for natural-language queries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn relaxed_search_finds_nodes_with_long_nl_query() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![
+            make_node(
+                "KeybindingResolver",
+                "src/keybinding/keybindingResolver.ts::KeybindingResolver",
+                "src/keybinding/keybindingResolver.ts",
+                NodeKind::Class,
+            ),
+            make_node(
+                "unrelated_function",
+                "src/utils.ts::unrelated_function",
+                "src/utils.ts",
+                NodeKind::Function,
+            ),
+        ];
+        store
+            .store_file_nodes_edges("src/keybinding/keybindingResolver.ts", &nodes[..1], &[], "h1")
+            .unwrap();
+        store
+            .store_file_nodes_edges("src/utils.ts", &nodes[1..], &[], "h2")
+            .unwrap();
+
+        // This NL query has many words — search_nodes (AND logic) would return empty.
+        let nl_query = "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key";
+        let strict = store.search_nodes(nl_query, 10).unwrap();
+        assert!(strict.is_empty(), "AND-logic search_nodes should return empty for long NL query");
+
+        let relaxed = store.search_nodes_relaxed(nl_query, 10).unwrap();
+        assert!(!relaxed.is_empty(), "relaxed search should find results for NL query");
+        assert_eq!(
+            relaxed[0].name, "KeybindingResolver",
+            "KeybindingResolver should be the top result"
+        );
+    }
+
+    #[test]
+    fn relaxed_search_delegates_short_queries_to_strict() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![make_node(
+            "FooBar",
+            "f.py::FooBar",
+            "f.py",
+            NodeKind::Function,
+        )];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &[], "h1")
+            .unwrap();
+
+        // Short query (1-3 words after stop-word filtering) should use AND logic
+        let results = store.search_nodes_relaxed("FooBar", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "FooBar");
+    }
+
+    #[test]
+    fn relaxed_search_filters_stop_words() {
+        let (mut store, _dir) = test_store();
+        let nodes = vec![make_node(
+            "deployment_controller",
+            "pkg/controller/deployment/deployment_controller.go::DeploymentController",
+            "pkg/controller/deployment/deployment_controller.go",
+            NodeKind::Class,
+        )];
+        store
+            .store_file_nodes_edges(
+                "pkg/controller/deployment/deployment_controller.go",
+                &nodes,
+                &[],
+                "h1",
+            )
+            .unwrap();
+
+        // "the", "when", "is", "and" are stop words; "deployment", "controller" are kept
+        let query = "Deployment controller stalls when the rolling update is zero and pod readiness probe begins failing";
+        let results = store.search_nodes_relaxed(query, 10).unwrap();
+        assert!(!results.is_empty(), "should find deployment_controller after stop-word filtering");
+    }
+
+    #[test]
+    fn relaxed_search_demotes_test_nodes() {
+        let (mut store, _dir) = test_store();
+        // Both nodes match exactly the same terms so the test penalty is the tiebreaker.
+        let source_node = make_node(
+            "ssl_verify_context",
+            "httpx/_config.py::ssl_verify_context",
+            "httpx/_config.py",
+            NodeKind::Function,
+        );
+        let mut test_info = make_node(
+            "test_ssl_verify_context",
+            "tests/test_config.py::test_ssl_verify_context",
+            "tests/test_config.py",
+            NodeKind::Function,
+        );
+        test_info.kind = NodeKind::Test;
+        let test_node = test_info;
+        store
+            .store_file_nodes_edges("httpx/_config.py", &[source_node], &[], "h1")
+            .unwrap();
+        store
+            .store_file_nodes_edges("tests/test_config.py", &[test_node], &[], "h2")
+            .unwrap();
+
+        // Both nodes match "ssl" and "verify". The test penalty (0.8x) should
+        // make the source node rank higher when match counts are equal.
+        let query = "SSL verification fails when verify is false and a client certificate provided at the same time";
+        let results = store.search_nodes_relaxed(query, 10).unwrap();
+        assert!(results.len() >= 2, "should find both source and test nodes");
+        assert_eq!(
+            results[0].file_path, "httpx/_config.py",
+            "source file should rank above test file when match counts are equal"
+        );
     }
 }
