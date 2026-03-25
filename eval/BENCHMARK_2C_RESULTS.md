@@ -259,3 +259,67 @@ Multiple levers could improve the remaining 23 misses — no single one is estab
 - Route-specific ranking fixes (FilePath/ConfigLookup results are plausible but imprecise)
 - Richer edges/context (neighborhood hits suggest the right package is found, not the right file)
 - Building embeddings for vscode/kubernetes/rust (adds semantic signal to keyword_only queries)
+
+---
+
+## Post-Phase 3 Re-Benchmark (scorer fix + graph expansion + evidence)
+
+**Binary:** v1.4.0 with PRs #25 (scorer fix), #26 (evidence), #27 (graph expansion)
+
+### Lite Eval (28-case gold set, file mode)
+
+```
+Hit@5: 10/28 (35.7%)
+MRR:   0.262
+```
+
+| Version | Hit@5 | MRR | Key Change |
+|---------|-------|-----|------------|
+| Pre-fix (2c baseline) | 2/28 (7.1%) | 0.071 | — |
+| Post-fix (relaxed search) | 5/28 (17.9%) | 0.137 | OR-matching, empty fallback |
+| File mode v1 (fanout+rerank) | 8/28 (28.6%) | 0.226 | Multi-channel fanout |
+| **File mode v2 (+ scorer + expansion)** | **10/28 (35.7%)** | **0.262** | KeywordExact boost, graph expansion |
+
+Changes from file mode v1:
+- nextjs-001: MISS → **HIT@4** (scorer fix helped CSS index.ts surface)
+- nextjs-004: HIT@2 → **HIT@1** (improved)
+- nextjs-011: HIT@2 → **HIT@1** (improved)
+- rust-002: MISS (regression) → **HIT@4** (scorer fix restored)
+
+### Full Agent Benchmarks (natural prompts, Sonnet, Next.js)
+
+**Simple Issue (#91862 — SASS decimal precision)**
+
+| Metric | V2 Old MCP (v1) | V2 New MCP (v3) | **Current** |
+|--------|----------------|-----------------|-------------|
+| Duration | 6.8 min | 11.2 min | **9.0 min** |
+| Tool calls | 113 | 219 | **127** |
+| Tokens | 128,818 | 119,691 | **119,789** |
+| MCP calls | 5 | 16 | **11** |
+| Bash calls | 54 | 128 | **22** |
+| Quality | Excellent | Excellent | **Excellent** |
+
+Agent correctly found turbopackUseBuiltinSass config, traced the Rust SASS compiler path,
+identified that sassOptions.precision isn't handled in the JS layer, and proposed a fix.
+Self-rated "medium confidence" because the Turbopack Rust code isn't in the clone —
+but externally the diagnosis is equivalent to V2 agents. No regression.
+
+Note: 22 Bash calls is a tool UX signal. Agents don't naturally avoid `bash grep`
+in favor of the Grep tool. This is real-world behavior, not optimized away by prompting.
+
+**Complex Issue (#89252 — CSS shared chunks)**
+
+| Metric | V2 Old MCP (v1) | V2 New MCP (v3) | **Current** |
+|--------|----------------|-----------------|-------------|
+| Duration | 7.6 min | 7.4 min | **5.8 min** |
+| Tool calls | 104 | 115 | **68** |
+| Tokens | 137,866 | 140,855 | **114,069** |
+| MCP calls | ~17 | 23 | **12** |
+| Bash calls | ~30 | 3 | **1** |
+| Quality | Good | Excellent | **Excellent** |
+
+Significant improvement: -41% tool calls, -19% tokens, -22% duration.
+Agent traced a complete 8-step causal chain from global-error injection through
+CssChunkingPlugin to blocking stylesheet rendering, with specific line numbers
+at every step. Proposed 5 ranked fix options. Quality matches our posted analysis
+on the GitHub issue, with additional detail on FlightManifestPlugin.entryCSSFiles.
