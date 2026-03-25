@@ -714,12 +714,13 @@ pub fn semantic_search_nodes(
         let _span = tracing::info_span!("embedding_load").entered();
         EmbeddingStore::new(&emb_db_path)?
     };
-    let result = semantic_search_nodes_with_store(&store, &mut emb_store, &root, query, kind, limit, compact)?;
+    let result = semantic_search_nodes_with_store(&store, &mut emb_store, &root, query, kind, limit, compact, None)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn semantic_search_nodes_with_store(
     store: &GraphStore,
     emb_store: &mut EmbeddingStore,
@@ -728,6 +729,7 @@ pub fn semantic_search_nodes_with_store(
     kind: Option<&str>,
     limit: usize,
     compact: bool,
+    keyword_hits: Option<Vec<crate::types::GraphNode>>,
 ) -> Result<Value> {
     let search_mode;
 
@@ -741,7 +743,9 @@ pub fn semantic_search_nodes_with_store(
         raw
     } else {
         search_mode = "keyword";
-        let mut nodes = store.search_nodes(query, limit * 2)?;
+        let mut nodes = keyword_hits.unwrap_or_else(|| {
+            store.search_nodes(query, limit * 2).unwrap_or_default()
+        });
         if let Some(k) = kind {
             nodes.retain(|n| n.kind.as_str() == k);
         }
@@ -997,12 +1001,13 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_query_with_store(
     store: &GraphStore,
     emb_store: &mut EmbeddingStore,
@@ -1011,6 +1016,7 @@ pub fn hybrid_query_with_store(
     limit: usize,
     compact: bool,
     fusion: Option<&str>,
+    keyword_hits: Option<Vec<crate::types::GraphNode>>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1022,7 +1028,9 @@ pub fn hybrid_query_with_store(
     }
 
     // Keyword results (used by both fusion modes)
-    let keyword_hits = store.search_nodes(query, limit * 2)?;
+    let keyword_hits = keyword_hits.unwrap_or_else(|| {
+        store.search_nodes(query, limit * 2).unwrap_or_default()
+    });
     let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
 
     let fusion_method = fusion.unwrap_or("rrf");
