@@ -196,6 +196,12 @@ struct HybridQueryParams {
     #[schemars(description = "Internal: fusion method. Leave unset to use the default (RRF).")]
     #[serde(default)]
     fusion: Option<String>,
+    #[schemars(description = "Routing strategy: 'auto' (default, classifies query and picks best approach), 'legacy' (current RRF, no classification), 'exact' (keyword-only), 'semantic' (semantic-only), 'path' (boost file/path matches).")]
+    #[serde(default)]
+    route: Option<String>,
+    #[schemars(description = "When true, include _debug metadata showing which route fired and classification confidence.")]
+    #[serde(default)]
+    debug: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -287,6 +293,8 @@ enum WorkerCommand {
         limit: usize,
         compact: bool,
         fusion: Option<String>,
+        route: Option<String>,
+        debug: Option<bool>,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
     },
     ListStats {
@@ -457,11 +465,11 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 let _ = reply.send(result);
             }
 
-            WorkerCommand::HybridQuery { query, limit, compact, fusion, reply } => {
+            WorkerCommand::HybridQuery { query, limit, compact, fusion, route, debug, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
                 let kw_hits = kw_hits!(&query, limit * 2);
                 let result = crate::tools::hybrid_query_with_store(
-                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits,
+                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug,
                 ).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
@@ -982,11 +990,13 @@ impl CodeReviewServer {
                 limit: p.limit,
                 compact: p.compact,
                 fusion: p.fusion,
+                route: p.route,
+                debug: p.debug,
                 reply,
             }).await
         } else {
             self.spawn_blocking_fallback(move || {
-                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact, p.fusion.as_deref())
+                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact, p.fusion.as_deref(), p.route.as_deref(), p.debug)
             }).await
         }
     }
