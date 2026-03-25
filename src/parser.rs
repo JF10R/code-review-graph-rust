@@ -1464,11 +1464,45 @@ impl CodeParser {
         let file_path = path.to_string_lossy().replace('\\', "/");
         let file_path = file_path.as_str();
 
-        // --- Vue SFC: 2-pass parse ---
+        // --- Vue SFC: 2-pass parse (no tree-sitter Tree returned) ---
         // Pass 1: regex-extract the <script> block.
         // Pass 2: re-parse that content with the JS/TS grammar.
         if language == "vue" {
             return self.parse_vue_sfc(path, source, file_path);
+        }
+
+        let (nodes, edges, _tree) = self.parse_bytes_with_tree(path, source, None)?;
+        Ok((nodes, edges))
+    }
+
+    /// Parse source bytes with optional old tree for incremental re-parsing.
+    ///
+    /// When `old_tree` is `Some`, tree-sitter reuses unchanged AST regions,
+    /// reducing parse time from ~5 ms to <1 ms for typical edits.
+    ///
+    /// Returns `(nodes, edges, new_tree)` so the caller can cache the tree.
+    /// Vue SFC files are not supported — use `parse_bytes` for Vue instead.
+    pub fn parse_bytes_with_tree(
+        &self,
+        path: &Path,
+        source: &[u8],
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> Result<(Vec<NodeInfo>, Vec<EdgeInfo>, tree_sitter::Tree)> {
+        let language = match detect_language(path) {
+            Some(l) => l,
+            None => {
+                return Err(CrgError::TreeSitter(
+                    "no language detected for incremental parse".into(),
+                ))
+            }
+        };
+
+        // Vue SFC uses a two-pass path that doesn't produce a single Tree.
+        // Callers must use parse_bytes for Vue files.
+        if language == "vue" {
+            return Err(CrgError::TreeSitter(
+                "incremental parse not supported for Vue SFC".into(),
+            ));
         }
 
         let mut parser = make_parser(language).ok_or_else(|| {
@@ -1476,9 +1510,11 @@ impl CodeParser {
         })?;
 
         let tree = parser
-            .parse(source, None)
+            .parse(source, old_tree)
             .ok_or_else(|| CrgError::TreeSitter("parse returned None".into()))?;
 
+        let file_path = path.to_string_lossy().replace('\\', "/");
+        let file_path = file_path.as_str();
         let root = tree.root_node();
         let test_file = is_test_file(file_path);
         let line_count = source.iter().filter(|&&b| b == b'\n').count() + 1;
@@ -1486,7 +1522,6 @@ impl CodeParser {
         let mut nodes: Vec<NodeInfo> = Vec::new();
         let mut edges: Vec<EdgeInfo> = Vec::new();
 
-        // File node
         nodes.push(NodeInfo {
             name: file_path.to_owned(),
             qualified_name: file_path.to_owned(),
@@ -1516,8 +1551,6 @@ impl CodeParser {
         extract_from_tree(&root, &ctx, &mut nodes, &mut edges, None, None, 0);
 
         edges = resolve_call_targets_pass(&nodes, edges);
-
-        // Framework-aware edge inference (JSX, Express, event emitters, pytest)
         edges.extend(framework_edges_pass(&nodes, &tree.root_node(), source, language, file_path));
 
         if test_file {
@@ -1525,7 +1558,7 @@ impl CodeParser {
             edges.extend(tested_by);
         }
 
-        Ok((nodes, edges))
+        Ok((nodes, edges, tree))
     }
 
     /// Vue SFC 2-pass parser: extract `<script>` block, re-parse with JS/TS grammar.

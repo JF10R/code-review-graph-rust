@@ -518,14 +518,19 @@ fn resolve_root(repo_root: Option<&str>) -> PathBuf {
 
 /// Parse `path` from disk and store its nodes/edges into `store`.
 ///
+/// When `old_tree` is `Some`, uses tree-sitter incremental parsing to reuse
+/// unchanged AST regions (~5× faster for typical edits).
+///
 /// Returns `Ok(None)` when the file hash is unchanged (skip).
-/// Returns `Ok(Some((node_count, edge_count)))` on a successful update.
+/// Returns `Ok(Some((node_count, edge_count, new_tree)))` on a successful update.
+/// `new_tree` is `None` for Vue SFC files (incremental parsing unsupported there).
 /// Returns `Err(String)` on failure.
 fn watcher_parse_and_store(
     parser: &crate::parser::CodeParser,
     store: &mut crate::graph::GraphStore,
     path: &std::path::Path,
-) -> Result<Option<(usize, usize)>, String> {
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Result<Option<(usize, usize, Option<tree_sitter::Tree>)>, String> {
     use crate::incremental::{is_binary_pub, sha256_bytes_pub};
     if is_binary_pub(path) {
         return Err(format!("{}: binary file skipped", path.display()));
@@ -539,15 +544,22 @@ fn watcher_parse_and_store(
         return Ok(None);
     }
 
-    let (nodes, edges) = parser
-        .parse_bytes(path, &source)
-        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    // Try incremental parse; fall back to full parse for Vue SFC files.
+    let (nodes, edges, new_tree) = match parser.parse_bytes_with_tree(path, &source, old_tree) {
+        Ok((n, e, t)) => (n, e, Some(t)),
+        Err(_) => {
+            let (n, e) = parser
+                .parse_bytes(path, &source)
+                .map_err(|e| format!("{}: {}", path.display(), e))?;
+            (n, e, None)
+        }
+    };
     let n = nodes.len();
     let e = edges.len();
     store
         .store_file_nodes_edges(&abs_str, &nodes, &edges, &fhash)
         .map_err(|e| format!("{}: {}", path.display(), e))?;
-    Ok(Some((n, e)))
+    Ok(Some((n, e, new_tree)))
 }
 
 /// Spawn a background OS thread that watches `repo_root` for source-file
@@ -564,9 +576,15 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
     use crate::incremental::{get_db_path, load_ignore_patterns_pub, find_dependents};
     use crate::graph::GraphStore;
     use crate::parser::CodeParser;
+    use std::collections::HashMap;
 
     let ignore_patterns = load_ignore_patterns_pub(&repo_root);
     let parser = CodeParser::new();
+
+    // Per-file parse-tree cache for incremental re-parsing.
+    // `tree_sitter::Tree` is `!Send`, but this entire watcher runs on one
+    // dedicated OS thread, so a plain HashMap is safe here.
+    let mut tree_cache: HashMap<String, tree_sitter::Tree> = HashMap::new();
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     let mut debouncer = new_debouncer(Duration::from_millis(300), tx)
@@ -630,6 +648,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
 
         for path in &paths_to_remove {
             let abs_str = path.to_string_lossy().into_owned();
+            tree_cache.remove(&abs_str);
             if let Err(e) = store.remove_file_data(&abs_str) {
                 log::error!("Watcher remove {}: {}", abs_str, e);
             } else {
@@ -649,8 +668,13 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
 
         for path in &paths_to_update {
             let abs_str = path.to_string_lossy().into_owned();
-            match watcher_parse_and_store(&parser, &mut store, path) {
-                Ok(Some((n, e))) => {
+            let old_tree = tree_cache.get(&abs_str);
+            let incremental = old_tree.is_some();
+            match watcher_parse_and_store(&parser, &mut store, path, old_tree) {
+                Ok(Some((n, e, new_tree))) => {
+                    if let Some(t) = new_tree {
+                        tree_cache.insert(abs_str.clone(), t);
+                    }
                     let _ = store.set_metadata(
                         "last_updated",
                         &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -659,7 +683,11 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         .strip_prefix(&repo_root)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
-                    log::info!("Watcher updated: {} ({} nodes, {} edges)", rel, n, e);
+                    log::info!(
+                        "Watcher updated: {} ({} nodes, {} edges, {})",
+                        rel, n, e,
+                        if incremental { "incremental" } else { "full parse" }
+                    );
 
                     // Re-parse dependents so cross-file edges stay fresh.
                     let deps = find_dependents(&store, &abs_str).unwrap_or_default();
@@ -669,11 +697,17 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         }
                         processed.insert(dep_path.clone());
                         let dep = std::path::PathBuf::from(dep_path);
-                        match watcher_parse_and_store(&parser, &mut store, &dep) {
-                            Ok(Some((dn, de))) => log::debug!(
-                                "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
-                                dep_path, dn, de
-                            ),
+                        let dep_old_tree = tree_cache.get(dep_path.as_str());
+                        match watcher_parse_and_store(&parser, &mut store, &dep, dep_old_tree) {
+                            Ok(Some((dn, de, dep_new_tree))) => {
+                                if let Some(t) = dep_new_tree {
+                                    tree_cache.insert(dep_path.clone(), t);
+                                }
+                                log::debug!(
+                                    "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
+                                    dep_path, dn, de
+                                );
+                            }
                             Ok(None) => log::debug!(
                                 "Watcher dependent unchanged (hash match): {}",
                                 dep_path
