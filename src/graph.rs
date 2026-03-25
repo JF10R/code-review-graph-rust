@@ -89,7 +89,7 @@ impl GraphStore {
             match load(db_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Could not load graph from {}: {} — starting empty",
                         db_path.display(),
                         e

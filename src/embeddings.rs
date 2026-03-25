@@ -326,7 +326,7 @@ impl FastEmbedProvider {
         #[cfg(feature = "gpu-directml")]
         {
             use ort::execution_providers::DirectMLExecutionProvider;
-            log::info!("DirectML GPU acceleration enabled — trying GPU first, CPU fallback");
+            tracing::info!("DirectML GPU acceleration enabled — trying GPU first, CPU fallback");
             init = init.with_execution_providers(vec![
                 DirectMLExecutionProvider::default().build(),
             ]);
@@ -540,29 +540,29 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
                 let api_key = get("OPENAI_API_KEY", "openai-api-key")?;
                 let model = get("EMBEDDING_MODEL", "embedding-model")
                     .unwrap_or_else(|| "text-embedding-3-small".to_string());
-                log::info!("Embedding provider: OpenAI (model={})", model);
+                tracing::info!("Embedding provider: OpenAI (model={})", model);
                 return Some(Box::new(OpenAiProvider::new(api_key, model)));
             }
             "voyage" => {
                 let api_key = get("VOYAGE_API_KEY", "voyage-api-key")?;
                 let model = get("EMBEDDING_MODEL", "embedding-model")
                     .unwrap_or_else(|| "voyage-code-3".to_string());
-                log::info!("Embedding provider: Voyage AI (model={})", model);
+                tracing::info!("Embedding provider: Voyage AI (model={})", model);
                 return Some(Box::new(VoyageProvider::new(api_key, model)));
             }
             "gemini" => {
                 let api_key = get("GEMINI_API_KEY", "gemini-api-key")?;
                 let model = get("EMBEDDING_MODEL", "embedding-model")
                     .unwrap_or_else(|| "text-embedding-004".to_string());
-                log::info!("Embedding provider: Gemini (model={})", model);
+                tracing::info!("Embedding provider: Gemini (model={})", model);
                 return Some(Box::new(GeminiProvider::new(api_key, model)));
             }
             "none" | "disabled" => {
-                log::info!("Embeddings explicitly disabled via embedding-provider=none");
+                tracing::info!("Embeddings explicitly disabled via embedding-provider=none");
                 return None;
             }
             other => {
-                log::warn!("Unknown embedding-provider='{}'; falling back to local", other);
+                tracing::warn!("Unknown embedding-provider='{}'; falling back to local", other);
             }
         }
     }
@@ -572,11 +572,11 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
     {
         match FastEmbedProvider::new() {
             Ok(p) => {
-                log::info!("Embedding provider: fastembed-jina-v2-code (local, free)");
+                tracing::info!("Embedding provider: fastembed-jina-v2-code (local, free)");
                 return Some(Box::new(p));
             }
             Err(e) => {
-                log::warn!("fastembed init failed: {}; trying candle fallback", e);
+                tracing::warn!("fastembed init failed: {}; trying candle fallback", e);
             }
         }
     }
@@ -586,11 +586,11 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
     {
         match CandleProvider::new() {
             Ok(p) => {
-                log::info!("Embedding provider: candle-minilm (all-MiniLM-L6-v2, local, free)");
+                tracing::info!("Embedding provider: candle-minilm (all-MiniLM-L6-v2, local, free)");
                 return Some(Box::new(p));
             }
             Err(e) => {
-                log::warn!("Local embedding provider unavailable: {}; embeddings disabled", e);
+                tracing::warn!("Local embedding provider unavailable: {}; embeddings disabled", e);
             }
         }
     }
@@ -618,7 +618,7 @@ impl EmbeddingStore {
             match load_embedding_data(store_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "Could not load embeddings from {}: {} — starting empty",
                         store_path.display(),
                         e
@@ -676,7 +676,7 @@ impl EmbeddingStore {
             .collect();
         let removed = stale_keys.len();
         if removed > 0 {
-            log::info!("Embedding GC: removing {} stale vector(s)", removed);
+            tracing::info!("Embedding GC: removing {} stale vector(s)", removed);
             for k in &stale_keys {
                 self.data.vectors.remove(k);
             }
@@ -875,7 +875,7 @@ pub fn semantic_search(
                 return nodes_from_scored(scored, store, compact, repo_root);
             }
             Err(e) => {
-                log::warn!("HNSW index build failed ({}); falling back to linear scan", e);
+                tracing::warn!("HNSW index build failed ({}); falling back to linear scan", e);
             }
         }
     }
@@ -915,7 +915,7 @@ fn nodes_from_scored(
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() {
-        log::error!("cosine_similarity: dimension mismatch {} vs {}", a.len(), b.len());
+        tracing::error!("cosine_similarity: dimension mismatch {} vs {}", a.len(), b.len());
         return 0.0;
     }
     let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();

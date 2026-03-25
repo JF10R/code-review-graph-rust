@@ -233,6 +233,7 @@ impl CodeReviewServer {
     /// Call this first to initialize the graph, or after making changes.
     /// By default performs an incremental update (only changed files).
     /// Set full_rebuild=True to re-parse every file.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "build_or_update_graph")]
     async fn build_or_update_graph_tool(
         &self,
@@ -256,6 +257,7 @@ impl CodeReviewServer {
     /// classes, and files are affected. Use during code review to understand
     /// what a change impacts. Pass changed file paths, or let it auto-detect
     /// from git diff. Follow up with Read tool on impacted files.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "get_impact_radius")]
     async fn get_impact_radius_tool(
         &self,
@@ -283,6 +285,7 @@ impl CodeReviewServer {
     /// Use callers_of/callees_of to navigate between functions instead of
     /// running grep in bash. After finding connected functions, use the
     /// Read tool to examine their logic.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "query_graph")]
     async fn query_graph_tool(
         &self,
@@ -307,6 +310,7 @@ impl CodeReviewServer {
     ///
     /// Combines impact analysis with source snippets and review guidance.
     /// Use this for comprehensive code reviews.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "get_review_context")]
     async fn get_review_context_tool(
         &self,
@@ -338,6 +342,7 @@ impl CodeReviewServer {
     /// Returns ranked results with similarity scores. After finding targets,
     /// use the Read tool (not bash cat) to examine their source code.
     /// Always pass compact: true to reduce response size.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "semantic_search_nodes")]
     async fn semantic_search_nodes_tool(
         &self,
@@ -363,6 +368,7 @@ impl CodeReviewServer {
     ///
     /// Shows total nodes, edges, languages, files, and last update time.
     /// Useful for checking if the graph is built and up to date.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "list_graph_stats")]
     async fn list_graph_stats_tool(
         &self,
@@ -383,6 +389,7 @@ impl CodeReviewServer {
     /// Uses the all-MiniLM-L6-v2 model (384-dim vectors).
     /// Only computes embeddings for nodes that don't already have them.
     /// After running this, semantic_search_nodes_tool uses vector similarity.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "embed_graph")]
     async fn embed_graph_tool(
         &self,
@@ -403,6 +410,7 @@ impl CodeReviewServer {
     /// Returns only the requested section content for minimal token usage.
     /// Available sections: usage, review-delta, review-pr, commands, legal,
     /// watch, embeddings, languages, troubleshooting.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "get_docs_section")]
     async fn get_docs_section_tool(
         &self,
@@ -422,6 +430,7 @@ impl CodeReviewServer {
     /// business logic concentrates and finding likely bug locations.
     /// Use for decomposition audits and code quality checks.
     /// Results ordered by size, largest first.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "find_large_functions")]
     async fn find_large_functions_tool(
         &self,
@@ -452,6 +461,7 @@ impl CodeReviewServer {
     /// files one-by-one to manually follow call chains. Try this BEFORE
     /// reading multiple files — it often answers "how does A reach B?"
     /// in one call. Tries callee direction first, then caller direction.
+    #[tracing::instrument(skip(self))]
     #[tool(name = "trace_call_chain")]
     async fn trace_call_chain_tool(
         &self,
@@ -576,7 +586,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         .watch(&repo_root, RecursiveMode::Recursive)
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
 
-    log::info!(
+    tracing::info!(
         "Background watcher active — watching {}",
         repo_root.display()
     );
@@ -585,7 +595,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         let events = match result {
             Ok(evts) => evts,
             Err(e) => {
-                log::error!("Watcher error: {:?}", e);
+                tracing::error!("Watcher error: {:?}", e);
                 continue;
             }
         };
@@ -623,7 +633,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         let mut store = match GraphStore::new(&db_path) {
             Ok(s) => s,
             Err(e) => {
-                log::error!("Background watcher: could not open store: {}", e);
+                tracing::error!("Background watcher: could not open store: {}", e);
                 continue;
             }
         };
@@ -631,13 +641,13 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         for path in &paths_to_remove {
             let abs_str = path.to_string_lossy().into_owned();
             if let Err(e) = store.remove_file_data(&abs_str) {
-                log::error!("Watcher remove {}: {}", abs_str, e);
+                tracing::error!("Watcher remove {}: {}", abs_str, e);
             } else {
                 let rel = path
                     .strip_prefix(&repo_root)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| abs_str.clone());
-                log::info!("Watcher removed: {}", rel);
+                tracing::info!("Watcher removed: {}", rel);
             }
         }
 
@@ -659,7 +669,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         .strip_prefix(&repo_root)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
-                    log::info!("Watcher updated: {} ({} nodes, {} edges)", rel, n, e);
+                    tracing::info!("Watcher updated: {} ({} nodes, {} edges)", rel, n, e);
 
                     // Re-parse dependents so cross-file edges stay fresh.
                     let deps = find_dependents(&store, &abs_str).unwrap_or_default();
@@ -670,15 +680,15 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         processed.insert(dep_path.clone());
                         let dep = std::path::PathBuf::from(dep_path);
                         match watcher_parse_and_store(&parser, &mut store, &dep) {
-                            Ok(Some((dn, de))) => log::debug!(
+                            Ok(Some((dn, de))) => tracing::debug!(
                                 "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
                                 dep_path, dn, de
                             ),
-                            Ok(None) => log::debug!(
+                            Ok(None) => tracing::debug!(
                                 "Watcher dependent unchanged (hash match): {}",
                                 dep_path
                             ),
-                            Err(e) => log::warn!("Watcher dependent {}: {}", dep_path, e),
+                            Err(e) => tracing::warn!("Watcher dependent {}: {}", dep_path, e),
                         }
                     }
                 }
@@ -687,18 +697,18 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         .strip_prefix(&repo_root)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
-                    log::debug!("Watcher skipped (hash unchanged): {}", rel);
+                    tracing::debug!("Watcher skipped (hash unchanged): {}", rel);
                 }
-                Err(err) => log::error!("Watcher {}", err),
+                Err(err) => tracing::error!("Watcher {}", err),
             }
         }
 
         if let Err(e) = store.commit() {
-            log::error!("Watcher commit error: {}", e);
+            tracing::error!("Watcher commit error: {}", e);
         }
     }
 
-    log::info!("Background watcher stopped.");
+    tracing::info!("Background watcher stopped.");
     Ok(())
 }
 
@@ -712,11 +722,11 @@ pub async fn run_server(repo_root: Option<String>) -> crate::error::Result<()> {
         let watcher_root = root.clone();
         std::thread::spawn(move || {
             if let Err(e) = run_background_watcher(watcher_root) {
-                log::error!("Background watcher error: {}", e);
+                tracing::error!("Background watcher error: {}", e);
             }
         });
     } else {
-        log::info!("No repo root detected, background watcher disabled");
+        tracing::info!("No repo root detected, background watcher disabled");
     }
 
     let server = CodeReviewServer::new(repo_root);
