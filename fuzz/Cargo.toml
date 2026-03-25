@@ -1,0 +1,21 @@
+[package]
+name = "code-review-graph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.code-review-graph]
+path = ".."
+
+[[bin]]
+name = "fuzz_parse_bytes"
+path = "fuzz_targets/fuzz_parse_bytes.rs"
+test = false
+doc = false
