@@ -237,14 +237,24 @@ pub fn get_impact_radius(
     base: &str,
     compact: bool,
 ) -> Result<Value> {
-    const MAX_RESULTS: usize = 500;
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
-
     let files = resolve_changed_files(changed_files, &root, base);
+    let result = get_impact_radius_with_store(&store, &root, files, max_depth, compact)?;
+    store.close()?;
+    Ok(result)
+}
+
+pub fn get_impact_radius_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    files: Vec<String>,
+    max_depth: usize,
+    compact: bool,
+) -> Result<Value> {
+    const MAX_RESULTS: usize = 500;
 
     if files.is_empty() {
-        store.close()?;
         return Ok(json!({
             "status": "ok",
             "summary": "No changed files detected.",
@@ -297,7 +307,6 @@ pub fn get_impact_radius(
         })
         .collect();
 
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "summary": summary_parts.join("\n"),
@@ -380,11 +389,21 @@ pub fn query_graph(
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
+    let result = query_graph_with_store(&store, &root, pattern, target, compact)?;
+    store.close()?;
+    Ok(result)
+}
 
+pub fn query_graph_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    pattern: &str,
+    target: &str,
+    compact: bool,
+) -> Result<Value> {
     let qp = match QueryPattern::from_str(pattern) {
         Some(p) => p,
         None => {
-            store.close()?;
             let available = [
                 "callers_of", "callees_of", "imports_of", "importers_of",
                 "children_of", "tests_for", "inheritors_of", "file_summary",
@@ -399,7 +418,6 @@ pub fn query_graph(
 
     // Filter common builtins for callers_of
     if qp == QueryPattern::CallersOf && is_builtin_call(target) && !target.contains("::") {
-        store.close()?;
         return Ok(json!({
             "status": "ok",
             "pattern": pattern,
@@ -413,7 +431,7 @@ pub fn query_graph(
 
     // Resolve the target node (file_summary bypasses ambiguous-node early return)
     let mut target_name = target.to_string();
-    let node_opt = resolve_target_node(&store, target, &root)?;
+    let node_opt = resolve_target_node(store, target, root)?;
 
     let node = match node_opt {
         ResolveResult::Found(n) => {
@@ -421,7 +439,6 @@ pub fn query_graph(
             Some(n)
         }
         ResolveResult::Ambiguous(candidates) if qp != QueryPattern::FileSummary => {
-            store.close()?;
             return Ok(json!({
                 "status": "ambiguous",
                 "summary": format!("Multiple matches for '{}'. Please use a qualified name.", target),
@@ -433,7 +450,6 @@ pub fn query_graph(
     };
 
     if node.is_none() && qp != QueryPattern::FileSummary {
-        store.close()?;
         return Ok(json!({
             "status": "not_found",
             "summary": format!("No node found matching '{}'.", target),
@@ -450,7 +466,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(caller) = store.get_node(&e.source_qualified)? {
-                        results.push(node_dict(&caller, compact, &root));
+                        results.push(node_dict(&caller, compact, root));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -460,7 +476,7 @@ pub fn query_graph(
                 if let Some(ref n) = node {
                     for e in store.search_edges_by_target_name(&n.name)? {
                         if let Some(caller) = store.get_node(&e.source_qualified)? {
-                            results.push(node_dict(&caller, compact, &root));
+                            results.push(node_dict(&caller, compact, root));
                         }
                         edges_out.push(edge_to_dict(&e));
                     }
@@ -471,7 +487,7 @@ pub fn query_graph(
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Calls {
                     if let Some(callee) = store.get_node(&e.target_qualified)? {
-                        results.push(node_dict(&callee, compact, &root));
+                        results.push(node_dict(&callee, compact, root));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -500,7 +516,7 @@ pub fn query_graph(
             for e in store.get_edges_by_source(&qn)? {
                 if e.kind == EdgeKind::Contains {
                     if let Some(child) = store.get_node(&e.target_qualified)? {
-                        results.push(node_dict(&child, compact, &root));
+                        results.push(node_dict(&child, compact, root));
                     }
                 }
             }
@@ -509,7 +525,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if e.kind == EdgeKind::TestedBy {
                     if let Some(t) = store.get_node(&e.source_qualified)? {
-                        results.push(node_dict(&t, compact, &root));
+                        results.push(node_dict(&t, compact, root));
                     }
                 }
             }
@@ -521,7 +537,7 @@ pub fn query_graph(
             for prefix in &[format!("test_{name}"), format!("Test{name}")] {
                 for t in store.search_nodes(prefix, 10)? {
                     if !seen.contains(&t.qualified_name) && t.is_test {
-                        results.push(node_dict(&t, compact, &root));
+                        results.push(node_dict(&t, compact, root));
                     }
                 }
             }
@@ -530,7 +546,7 @@ pub fn query_graph(
             for e in store.get_edges_by_target(&qn)? {
                 if matches!(e.kind, EdgeKind::Inherits | EdgeKind::Implements) {
                     if let Some(child) = store.get_node(&e.source_qualified)? {
-                        results.push(node_dict(&child, compact, &root));
+                        results.push(node_dict(&child, compact, root));
                     }
                     edges_out.push(edge_to_dict(&e));
                 }
@@ -554,12 +570,11 @@ pub fn query_graph(
                 }
             };
             for n in store.get_nodes_by_file(&abs_path)? {
-                results.push(node_dict(&n, compact, &root));
+                results.push(node_dict(&n, compact, root));
             }
         }
     }
 
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "pattern": qp.as_str(),
@@ -586,11 +601,22 @@ pub fn get_review_context(
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
-
     let files = resolve_changed_files(changed_files, &root, base);
+    let result = get_review_context_with_store(&store, &root, files, max_depth, include_source, max_lines_per_file, compact)?;
+    store.close()?;
+    Ok(result)
+}
 
+pub fn get_review_context_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    files: Vec<String>,
+    max_depth: usize,
+    include_source: bool,
+    max_lines_per_file: usize,
+    compact: bool,
+) -> Result<Value> {
     if files.is_empty() {
-        store.close()?;
         return Ok(json!({
             "status": "ok",
             "summary": "No changes detected. Nothing to review.",
@@ -659,7 +685,6 @@ pub fn get_review_context(
         guidance.clone(),
     ];
 
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "summary": summary_parts.join("\n"),
@@ -682,11 +707,26 @@ pub fn semantic_search_nodes(
     maybe_auto_update(&mut store, &root);
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
+    let result = semantic_search_nodes_with_store(&store, &mut emb_store, &root, query, kind, limit, compact)?;
+    emb_store.close()?;
+    store.close()?;
+    Ok(result)
+}
+
+pub fn semantic_search_nodes_with_store(
+    store: &GraphStore,
+    emb_store: &mut EmbeddingStore,
+    root: &Utf8Path,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+    compact: bool,
+) -> Result<Value> {
     let search_mode;
 
     let results: Vec<Value> = if emb_store.available() && emb_store.count()? > 0 {
         search_mode = "semantic";
-        let mut raw = semantic_search(query, &store, &mut emb_store, limit * 2, compact, &root)?;
+        let mut raw = semantic_search(query, store, emb_store, limit * 2, compact, root)?;
         if let Some(k) = kind {
             raw.retain(|r| r.get("kind").and_then(|v| v.as_str()) == Some(k));
         }
@@ -706,7 +746,7 @@ pub fn semantic_search_nodes(
             else { 2 }
         });
         nodes.truncate(limit);
-        nodes.iter().map(|n| node_dict(n, compact, &root)).collect()
+        nodes.iter().map(|n| node_dict(n, compact, root)).collect()
     };
 
     // Adaptive source snippets: top 3 results get 10 lines of source inline.
@@ -740,8 +780,6 @@ pub fn semantic_search_nodes(
     }
 
     let kind_suffix = kind.map(|k| format!(" (kind={k})")).unwrap_or_default();
-    emb_store.close()?;
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "query": query,
@@ -758,6 +796,15 @@ pub fn semantic_search_nodes(
 pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
+    let result = list_graph_stats_with_store(&store, &root)?;
+    store.close()?;
+    Ok(result)
+}
+
+pub fn list_graph_stats_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+) -> Result<Value> {
     let stats = store.get_stats()?;
 
     let root_name = root.file_name()
@@ -794,14 +841,13 @@ pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
     }
 
     // Embedding info
-    let emb_db_path = incremental::get_embeddings_db_path(&root);
+    let emb_db_path = incremental::get_embeddings_db_path(root);
     let emb_count = EmbeddingStore::new(&emb_db_path)
         .and_then(|es| es.count())
         .unwrap_or(0);
     summary_parts.push(String::new());
     summary_parts.push(format!("Embeddings: {emb_count} nodes embedded"));
 
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "summary": summary_parts.join("\n"),
@@ -933,13 +979,35 @@ pub fn hybrid_query(
         }));
     }
 
-    const RRF_K: f64 = 60.0;
-
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact)?;
+    emb_store.close()?;
+    store.close()?;
+    Ok(result)
+}
+
+pub fn hybrid_query_with_store(
+    store: &GraphStore,
+    emb_store: &mut EmbeddingStore,
+    root: &Utf8Path,
+    query: &str,
+    limit: usize,
+    compact: bool,
+) -> Result<Value> {
+    if query.trim().is_empty() {
+        return Ok(json!({
+            "status": "ok",
+            "query": query,
+            "method": "keyword_only",
+            "results": [],
+        }));
+    }
+
+    const RRF_K: f64 = 60.0;
 
     // Keyword results
     let keyword_hits = store.search_nodes(query, limit * 2)?;
@@ -956,7 +1024,7 @@ pub fn hybrid_query(
     // Semantic ranks (if available)
     if emb_store.available() && emb_store.count().unwrap_or(0) > 0 {
         method = "hybrid_rrf";
-        let semantic_hits = crate::embeddings::semantic_search(query, &store, &mut emb_store, limit * 2, compact, &root)?;
+        let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
         for (rank, hit) in semantic_hits.iter().enumerate() {
             if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
                 let score = 1.0 / (RRF_K + rank as f64 + 1.0);
@@ -976,20 +1044,203 @@ pub fn hybrid_query(
         .iter()
         .filter_map(|(qn, score)| {
             store.get_node(qn).ok().flatten().map(|node| {
-                let mut d = node_dict(&node, compact, &root);
+                let mut d = node_dict(&node, compact, root);
                 d["rrf_score"] = json!(score);
                 d
             })
         })
         .collect();
 
-    emb_store.close()?;
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "query": query,
         "method": method,
         "results": results,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Tool 12: open_node_context
+// ---------------------------------------------------------------------------
+
+/// Get complete context for a node — source preview, callers, callees, tests,
+/// and file siblings — in a single store-borrowed call.
+pub fn open_node_context(
+    target: &str,
+    compact: bool,
+    repo_root: Option<&str>,
+) -> Result<Value> {
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+    let result = open_node_context_with_store(&store, &root, target, compact)?;
+    store.close()?;
+    Ok(result)
+}
+
+pub fn open_node_context_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    target: &str,
+    compact: bool,
+) -> Result<Value> {
+    let node = match resolve_target_node(store, target, root)? {
+        ResolveResult::Found(n) => n,
+        ResolveResult::Ambiguous(candidates) => {
+            return Ok(json!({
+                "status": "ambiguous",
+                "summary": format!("Multiple matches for '{}'. Please use a qualified name.", target),
+                "candidates": candidates,
+            }));
+        }
+        ResolveResult::NotFound => {
+            return Ok(json!({
+                "status": "not_found",
+                "summary": format!("No node found matching '{}'.", target),
+            }));
+        }
+    };
+
+    let qn = &node.qualified_name;
+
+    // Single pass over incoming edges splits callers (Calls) from tests (TestedBy),
+    // avoiding a second get_edges_by_target call.
+    let mut caller_edges: Vec<_> = Vec::new();
+    let mut test_edges: Vec<_> = Vec::new();
+    for e in store.get_edges_by_target(qn)? {
+        match e.kind {
+            EdgeKind::Calls => caller_edges.push(e),
+            EdgeKind::TestedBy => test_edges.push(e),
+            _ => {}
+        }
+    }
+    let callers_count = caller_edges.len();
+    let callers: Vec<Value> = caller_edges.iter()
+        .take(5)
+        .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
+        .map(|n| node_to_dict(&n, compact))
+        .collect();
+
+    let all_callees_edges: Vec<_> = store.get_edges_by_source(qn)?
+        .into_iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .collect();
+    let callees_count = all_callees_edges.len();
+    let callees: Vec<Value> = all_callees_edges.iter()
+        .take(5)
+        .filter_map(|e| store.get_node(&e.target_qualified).ok().flatten())
+        .map(|n| node_to_dict(&n, compact))
+        .collect();
+
+    let tests_count = test_edges.len();
+    let tests: Vec<Value> = test_edges.iter()
+        .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
+        .map(|n| node_to_dict(&n, compact))
+        .collect();
+
+    let node_kind = node.kind;
+    let node_line = node.line_start;
+    let node_qn = node.qualified_name.clone();
+    let mut siblings: Vec<_> = store.get_nodes_by_file(&node.file_path)?
+        .into_iter()
+        .filter(|n| n.qualified_name != node_qn)
+        .collect();
+    siblings.sort_by_key(|n| {
+        let kind_score: u8 = if n.kind == node_kind { 0 } else { 1 };
+        let line_dist = (n.line_start as i64 - node_line as i64).unsigned_abs() as usize;
+        (kind_score, line_dist)
+    });
+    siblings.truncate(10);
+    let file_siblings: Vec<Value> = siblings.iter().map(|n| node_to_dict(n, compact)).collect();
+
+    let (source_preview, source_truncated) = {
+        let file_path_str = &node.file_path;
+        match std::fs::read_to_string(file_path_str) {
+            Ok(content) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = node.line_start.saturating_sub(1);
+                let end = node.line_end.min(lines.len());
+                let available = end.saturating_sub(start);
+                let take = available.min(30);
+                let truncated = available > 30;
+                let preview: String = lines[start..start + take]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>4}: {}", start + i + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (preview, truncated)
+            }
+            Err(_) => (String::new(), false),
+        }
+    };
+
+    let node_name = node.name.clone();
+    let node_dict_val = node_to_dict(&node, compact);
+
+    Ok(json!({
+        "status": "ok",
+        "node": node_dict_val,
+        "source_preview": source_preview,
+        "source_truncated": source_truncated,
+        "callers": callers,
+        "callers_count": callers_count,
+        "callees": callees,
+        "callees_count": callees_count,
+        "tests": tests,
+        "tests_count": tests_count,
+        "file_siblings": file_siblings,
+        "summary": format!(
+            "Context for {}: {} callers, {} callees, {} tests",
+            node_name, callers_count, callees_count, tests_count
+        ),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Tool 13: batch_open_node_context
+// ---------------------------------------------------------------------------
+
+/// Inspect multiple nodes at once — opens the store once and calls
+/// `open_node_context_with_store` for each target (max 5).
+pub fn batch_open_node_context(
+    targets: Vec<String>,
+    compact: bool,
+    repo_root: Option<&str>,
+) -> Result<Value> {
+    let (mut store, root) = get_store(repo_root)?;
+    maybe_auto_update(&mut store, &root);
+
+    let capped: Vec<String> = targets.into_iter().take(5).collect();
+    let mut results: Vec<Value> = Vec::with_capacity(capped.len());
+
+    for target in &capped {
+        match open_node_context_with_store(&store, &root, target, compact) {
+            Ok(v) => {
+                if v["status"] == "not_found" || v["status"] == "ambiguous" {
+                    results.push(json!({
+                        "target": target,
+                        "status": v["status"],
+                        "summary": v["summary"],
+                    }));
+                } else {
+                    results.push(v);
+                }
+            }
+            Err(_) => {
+                results.push(json!({
+                    "target": target,
+                    "status": "not_found",
+                }));
+            }
+        }
+    }
+
+    let count = results.len();
+    store.close()?;
+    Ok(json!({
+        "status": "ok",
+        "results": results,
+        "count": count,
     }))
 }
 
@@ -1078,7 +1329,20 @@ pub fn find_large_functions(
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
+    let result = find_large_functions_with_store(&store, &root, min_lines, kind, file_path_pattern, limit, compact)?;
+    store.close()?;
+    Ok(result)
+}
 
+pub fn find_large_functions_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    min_lines: usize,
+    kind: Option<&str>,
+    file_path_pattern: Option<&str>,
+    limit: usize,
+    compact: bool,
+) -> Result<Value> {
     let nodes = store.get_nodes_by_size(min_lines, kind, file_path_pattern, limit)?;
 
     let results: Vec<Value> = nodes.iter().map(|n| {
@@ -1088,10 +1352,10 @@ pub fn find_large_functions(
             0
         };
         let relative_path = Utf8Path::new(&n.file_path)
-            .strip_prefix(&root)
+            .strip_prefix(root)
             .map(|p| p.as_str().to_owned())
             .unwrap_or_else(|_| n.file_path.clone());
-        let mut d = node_dict(n, compact, &root);
+        let mut d = node_dict(n, compact, root);
         d["line_count"] = json!(line_count);
         d["relative_path"] = json!(relative_path);
         d
@@ -1122,7 +1386,6 @@ pub fn find_large_functions(
         summary_parts.push(format!("  ... and {} more", results.len() - 10));
     }
 
-    store.close()?;
     Ok(json!({
         "status": "ok",
         "summary": summary_parts.join("\n"),
@@ -1141,18 +1404,28 @@ pub fn trace_call_chain(
 ) -> Result<Value> {
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
+    let result = trace_call_chain_with_store(&store, &root, from, to, max_depth, compact)?;
+    store.close()?;
+    Ok(result)
+}
 
-    let from_node = match resolve_target_node(&store, from, &root)? {
+pub fn trace_call_chain_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    compact: bool,
+) -> Result<Value> {
+    let from_node = match resolve_target_node(store, from, root)? {
         ResolveResult::Found(n) => n,
         ResolveResult::NotFound => {
-            store.close()?;
             return Ok(json!({
                 "status": "error",
                 "summary": format!("Node not found: '{from}'"),
             }));
         }
         ResolveResult::Ambiguous(candidates) => {
-            store.close()?;
             return Ok(json!({
                 "status": "ambiguous",
                 "summary": format!("Ambiguous name '{from}' — qualify with file path or full qualified name"),
@@ -1161,17 +1434,15 @@ pub fn trace_call_chain(
         }
     };
 
-    let to_node = match resolve_target_node(&store, to, &root)? {
+    let to_node = match resolve_target_node(store, to, root)? {
         ResolveResult::Found(n) => n,
         ResolveResult::NotFound => {
-            store.close()?;
             return Ok(json!({
                 "status": "error",
                 "summary": format!("Node not found: '{to}'"),
             }));
         }
         ResolveResult::Ambiguous(candidates) => {
-            store.close()?;
             return Ok(json!({
                 "status": "ambiguous",
                 "summary": format!("Ambiguous name '{to}' — qualify with file path or full qualified name"),
@@ -1186,14 +1457,12 @@ pub fn trace_call_chain(
         max_depth,
     )?;
 
-    store.close()?;
-
     match result {
         Some(path) => {
             let hops = path.len().saturating_sub(1);
             let path_json: Vec<Value> = path.iter().map(|(node, edge)| {
                 json!({
-                    "node": node_dict(node, compact, &root),
+                    "node": node_dict(node, compact, root),
                     "edge_to_next": edge.is_some().then_some("CALLS"),
                 })
             }).collect();

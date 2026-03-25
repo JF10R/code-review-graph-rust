@@ -192,6 +192,30 @@ struct HybridQueryParams {
     repo_root: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OpenNodeContextParams {
+    #[schemars(description = "Function, class, or file name to inspect")]
+    target: String,
+    #[schemars(description = "Compact output (default: true)")]
+    #[serde(default = "default_true")]
+    compact: bool,
+    #[schemars(description = "Repository root path")]
+    #[serde(default)]
+    repo_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BatchNodeContextParams {
+    #[schemars(description = "List of function/class names to inspect (max 5)")]
+    targets: Vec<String>,
+    #[schemars(description = "Compact output (default: true)")]
+    #[serde(default = "default_true")]
+    compact: bool,
+    #[schemars(description = "Repository root path")]
+    #[serde(default)]
+    repo_root: Option<String>,
+}
+
 // Default value helpers
 fn default_base() -> String { "HEAD~1".to_string() }
 fn default_max_depth() -> usize { 2 }
@@ -507,6 +531,51 @@ impl CodeReviewServer {
                 p.limit,
                 repo_root.as_deref(),
                 p.compact,
+            )
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Get complete context for a function or class in one call — source preview,
+    /// callers, callees, tests, and file siblings. Use this as your PRIMARY
+    /// investigation tool instead of making separate query_graph + Read calls.
+    /// Returns everything you need to understand a symbol's role in the codebase.
+    #[tool(name = "open_node_context")]
+    async fn open_node_context_tool(
+        &self,
+        Parameters(p): Parameters<OpenNodeContextParams>,
+    ) -> std::result::Result<String, String> {
+        let repo_root = self.resolve_repo_root(p.repo_root);
+        tokio::task::spawn_blocking(move || {
+            crate::tools::open_node_context(
+                &p.target,
+                p.compact,
+                repo_root.as_deref(),
+            )
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Inspect multiple functions at once — saves N-1 tool calls compared to
+    /// calling open_node_context separately for each. Max 5 targets per call.
+    /// Use when you've identified several candidate symbols to investigate.
+    #[tool(name = "batch_open_node_context")]
+    async fn batch_open_node_context_tool(
+        &self,
+        Parameters(p): Parameters<BatchNodeContextParams>,
+    ) -> std::result::Result<String, String> {
+        let repo_root = self.resolve_repo_root(p.repo_root);
+        tokio::task::spawn_blocking(move || {
+            crate::tools::batch_open_node_context(
+                p.targets,
+                p.compact,
+                repo_root.as_deref(),
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())
