@@ -141,25 +141,26 @@ pub fn search_nodes_indexed(
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
-    let qualified_names = index.search(query, limit * 2)?;
+    let qualified_names = index.search(query, limit)?;
     let query_lower = query.to_lowercase();
 
-    let mut results: Vec<(u8, GraphNode)> = qualified_names
-        .into_iter()
-        .filter_map(|qn| {
-            let node = store.get_node(&qn).ok()??;
-            let name_lower = node.name.to_lowercase();
-            let qn_lower = node.qualified_name.to_lowercase();
-            let relevance = if name_lower == query_lower || qn_lower == query_lower {
-                0u8
-            } else if name_lower.starts_with(&query_lower) {
-                1u8
-            } else {
-                2u8
-            };
-            Some((relevance, node))
-        })
-        .collect();
+    let mut results: Vec<(u8, GraphNode)> = Vec::new();
+    for qn in qualified_names {
+        let node = match store.get_node(&qn)? {
+            Some(node) => node,
+            None => continue,
+        };
+        let name_lower = node.name.to_lowercase();
+        let qn_lower = node.qualified_name.to_lowercase();
+        let relevance = if name_lower == query_lower || qn_lower == query_lower {
+            0u8
+        } else if name_lower.starts_with(&query_lower) {
+            1u8
+        } else {
+            2u8
+        };
+        results.push((relevance, node));
+    }
 
     results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
     results.truncate(limit);

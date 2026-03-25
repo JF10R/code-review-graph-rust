@@ -743,9 +743,10 @@ pub fn semantic_search_nodes_with_store(
         raw
     } else {
         search_mode = "keyword";
-        let mut nodes = keyword_hits.unwrap_or_else(|| {
-            store.search_nodes(query, limit * 2).unwrap_or_default()
-        });
+        let mut nodes = match keyword_hits {
+            Some(nodes) => nodes,
+            None => store.search_nodes(query, limit * 2)?,
+        };
         if let Some(k) = kind {
             nodes.retain(|n| n.kind.as_str() == k);
         }
@@ -1028,9 +1029,10 @@ pub fn hybrid_query_with_store(
     }
 
     // Keyword results (used by both fusion modes)
-    let keyword_hits = keyword_hits.unwrap_or_else(|| {
-        store.search_nodes(query, limit * 2).unwrap_or_default()
-    });
+    let keyword_hits = match keyword_hits {
+        Some(hits) => hits,
+        None => store.search_nodes(query, limit * 2)?,
+    };
     let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
 
     let fusion_method = fusion.unwrap_or("rrf");
