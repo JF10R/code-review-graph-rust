@@ -1,0 +1,524 @@
+[
+  {
+    "id": "nextjs-001",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/90518",
+    "pr_url": "https://github.com/vercel/next.js/pull/90556",
+    "query": "CSS insert function in webpack bundle uses ES6 arrow functions that break in old browsers with legacy browserslist targets",
+    "category": "css",
+    "ground_truth_files": [
+      "packages/next/src/build/webpack/config/blocks/css/index.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/build/webpack/config/blocks/css/index.ts"
+    ],
+    "root_cause_description": "The insert function passed to MiniCssExtractPlugin was serialized via Function#toString and injected into the webpack runtime without transpilation, embedding ES6 syntax that breaks in legacy browsers.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "nextjs-002",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/90332",
+    "pr_url": "https://github.com/vercel/next.js/pull/90384",
+    "query": "TypeScript error in .next/dev/types/validator.ts cannot find module routes.js after next-env.d.ts is regenerated",
+    "category": "config",
+    "ground_truth_files": [
+      "packages/next/src/lib/typescript/writeAppTypeDeclarations.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/lib/typescript/writeAppTypeDeclarations.ts",
+      "packages/next/src/build/index.ts",
+      "packages/next/src/build/type-check.ts",
+      "packages/next/src/lib/verify-typescript-setup.ts"
+    ],
+    "root_cause_description": "next-env.d.ts was being kept unchanged between dev and build modes, causing the generated type declaration to reference a routes.js that did not exist in dev-only builds.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "nextjs-003",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/90381",
+    "pr_url": "https://github.com/vercel/next.js/pull/90700",
+    "query": "Turbopack manifest files 404 on Windows because client URL paths use backslashes instead of forward slashes",
+    "category": "bundling",
+    "ground_truth_files": [
+      "packages/next/src/shared/lib/turbopack/manifest-loader.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/shared/lib/turbopack/manifest-loader.ts"
+    ],
+    "root_cause_description": "TurbopackManifestLoader used path.join instead of path.posix.join when constructing client-side URL paths, producing Windows backslash separators that caused 404s for manifest files.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "nextjs-004",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/90513",
+    "pr_url": "https://github.com/vercel/next.js/pull/90533",
+    "query": "serverPatchReducer loses push/replace history intent on retry — back button broken after router.push",
+    "category": "routing",
+    "ground_truth_files": [
+      "packages/next/src/client/components/router-reducer/reducers/server-patch-reducer.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/client/components/router-reducer/reducers/server-patch-reducer.ts",
+      "packages/next/src/client/components/router-reducer/ppr-navigations.ts",
+      "packages/next/src/client/components/app-router.tsx",
+      "packages/next/src/client/components/router-reducer/reducers/restore-reducer.ts"
+    ],
+    "root_cause_description": "serverPatchReducer did not preserve the push/replace intent of a suspended transition when retrying a server patch, causing the committed navigation state to lose the original history method and breaking browser back navigation.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "nextjs-005",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/85416",
+    "pr_url": "https://github.com/vercel/next.js/pull/85418",
+    "query": "Race condition in Node.js middleware body cloning causes SyntaxError unexpected end of JSON when processing large payloads with server actions",
+    "category": "runtime",
+    "ground_truth_files": [
+      "packages/next/src/server/next-server.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/server/next-server.ts"
+    ],
+    "root_cause_description": "The body cloning operation in the Node.js middleware path was not awaited, causing a race condition where the server action received a partially cloned request body when processing large payloads.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "nextjs-006",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/89033",
+    "pr_url": "https://github.com/vercel/next.js/pull/89040",
+    "query": "LRU cache memory leak — null route handler cache entries have size zero so they are never evicted causing unbounded memory growth",
+    "category": "runtime",
+    "ground_truth_files": [
+      "packages/next/src/server/lib/lru-cache.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/server/lib/lru-cache.ts",
+      "packages/next/src/server/lib/router-utils/filesystem.ts",
+      "packages/next/src/server/dev/next-dev-server.ts"
+    ],
+    "root_cause_description": "LRUCache allowed calculateSize to return 0 for null values; entries with zero size never contributed to totalSize so they were never evicted, causing unbounded LRU cache growth.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "nextjs-007",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/90281",
+    "pr_url": "https://github.com/vercel/next.js/pull/90304",
+    "query": "Pages router _next/data JSON responses missing Content-Length and ETag headers when served via CDN after v15.4.1",
+    "category": "api",
+    "ground_truth_files": [
+      "packages/next/src/server/route-modules/pages/pages-handler.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/server/route-modules/pages/pages-handler.ts"
+    ],
+    "root_cause_description": "The pages handler stopped passing Content-Length and ETag headers for /_next/data/ JSON responses after a refactor, causing CDN caches behind proxies to receive responses without these required headers.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "nextjs-008",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/87090",
+    "pr_url": "https://github.com/vercel/next.js/pull/90111",
+    "query": "SegmentPrefixRSCPathnameNormalizer incorrectly strips dynamic route params named 'segments' causing use cache misses",
+    "category": "runtime",
+    "ground_truth_files": [
+      "packages/next/src/server/normalizers/request/segment-prefix-rsc.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/server/normalizers/request/segment-prefix-rsc.ts"
+    ],
+    "root_cause_description": "SegmentPrefixRSCPathnameNormalizer incorrectly matched and stripped URL segments that contained a route param named 'segments', causing cache keys to be mangled and resulting in consistent cache misses.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "nextjs-009",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "github issue",
+    "issue_url": "https://github.com/vercel/next.js/issues/91662",
+    "pr_url": "https://github.com/vercel/next.js/pull/91711",
+    "query": "Server action POST returns HTML PPR prerender shell instead of RSC payload in standalone mode with cacheComponents enabled",
+    "category": "bundling",
+    "ground_truth_files": [
+      "packages/next/src/build/templates/app-page.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/build/templates/app-page.ts"
+    ],
+    "root_cause_description": "The app-page handler in standalone mode with cacheComponents did not correctly detect server action requests before deciding to serve the cached PPR shell, so action POSTs received the static HTML shell instead of the expected RSC flight response.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "nextjs-010",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "manual",
+    "issue_url": null,
+    "pr_url": "https://github.com/vercel/next.js/pull/91160",
+    "query": "Parallel routes with route groups cause 404 in webpack dev — what controls the sort order of appPaths for entries and route matcher resolution?",
+    "category": "routing",
+    "ground_truth_files": [
+      "packages/next/src/build/entries.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/build/entries.ts",
+      "packages/next/src/build/webpack/loaders/next-app-loader/index.ts",
+      "packages/next/src/server/lib/router-utils/setup-dev-bundler.ts",
+      "packages/next/src/shared/lib/router/utils/app-paths.ts"
+    ],
+    "root_cause_description": "The appPaths sort order for webpack entry generation did not account for parallel route slots nested inside route groups, causing incorrect page resolution and 404s during development.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "nextjs-011",
+    "repo": "vercel/next.js",
+    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "source": "manual",
+    "issue_url": null,
+    "pr_url": "https://github.com/vercel/next.js/pull/91855",
+    "query": "Where does Next.js read and normalize tsconfig baseUrl so that TypeScript 6 path aliases work correctly when tsconfig extends another config?",
+    "category": "config",
+    "ground_truth_files": [
+      "packages/next/src/lib/typescript/getTypeScriptConfiguration.ts"
+    ],
+    "relevant_files": [
+      "packages/next/src/lib/typescript/getTypeScriptConfiguration.ts",
+      "packages/next/src/build/index.ts"
+    ],
+    "root_cause_description": "getTypeScriptConfiguration did not resolve baseUrl inherited via tsconfig extends before rewriting paths aliases, causing TS6 TS5101 errors when baseUrl was declared in a parent config rather than the project's own tsconfig.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fastapi-001",
+    "repo": "fastapi/fastapi",
+    "repo_root": "D:\\GitHub\\bench-repos\\fastapi",
+    "source": "github issue",
+    "issue_url": "https://github.com/fastapi/fastapi/issues/14454",
+    "pr_url": "https://github.com/fastapi/fastapi/pull/14455",
+    "query": "OAuth2 security schemes appear duplicated in OpenAPI spec with and without scopes when declared at APIRouter level",
+    "category": "api",
+    "ground_truth_files": [
+      "fastapi/openapi/utils.py"
+    ],
+    "relevant_files": [
+      "fastapi/openapi/utils.py",
+      "fastapi/dependencies/models.py",
+      "fastapi/dependencies/utils.py"
+    ],
+    "root_cause_description": "get_openapi_security_definitions did not deduplicate OAuth2 security schemes that differed only by scope list, causing the same scheme to appear multiple times in the OpenAPI spec when scopes were declared at router vs route level.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fastapi-002",
+    "repo": "fastapi/fastapi",
+    "repo_root": "D:\\GitHub\\bench-repos\\fastapi",
+    "source": "github issue",
+    "issue_url": "https://github.com/fastapi/fastapi/issues/10997",
+    "pr_url": "https://github.com/fastapi/fastapi/pull/14616",
+    "query": "Using pydantic Json type with a list type annotation like Json[list[str]] fails in form data dependency resolution",
+    "category": "api",
+    "ground_truth_files": [
+      "fastapi/dependencies/utils.py"
+    ],
+    "relevant_files": [
+      "fastapi/dependencies/utils.py"
+    ],
+    "root_cause_description": "The JSON field detection logic in dependencies/utils.py did not correctly unwrap parameterized Json[X] types when X was a generic like list[str], causing form JSON fields to be treated as plain strings rather than parsed JSON.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "fastapi-003",
+    "repo": "fastapi/fastapi",
+    "repo_root": "D:\\GitHub\\bench-repos\\fastapi",
+    "source": "github issue",
+    "issue_url": "https://github.com/fastapi/fastapi/issues/13533",
+    "pr_url": "https://github.com/fastapi/fastapi/pull/13537",
+    "query": "Form fields with empty string values are incorrectly treated as None/missing instead of empty string in FastAPI dependency injection",
+    "category": "api",
+    "ground_truth_files": [
+      "fastapi/dependencies/utils.py"
+    ],
+    "relevant_files": [
+      "fastapi/dependencies/utils.py"
+    ],
+    "root_cause_description": "_extract_form_body treated empty string form values as absent/None for HTML form compatibility, but this broke validation when the default was explicitly None and the field accepted an empty string as a valid value.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "httpx-001",
+    "repo": "encode/httpx",
+    "repo_root": "D:\\GitHub\\bench-repos\\httpx",
+    "source": "github pr",
+    "issue_url": null,
+    "pr_url": "https://github.com/encode/httpx/pull/3442",
+    "query": "SSL verification fails when both verify=False and a client certificate are provided at the same time",
+    "category": "error-handling",
+    "ground_truth_files": [
+      "httpx/_config.py"
+    ],
+    "relevant_files": [
+      "httpx/_config.py"
+    ],
+    "root_cause_description": "create_ssl_context did not handle the combination of verify=False with cert being set, causing the SSL context construction to fail instead of creating an unverified context that still loads the client certificate.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "httpx-002",
+    "repo": "encode/httpx",
+    "repo_root": "D:\\GitHub\\bench-repos\\httpx",
+    "source": "github pr",
+    "issue_url": null,
+    "pr_url": "https://github.com/encode/httpx/pull/3412",
+    "query": "Empty zstd-encoded response body causes decode error instead of returning empty bytes",
+    "category": "error-handling",
+    "ground_truth_files": [
+      "httpx/_decoders.py"
+    ],
+    "relevant_files": [
+      "httpx/_decoders.py"
+    ],
+    "root_cause_description": "ZStandardDecoder.decode did not handle an empty input bytes object, raising a decompression error when the server returned a zstd-encoded response with no body content.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "httpx-003",
+    "repo": "encode/httpx",
+    "repo_root": "D:\\GitHub\\bench-repos\\httpx",
+    "source": "github pr",
+    "issue_url": null,
+    "pr_url": "https://github.com/encode/httpx/pull/3045",
+    "query": "RFC 2069 digest authentication fails — where is the qop field omitted for legacy digest auth compatibility?",
+    "category": "api",
+    "ground_truth_files": [
+      "httpx/_auth.py"
+    ],
+    "relevant_files": [
+      "httpx/_auth.py"
+    ],
+    "root_cause_description": "DigestAuth always included the qop directive in the Authorization header, but RFC 2069 mode (no qop in server challenge) requires qop to be omitted, causing authentication to fail against servers expecting strict RFC 2069 compliance.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "vscode-001",
+    "repo": "microsoft/vscode",
+    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "source": "github issue",
+    "issue_url": "https://github.com/microsoft/vscode/issues/236578",
+    "query": "Settings editor shows wrong default value for enum settings after workspace configuration overrides the user default",
+    "category": "config",
+    "ground_truth_files": [
+      "src/vs/platform/configuration/common/configurationModels.ts"
+    ],
+    "relevant_files": [
+      "src/vs/platform/configuration/common/configurationModels.ts",
+      "src/vs/platform/configuration/common/configurationRegistry.ts",
+      "src/vs/workbench/services/configuration/common/configurationModels.ts"
+    ],
+    "root_cause_description": "ConfigurationModel.merge did not correctly resolve enum default overrides when a workspace policy layer was present, causing the settings UI to display the raw policy value instead of the user-visible default.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "vscode-002",
+    "repo": "microsoft/vscode",
+    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "source": "github issue",
+    "issue_url": "https://github.com/microsoft/vscode/issues/232014",
+    "query": "Extension host crashes silently when extHostLanguageFeatures registers a document link provider that throws synchronously",
+    "category": "api",
+    "ground_truth_files": [
+      "src/vs/workbench/api/common/extHostLanguageFeatures.ts"
+    ],
+    "relevant_files": [
+      "src/vs/workbench/api/common/extHostLanguageFeatures.ts",
+      "src/vs/workbench/services/extensions/common/abstractExtensionService.ts"
+    ],
+    "root_cause_description": "extHostLanguageFeatures did not wrap synchronous provider calls in a try/catch before converting them to promises, so a provider throwing synchronously propagated an unhandled rejection that crashed the extension host process.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "vscode-003",
+    "repo": "microsoft/vscode",
+    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "source": "github issue",
+    "issue_url": "https://github.com/microsoft/vscode/issues/229761",
+    "query": "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key",
+    "category": "editor",
+    "ground_truth_files": [
+      "src/vs/platform/keybinding/common/keybindingResolver.ts"
+    ],
+    "relevant_files": [
+      "src/vs/platform/keybinding/common/keybindingResolver.ts"
+    ],
+    "root_cause_description": "KeybindingResolver.resolve did not correctly score negated context key expressions when ranking competing chord bindings, causing a binding with a stricter negated when-clause to lose to a more general one that should have been shadowed.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "vscode-004",
+    "repo": "microsoft/vscode",
+    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "source": "github issue",
+    "issue_url": "https://github.com/microsoft/vscode/issues/227843",
+    "query": "Debug hover does not evaluate expressions containing await when stopped at a breakpoint inside an async function",
+    "category": "editor",
+    "ground_truth_files": [
+      "src/vs/workbench/contrib/debug/browser/debugHover.ts"
+    ],
+    "relevant_files": [
+      "src/vs/workbench/contrib/debug/browser/debugHover.ts",
+      "src/vs/workbench/contrib/debug/browser/debugEditorContribution.ts",
+      "src/vs/workbench/contrib/debug/common/debugModel.ts"
+    ],
+    "root_cause_description": "debugHover extracted the hovered expression text by word-boundary splitting rather than using the language-aware expression evaluator, causing multi-token expressions with await to be truncated to just the identifier token and evaluated incorrectly.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "kubernetes-001",
+    "repo": "kubernetes/kubernetes",
+    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "source": "github issue",
+    "issue_url": "https://github.com/kubernetes/kubernetes/issues/128855",
+    "query": "Scheduler skips nodes whose resource capacity exactly matches pod request due to off-by-one in NodeResourcesFit filter comparison",
+    "category": "scheduler",
+    "ground_truth_files": [
+      "pkg/scheduler/framework/plugins/noderesources/fit.go"
+    ],
+    "relevant_files": [
+      "pkg/scheduler/framework/plugins/noderesources/fit.go",
+      "pkg/scheduler/schedule_one.go"
+    ],
+    "root_cause_description": "fitsRequest used strict less-than instead of less-than-or-equal when comparing available capacity to requested resources, causing nodes where capacity exactly equals the request to be incorrectly marked as insufficient.",
+    "difficulty": "simple"
+  },
+  {
+    "id": "kubernetes-002",
+    "repo": "kubernetes/kubernetes",
+    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "source": "github issue",
+    "issue_url": "https://github.com/kubernetes/kubernetes/issues/126287",
+    "query": "PodTopologySpread scoring produces uneven distribution when topology domains have zero running pods and minDomains is set",
+    "category": "scheduler",
+    "ground_truth_files": [
+      "pkg/scheduler/framework/plugins/podtopologyspread/scoring.go"
+    ],
+    "relevant_files": [
+      "pkg/scheduler/framework/plugins/podtopologyspread/scoring.go",
+      "pkg/scheduler/framework/plugins/podtopologyspread/common.go",
+      "pkg/scheduler/framework/plugins/podtopologyspread/filtering.go"
+    ],
+    "root_cause_description": "The NormalizeScore step assigned a score of zero to domains that had no running pods when minDomains constraint was active, instead of treating them as preferred spread targets, which caused the scheduler to pack pods into already-occupied domains.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "kubernetes-003",
+    "repo": "kubernetes/kubernetes",
+    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "source": "github issue",
+    "issue_url": "https://github.com/kubernetes/kubernetes/issues/124847",
+    "query": "Deployment controller stalls when rolling update maxUnavailable is zero and pod readiness probe begins failing mid-rollout",
+    "category": "controller",
+    "ground_truth_files": [
+      "pkg/controller/deployment/deployment_controller.go"
+    ],
+    "relevant_files": [
+      "pkg/controller/deployment/deployment_controller.go",
+      "pkg/controller/deployment/util/deployment_util.go"
+    ],
+    "root_cause_description": "The deployment controller's rollout progress check did not account for pods that transitioned from Ready to NotReady mid-rollout; with maxUnavailable=0 it incorrectly blocked the rollout rather than retrying after the readiness re-check interval.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "kubernetes-004",
+    "repo": "kubernetes/kubernetes",
+    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "source": "github issue",
+    "issue_url": "https://github.com/kubernetes/kubernetes/issues/122718",
+    "query": "kubelet volume manager deadlocks when reconciler detaches a volume while attach/detach controller holds the global volume lock",
+    "category": "kubelet",
+    "ground_truth_files": [
+      "pkg/kubelet/volumemanager/volume_manager.go"
+    ],
+    "relevant_files": [
+      "pkg/kubelet/volumemanager/volume_manager.go",
+      "pkg/kubelet/kubelet_pods.go"
+    ],
+    "root_cause_description": "The kubelet volume manager reconciler acquired the global volume lock while calling into the attach/detach controller, which itself held the same lock during its own reconciliation pass, creating a deadlock when both loops ran concurrently.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "rust-001",
+    "repo": "rust-lang/rust",
+    "repo_root": "D:\\GitHub\\bench-repos\\rust",
+    "source": "github issue",
+    "issue_url": "https://github.com/rust-lang/rust/issues/130528",
+    "query": "Borrow checker emits confusing error message about lifetime mismatch when returning a reference from a closure that captures a local",
+    "category": "compiler",
+    "ground_truth_files": [
+      "compiler/rustc_borrowck/src/diagnostics/region_errors.rs"
+    ],
+    "relevant_files": [
+      "compiler/rustc_borrowck/src/diagnostics/region_errors.rs",
+      "compiler/rustc_borrowck/src/diagnostics/mod.rs",
+      "compiler/rustc_borrowck/src/diagnostics/region_name.rs"
+    ],
+    "root_cause_description": "region_errors.rs did not special-case closures that capture a local by reference when generating the lifetime mismatch diagnostic, producing a generic 'lifetime may not live long enough' message with no pointer to the captured variable.",
+    "difficulty": "medium"
+  },
+  {
+    "id": "rust-002",
+    "repo": "rust-lang/rust",
+    "repo_root": "D:\\GitHub\\bench-repos\\rust",
+    "source": "github issue",
+    "issue_url": "https://github.com/rust-lang/rust/issues/127961",
+    "query": "Type checker incorrectly accepts coercion from fn pointer with higher-ranked lifetime to fn pointer without lifetime bound",
+    "category": "compiler",
+    "ground_truth_files": [
+      "compiler/rustc_hir_typeck/src/coercion.rs"
+    ],
+    "relevant_files": [
+      "compiler/rustc_hir_typeck/src/coercion.rs",
+      "compiler/rustc_infer/src/infer/mod.rs",
+      "compiler/rustc_trait_selection/src/traits/mod.rs"
+      ],
+    "root_cause_description": "coerce_from_fn_pointer did not instantiate higher-ranked lifetime binders before comparing fn pointer types, allowing the type checker to accept an unsound coercion that stripped the for<'a> lifetime bound from the source type.",
+    "difficulty": "complex"
+  },
+  {
+    "id": "rust-003",
+    "repo": "rust-lang/rust",
+    "repo_root": "D:\\GitHub\\bench-repos\\rust",
+    "source": "github issue",
+    "issue_url": "https://github.com/rust-lang/rust/issues/126452",
+    "query": "MIR inliner panics with index out of bounds when inlining a function whose local declarations include compiler-generated temporaries from a match expression",
+    "category": "compiler",
+    "ground_truth_files": [
+      "compiler/rustc_mir_transform/src/inline.rs"
+    ],
+    "relevant_files": [
+      "compiler/rustc_mir_transform/src/inline.rs",
+      "compiler/rustc_mir_transform/src/lib.rs"
+    ],
+    "root_cause_description": "The MIR inliner remapped local indices for the callee body without accounting for compiler-synthesized temporaries inserted during match lowering, causing the remapped index to exceed the local declaration count and panic with an out-of-bounds access.",
+    "difficulty": "medium"
+  }
+]
