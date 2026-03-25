@@ -372,12 +372,14 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
     for cmd in cmd_rx {
         match cmd {
             WorkerCommand::QueryGraph { pattern, target, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "query_graph").entered();
                 let result = crate::tools::query_graph_with_store(&store, &root, &pattern, &target, compact)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
             WorkerCommand::SemanticSearch { query, kind, limit, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "semantic_search").entered();
                 let result = crate::tools::semantic_search_nodes_with_store(
                     &store, &mut emb_store, &root, &query, kind.as_deref(), limit, compact,
                 ).map_err(|e| e.to_string());
@@ -385,18 +387,21 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::OpenNodeContext { target, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "open_node_context").entered();
                 let result = crate::tools::open_node_context_with_store(&store, &root, &target, compact)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
             WorkerCommand::BatchNodeContext { targets, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "batch_node_context").entered();
                 let result = crate::tools::batch_open_node_context_with_store(&store, &root, targets, compact)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
             WorkerCommand::ImpactRadius { changed_files, max_depth, compact, base, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "impact_radius").entered();
                 let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
                 let result = crate::tools::get_impact_radius_with_store(&store, &root, files, max_depth, compact)
                     .map_err(|e| e.to_string());
@@ -404,24 +409,28 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::TraceCallChain { from, to, max_depth, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "trace_call_chain").entered();
                 let result = crate::tools::trace_call_chain_with_store(&store, &root, &from, &to, max_depth, compact)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
             WorkerCommand::HybridQuery { query, limit, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
                 let result = crate::tools::hybrid_query_with_store(&store, &mut emb_store, &root, &query, limit, compact)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
             WorkerCommand::ListStats { reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "list_stats").entered();
                 let result = crate::tools::list_graph_stats_with_store(&store, &root)
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
 
             WorkerCommand::FindLargeFunctions { min_lines, kind, file_path_pattern, limit, compact, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "find_large_functions").entered();
                 let result = crate::tools::find_large_functions_with_store(
                     &store, &root, min_lines, kind.as_deref(), file_path_pattern.as_deref(), limit, compact,
                 ).map_err(|e| e.to_string());
@@ -429,6 +438,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::GetReviewContext { changed_files, max_depth, include_source, max_lines, compact, base, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "get_review_context").entered();
                 let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
                 let result = crate::tools::get_review_context_with_store(
                     &store, &root, files, max_depth, include_source, max_lines, compact,
@@ -437,6 +447,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::BuildGraph { full_rebuild, base, reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "build_graph").entered();
                 // build_or_update_graph opens its own store, writes to disk, closes it.
                 let root_str = root.as_str().to_owned();
                 let result = crate::tools::build_or_update_graph(full_rebuild, Some(&root_str), &base)
@@ -447,6 +458,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::EmbedGraph { reply } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "embed_graph").entered();
                 // embed_graph opens its own stores, writes to disk, closes them.
                 let root_str = root.as_str().to_owned();
                 let result = crate::tools::embed_graph(Some(&root_str))
@@ -457,6 +469,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::WatcherUpdate { paths } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "watcher_update").entered();
                 // Track processed paths to guard against circular import cycles.
                 let mut processed: HashSet<String> = paths
                     .iter()
@@ -529,6 +542,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
             }
 
             WorkerCommand::WatcherRemove { paths } => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "watcher_remove").entered();
                 for path in &paths {
                     let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
                     tree_cache.remove(&abs_str);

@@ -608,6 +608,8 @@ pub struct EmbeddingStore {
     data: EmbeddingData,
     path: Utf8PathBuf,
     provider: Option<Box<dyn EmbeddingProvider>>,
+    #[cfg(feature = "hnsw-index")]
+    hnsw_cache: Option<HnswIndex>,
 }
 
 impl EmbeddingStore {
@@ -636,6 +638,8 @@ impl EmbeddingStore {
             data,
             path: store_path.to_path_buf(),
             provider,
+            #[cfg(feature = "hnsw-index")]
+            hnsw_cache: None,
         })
     }
 
@@ -681,6 +685,8 @@ impl EmbeddingStore {
             for k in &stale_keys {
                 self.data.vectors.remove(k);
             }
+            #[cfg(feature = "hnsw-index")]
+            { self.hnsw_cache = None; }
         }
         Ok(removed)
     }
@@ -820,6 +826,8 @@ pub fn embed_all_nodes(
     }
 
     emb_store.save()?;
+    #[cfg(feature = "hnsw-index")]
+    { emb_store.hnsw_cache = None; }
     Ok(count)
 }
 
@@ -840,19 +848,6 @@ pub fn semantic_search(
         return Ok(nodes.iter().map(|n| node_to_dict(n, compact)).collect());
     }
 
-    // GC stale embeddings when vector count has grown more than 20% beyond live nodes.
-    {
-        let live_count: usize = store
-            .get_all_files()
-            .unwrap_or_default()
-            .iter()
-            .map(|f| store.get_nodes_by_file(f).unwrap_or_default().len())
-            .sum();
-        if emb_store.data.vectors.len() > live_count.saturating_add(live_count / 5) {
-            emb_store.gc(store)?;
-        }
-    }
-
     let provider = emb_store.provider.as_ref().expect("provider checked above");
 
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
@@ -861,18 +856,23 @@ pub fn semantic_search(
     // Use HNSW approximate nearest-neighbour search when the feature is compiled in.
     #[cfg(feature = "hnsw-index")]
     {
-        match HnswIndex::build(emb_store) {
-            Ok(idx) => {
-                let scored = idx
-                    .search(query_vec, limit)
-                    .into_iter()
-                    .map(|(qn, s)| (qn, s as f64))
-                    .collect::<Vec<_>>();
-                return nodes_from_scored(scored, store, compact, repo_root);
+        let cached = emb_store.hnsw_cache.is_some();
+        let _span = tracing::info_span!("hnsw_search", cached).entered();
+        if emb_store.hnsw_cache.is_none() {
+            match HnswIndex::build(emb_store) {
+                Ok(idx) => { emb_store.hnsw_cache = Some(idx); }
+                Err(e) => {
+                    tracing::warn!("HNSW index build failed ({}); falling back to linear scan", e);
+                }
             }
-            Err(e) => {
-                tracing::warn!("HNSW index build failed ({}); falling back to linear scan", e);
-            }
+        }
+        if let Some(ref idx) = emb_store.hnsw_cache {
+            let scored = idx
+                .search(query_vec, limit)
+                .into_iter()
+                .map(|(qn, s)| (qn, s as f64))
+                .collect::<Vec<_>>();
+            return nodes_from_scored(scored, store, compact, repo_root);
         }
     }
 

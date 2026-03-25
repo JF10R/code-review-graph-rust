@@ -119,7 +119,10 @@ fn get_store(repo_root: Option<&str>) -> Result<(GraphStore, Utf8PathBuf)> {
         None => incremental::find_project_root(None),
     };
     let db_path = incremental::get_db_path(&root);
-    let store = GraphStore::new(&db_path)?;
+    let store = {
+        let _span = tracing::info_span!("graph_open", path = %db_path).entered();
+        GraphStore::new(&db_path)?
+    };
     Ok((store, root))
 }
 
@@ -131,6 +134,7 @@ fn get_store(repo_root: Option<&str>) -> Result<(GraphStore, Utf8PathBuf)> {
 /// Only checks git status (fast, ~10-50ms) — doesn't re-hash all files.
 /// Skipped if the graph was updated less than 2 seconds ago.
 fn maybe_auto_update(store: &mut GraphStore, repo_root: &Utf8Path) {
+    let _span = tracing::info_span!("auto_update_check").entered();
     // Skip if graph was updated less than 2 seconds ago
     if let Ok(Some(last)) = store.get_metadata("last_updated") {
         if let Ok(last_time) = chrono::NaiveDateTime::parse_from_str(&last, "%Y-%m-%dT%H:%M:%S") {
@@ -706,7 +710,10 @@ pub fn semantic_search_nodes(
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
     let emb_db_path = incremental::get_embeddings_db_path(&root);
-    let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
+    let mut emb_store = {
+        let _span = tracing::info_span!("embedding_load").entered();
+        EmbeddingStore::new(&emb_db_path)?
+    };
     let result = semantic_search_nodes_with_store(&store, &mut emb_store, &root, query, kind, limit, compact)?;
     emb_store.close()?;
     store.close()?;
