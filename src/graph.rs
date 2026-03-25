@@ -309,7 +309,8 @@ impl GraphStore {
     /// then alphabetically by name for stable ordering within each tier.
     ///
     /// Path-aware adjustments:
-    /// - Nodes whose file path matches query words are promoted by one tier.
+    /// - Nodes whose file path matches query words are promoted by one tier,
+    ///   but never into tier 0 (exact match always wins).
     /// - Nodes in compiled/minified paths (e.g. `/compiled/`, `/node_modules/`, `/.next/`)
     ///   are demoted by one tier.
     pub fn search_nodes(&self, query: &str, limit: usize) -> Result<Vec<GraphNode>> {
@@ -345,9 +346,10 @@ impl GraphStore {
                     2u8
                 };
 
-                // Path-segment boost: promote if any query word appears in the file path.
-                if relevance > 0 && words.iter().any(|w| path_lower.contains(w.as_str())) {
-                    relevance = relevance.saturating_sub(1);
+                // Path-segment boost: promote by one tier if any query word appears
+                // in the file path, but never into tier 0 (exact match always wins).
+                if relevance > 1 && words.iter().any(|w| path_lower.contains(w.as_str())) {
+                    relevance -= 1;
                 }
 
                 // Demote compiled/minified paths.
@@ -1296,30 +1298,31 @@ mod tests {
     #[test]
     fn search_nodes_path_segment_boosts_relevant_results() {
         let (mut store, _dir) = test_store();
-        // Node in a config path
+        // Both nodes share the same name so they start in the same tier.
+        // The only differentiator is that the config-path node's file path
+        // contains "config", triggering the path-segment boost (tier 2 -> 1).
         let config_node = make_node(
-            "validate",
-            "src/config.ts::validate",
+            "validate_config",
+            "src/config.ts::validate_config",
             "src/config.ts",
             NodeKind::Function,
         );
-        // Node in a compiled path
-        let compiled_node = make_node(
-            "validate",
-            "compiled/utils.js::validate",
-            "compiled/utils.js",
+        let other_node = make_node(
+            "validate_config",
+            "src/helpers.ts::validate_config",
+            "src/helpers.ts",
             NodeKind::Function,
         );
         store
             .store_file_nodes_edges("src/config.ts", &[config_node], &[], "h1")
             .unwrap();
         store
-            .store_file_nodes_edges("compiled/utils.js", &[compiled_node], &[], "h2")
+            .store_file_nodes_edges("src/helpers.ts", &[other_node], &[], "h2")
             .unwrap();
 
         let results = store.search_nodes("validate config", 10).unwrap();
-        assert!(results.len() >= 1);
-        // The config path node should rank first (path matches "config")
+        assert_eq!(results.len(), 2);
+        // The config-path node should rank first (path matches "config")
         assert_eq!(results[0].file_path, "src/config.ts");
     }
 
@@ -1352,37 +1355,31 @@ mod tests {
     }
 
     #[test]
-    fn search_nodes_file_node_matches_path_segments() {
+    fn search_nodes_path_matches_when_name_does_not() {
         let (mut store, _dir) = test_store();
-        // A File node — its name IS the file path
-        let file_node = make_node(
-            "src/server/config-shared.ts",
-            "src/server/config-shared.ts",
-            "src/server/config-shared.ts",
-            NodeKind::File,
-        );
-        let func_node = make_node(
-            "parseConfig",
-            "src/utils.ts::parseConfig",
-            "src/utils.ts",
+        // A non-File node whose name and qualified_name do NOT contain
+        // "config", but whose file_path does.  This proves that
+        // path_lower matching works independently of name matching.
+        let path_only_node = make_node(
+            "validate",
+            "src/config/validate.ts::validate",
+            "src/config/validate.ts",
             NodeKind::Function,
         );
         store
             .store_file_nodes_edges(
-                "src/server/config-shared.ts",
-                &[file_node],
+                "src/config/validate.ts",
+                &[path_only_node],
                 &[],
                 "h1",
             )
             .unwrap();
-        store
-            .store_file_nodes_edges("src/utils.ts", &[func_node], &[], "h2")
-            .unwrap();
 
         let results = store.search_nodes("config", 10).unwrap();
-        assert!(results.len() >= 1);
-        // File node should appear because "config" is in its path/name
-        assert!(results.iter().any(|n| n.name.contains("config-shared")));
+        assert_eq!(results.len(), 1);
+        // Found via file_path, not via name
+        assert_eq!(results[0].name, "validate");
+        assert_eq!(results[0].file_path, "src/config/validate.ts");
     }
 
     // -----------------------------------------------------------------------
