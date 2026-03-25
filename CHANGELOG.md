@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.3.0
+
+### Performance
+
+- **`get_edges_among` rewrite** — Impact radius and review context queries now iterate only edges incident to the subgraph nodes (O(degree sum)) instead of scanning all edges in the graph (O(E)). **10-100x faster** for typical impact queries where the subgraph is small relative to the full graph.
+- **`file_hash_unchanged` O(1) lookup** — Incremental update hash check uses direct `HashMap::get` instead of cloning all nodes in a file. Eliminates O(n) allocations per file during change detection.
+- **Parallel incremental parsing** — `incremental_update` now uses `rayon::par_iter` for the tree-sitter parse phase, matching the parallelism already used by `full_build`. **4-8x faster** incremental updates when multiple files change (e.g., branch switches).
+- **Precomputed lowercase search cache** — `search_nodes` no longer calls `to_lowercase()` on every node name per query. A `lowercase_cache` in `GraphData` is maintained incrementally on insert/remove, eliminating N string allocations per keyword search.
+
+### Experimental
+
+- **Convex combination fusion** — `hybrid_query` accepts `fusion: "cc"` to use min-max normalized convex combination (alpha=0.5) instead of RRF. Based on Pinecone's hybrid retrieval research (arxiv:2210.11934). RRF remains the default; CC is opt-in for evaluation.
+
 ## v1.2.0
 
 - **Release binaries** — Prebuilt binaries for Linux, macOS (x86_64 + ARM64), and Windows published to GitHub Releases on each version tag. No Rust toolchain needed.
