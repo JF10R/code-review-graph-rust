@@ -39,6 +39,10 @@ pub struct GraphData {
     metadata: HashMap<String, String>,
     /// file_path → SHA-256 (kept for hash-skip in incremental)
     file_hashes: HashMap<String, String>,
+    /// Precomputed lowercase names for fast keyword search.
+    /// Maps NodeIndex to (lowercase_name, lowercase_qualified_name).
+    #[serde(skip)]
+    lowercase_cache: HashMap<NodeIndex, (String, String)>,
 }
 
 impl GraphData {
@@ -49,6 +53,7 @@ impl GraphData {
             file_index: HashMap::new(),
             metadata: HashMap::new(),
             file_hashes: HashMap::new(),
+            lowercase_cache: HashMap::new(),
         }
     }
 }
@@ -103,10 +108,12 @@ impl GraphStore {
             GraphData::new()
         };
 
-        Ok(Self {
+        let mut store = Self {
             data,
             bin_path: db_path.to_path_buf(),
-        })
+        };
+        store.rebuild_lowercase_cache();
+        Ok(store)
     }
 
     // -- Write operations --
@@ -173,6 +180,10 @@ impl GraphStore {
                 file_hash: file_hash_owned.clone(),
             };
             let idx = self.data.graph.add_node(graph_node);
+            self.data.lowercase_cache.insert(idx, (
+                node_info.name.to_lowercase(),
+                norm_qn.to_lowercase(),
+            ));
             self.data
                 .node_index
                 .insert(norm_qn, idx);
@@ -231,6 +242,7 @@ impl GraphStore {
     pub fn compact(&mut self) -> Result<()> {
         self.commit()?;
         self.data = load(&self.bin_path)?;
+        self.rebuild_lowercase_cache();
         Ok(())
     }
 
@@ -268,6 +280,21 @@ impl GraphStore {
         Ok(self.data.file_index.keys().cloned().collect())
     }
 
+    /// Rebuild the lowercase name cache from all current nodes.
+    ///
+    /// Must be called after any deserialization because `lowercase_cache` is
+    /// `#[serde(skip)]` and defaults to empty on load.
+    fn rebuild_lowercase_cache(&mut self) {
+        self.data.lowercase_cache.clear();
+        for idx in self.data.graph.node_indices() {
+            let node = &self.data.graph[idx];
+            self.data.lowercase_cache.insert(
+                idx,
+                (node.name.to_lowercase(), node.qualified_name.to_lowercase()),
+            );
+        }
+    }
+
     /// Search nodes by name substring (multi-word AND logic, case-insensitive).
     ///
     /// Results are sorted by relevance: exact name match (0) > prefix match (1) > contains (2),
@@ -287,24 +314,22 @@ impl GraphStore {
             .data
             .node_index
             .iter()
-            .filter_map(|(qn, &idx)| {
-                let node = &self.data.graph[idx];
-                let name_lower = node.name.to_lowercase();
-                let qn_lower = qn.to_lowercase();
+            .filter_map(|(_, &idx)| {
+                let (name_lower, qn_lower) = self.data.lowercase_cache.get(&idx)?;
                 if !words
                     .iter()
                     .all(|w| name_lower.contains(w.as_str()) || qn_lower.contains(w.as_str()))
                 {
                     return None;
                 }
-                let relevance = if name_lower == query_lower || qn_lower == query_lower {
+                let relevance = if name_lower == &query_lower || qn_lower == &query_lower {
                     0u8
                 } else if name_lower.starts_with(&query_lower) {
                     1u8
                 } else {
                     2u8
                 };
-                Some((relevance, node.clone()))
+                Some((relevance, self.data.graph[idx].clone()))
             })
             .collect();
 
@@ -650,6 +675,7 @@ impl GraphStore {
                 let qn = node.qualified_name.clone();
                 self.data.node_index.remove(&qn);
             }
+            self.data.lowercase_cache.remove(idx);
             // StableGraph::remove_node also removes all incident edges
             self.data.graph.remove_node(*idx);
         }
