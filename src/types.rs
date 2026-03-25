@@ -260,8 +260,8 @@ pub struct NormalizedPrefix {
 }
 
 impl NormalizedPrefix {
-    pub fn new(repo_root: &std::path::Path) -> Self {
-        let fwd = repo_root.to_string_lossy().replace('\\', "/");
+    pub fn new(repo_root: &camino::Utf8Path) -> Self {
+        let fwd = repo_root.as_str().replace('\\', "/");
         let fwd_unc = format!("//?/{}", fwd);
         Self { fwd, fwd_unc }
     }
@@ -285,7 +285,7 @@ impl NormalizedPrefix {
 /// Strip the repo root prefix from `file_path` and `qualified_name` fields
 /// in a node dict. For batch operations, prefer `NormalizedPrefix::new()` +
 /// `.strip()` to avoid recomputing the prefix on every node.
-pub fn strip_paths_prefix(dict: &mut serde_json::Value, repo_root: &std::path::Path) {
+pub fn strip_paths_prefix(dict: &mut serde_json::Value, repo_root: &camino::Utf8Path) {
     NormalizedPrefix::new(repo_root).strip(dict);
 }
 

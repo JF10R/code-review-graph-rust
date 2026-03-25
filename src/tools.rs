@@ -12,8 +12,9 @@
 //! 9. find_large_functions
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use camino::{Utf8Path, Utf8PathBuf};
 
 use serde_json::{json, Value};
 
@@ -25,7 +26,7 @@ use crate::types::{edge_to_dict, node_to_dict, NormalizedPrefix, EdgeKind};
 
 /// Wrapper: build a node dict, then strip repo-root prefix if compact.
 /// For batch results, prefer `node_dict_batch` with a pre-computed prefix.
-fn node_dict(node: &crate::types::GraphNode, compact: bool, root: &Path) -> Value {
+fn node_dict(node: &crate::types::GraphNode, compact: bool, root: &Utf8Path) -> Value {
     let mut d = node_to_dict(node, compact);
     if compact {
         NormalizedPrefix::new(root).strip(&mut d);
@@ -99,29 +100,32 @@ fn is_builtin_call(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Validate that a path is a plausible project root.
-fn validate_repo_root(path: &Path) -> Result<PathBuf> {
-    let resolved = path.canonicalize().map_err(|e| {
-        CrgError::InvalidRepoRoot(format!("{}: {}", path.display(), e))
+fn validate_repo_root(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    let resolved_std = path.as_std_path().canonicalize().map_err(|e| {
+        CrgError::InvalidRepoRoot(format!("{}: {}", path, e))
+    })?;
+    let resolved = Utf8PathBuf::from_path_buf(resolved_std).map_err(|p| {
+        CrgError::InvalidRepoRoot(format!("non-UTF-8 path: {}", p.display()))
     })?;
     if !resolved.is_dir() {
         return Err(CrgError::InvalidRepoRoot(format!(
             "not a directory: {}",
-            resolved.display()
+            resolved
         )));
     }
     if !resolved.join(".git").exists() && !resolved.join(".code-review-graph").exists() {
         return Err(CrgError::InvalidRepoRoot(format!(
             "no .git or .code-review-graph found: {}",
-            resolved.display()
+            resolved
         )));
     }
     Ok(resolved)
 }
 
 /// Resolve repo root and open the graph store.
-fn get_store(repo_root: Option<&str>) -> Result<(GraphStore, PathBuf)> {
+fn get_store(repo_root: Option<&str>) -> Result<(GraphStore, Utf8PathBuf)> {
     let root = match repo_root {
-        Some(p) => validate_repo_root(Path::new(p))?,
+        Some(p) => validate_repo_root(Utf8Path::new(p))?,
         None => incremental::find_project_root(None),
     };
     let db_path = incremental::get_db_path(&root);
@@ -136,7 +140,7 @@ fn get_store(repo_root: Option<&str>) -> Result<(GraphStore, PathBuf)> {
 /// Check if the graph is stale and run a quick incremental update if needed.
 /// Only checks git status (fast, ~10-50ms) — doesn't re-hash all files.
 /// Skipped if the graph was updated less than 2 seconds ago.
-fn maybe_auto_update(store: &mut GraphStore, repo_root: &Path) {
+fn maybe_auto_update(store: &mut GraphStore, repo_root: &Utf8Path) {
     // Skip if graph was updated less than 2 seconds ago
     if let Ok(Some(last)) = store.get_metadata("last_updated") {
         if let Ok(last_time) = chrono::NaiveDateTime::parse_from_str(&last, "%Y-%m-%dT%H:%M:%S") {
@@ -263,7 +267,7 @@ pub fn get_impact_radius(
     }
 
     let abs_files: Vec<String> = files.iter()
-        .map(|f| root.join(f).to_string_lossy().into_owned())
+        .map(|f| root.join(f).as_str().to_owned())
         .collect();
 
     let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS, None)?;
@@ -494,7 +498,7 @@ pub fn query_graph(
         QueryPattern::ImportersOf => {
             let abs_target = node.as_ref()
                 .map(|n| n.file_path.clone())
-                .unwrap_or_else(|| root.join(target).to_string_lossy().into_owned());
+                .unwrap_or_else(|| root.join(target).as_str().to_owned());
             for e in store.get_edges_by_target(&abs_target)? {
                 if e.kind == EdgeKind::ImportsFrom {
                     results.push(json!({ "importer": e.source_qualified, "file": e.file_path }));
@@ -553,7 +557,7 @@ pub fn query_graph(
                     // then fall back to root-relative join.
                     let as_is = target.to_string();
                     if store.get_nodes_by_file(&as_is)?.is_empty() {
-                        root.join(target).to_string_lossy().into_owned()
+                        root.join(target).as_str().to_owned()
                     } else {
                         as_is
                     }
@@ -605,7 +609,7 @@ pub fn get_review_context(
     }
 
     let abs_files: Vec<String> = files.iter()
-        .map(|f| root.join(f).to_string_lossy().into_owned())
+        .map(|f| root.join(f).as_str().to_owned())
         .collect();
 
     let impact = store.get_impact_radius(&abs_files, max_depth, 500, None)?;
@@ -637,7 +641,7 @@ pub fn get_review_context(
             };
             let lines: Vec<&str> = content.lines().collect();
             let snippet = if lines.len() > max_lines_per_file {
-                extract_relevant_lines(&lines, &impact.changed_nodes, &full_path.to_string_lossy())
+                extract_relevant_lines(&lines, &impact.changed_nodes, full_path.as_str())
             } else {
                 lines.iter().enumerate()
                     .map(|(i, line)| format!("{}: {}", i + 1, line))
@@ -737,8 +741,8 @@ pub fn list_graph_stats(repo_root: Option<&str>) -> Result<Value> {
     let stats = store.get_stats()?;
 
     let root_name = root.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| root.as_str().to_owned());
 
     let languages = if stats.languages.is_empty() {
         "none".to_string()
@@ -832,10 +836,10 @@ pub fn embed_graph(repo_root: Option<&str>) -> Result<Value> {
 // ---------------------------------------------------------------------------
 
 pub fn get_docs_section(section_name: &str, repo_root: Option<&str>) -> Result<Value> {
-    let mut search_roots: Vec<PathBuf> = vec![];
+    let mut search_roots: Vec<Utf8PathBuf> = vec![];
 
     if let Some(p) = repo_root {
-        search_roots.push(PathBuf::from(p));
+        search_roots.push(Utf8PathBuf::from(p));
     }
 
     if let Ok((store, root)) = get_store(repo_root) {
@@ -1009,7 +1013,7 @@ pub fn measure_token_reduction(
     // Context bytes: size of graph-filtered impact context
     let files = resolve_changed_files(changed_files, &root, base);
     let abs_files: Vec<String> = files.iter()
-        .map(|f| root.join(f).to_string_lossy().into_owned())
+        .map(|f| root.join(f).as_str().to_owned())
         .collect();
 
     let context_bytes: u64 = if abs_files.is_empty() {
@@ -1063,9 +1067,9 @@ pub fn find_large_functions(
         } else {
             0
         };
-        let relative_path = Path::new(&n.file_path)
+        let relative_path = Utf8Path::new(&n.file_path)
             .strip_prefix(&root)
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.as_str().to_owned())
             .unwrap_or_else(|_| n.file_path.clone());
         let mut d = node_dict(n, compact, &root);
         d["line_count"] = json!(line_count);
@@ -1202,7 +1206,7 @@ pub fn trace_call_chain(
 /// Resolve changed files from the provided list or from git diff.
 fn resolve_changed_files(
     changed_files: Option<Vec<String>>,
-    root: &Path,
+    root: &Utf8Path,
     base: &str,
 ) -> Vec<String> {
     if let Some(files) = changed_files {
@@ -1225,12 +1229,12 @@ enum ResolveResult {
 fn resolve_target_node(
     store: &GraphStore,
     target: &str,
-    root: &Path,
+    root: &Utf8Path,
 ) -> Result<ResolveResult> {
     if let Some(node) = store.get_node(target)? {
         return Ok(ResolveResult::Found(node));
     }
-    let abs_target = root.join(target).to_string_lossy().into_owned();
+    let abs_target = root.join(target).as_str().to_owned();
     if let Some(node) = store.get_node(&abs_target)? {
         return Ok(ResolveResult::Found(node));
     }
@@ -1362,7 +1366,7 @@ mod tests {
     fn make_git_repo() -> (TempDir, String) {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
-        let path = dir.path().to_string_lossy().into_owned();
+        let path = dir.path().to_str().expect("temp dir path is valid UTF-8").to_owned();
         (dir, path)
     }
 
@@ -1370,9 +1374,13 @@ mod tests {
     // validate_repo_root
     // -----------------------------------------------------------------------
 
+    fn tp(path: &std::path::Path) -> &Utf8Path {
+        Utf8Path::from_path(path).expect("test path is valid UTF-8")
+    }
+
     #[test]
     fn validate_repo_root_rejects_nonexistent() {
-        let result = validate_repo_root(Path::new("/nonexistent/path/that/does/not/exist"));
+        let result = validate_repo_root(Utf8Path::new("/nonexistent/path/that/does/not/exist"));
         assert!(result.is_err());
     }
 
@@ -1380,14 +1388,14 @@ mod tests {
     fn validate_repo_root_rejects_dir_without_git() {
         let dir = TempDir::new().unwrap();
         // No .git, no .code-review-graph
-        let result = validate_repo_root(dir.path());
+        let result = validate_repo_root(tp(dir.path()));
         assert!(result.is_err(), "dir without .git should be rejected");
     }
 
     #[test]
     fn validate_repo_root_accepts_git_repo() {
         let (dir, _) = make_git_repo();
-        let result = validate_repo_root(dir.path());
+        let result = validate_repo_root(tp(dir.path()));
         assert!(result.is_ok(), "dir with .git should be accepted");
     }
 
@@ -1395,7 +1403,7 @@ mod tests {
     fn validate_repo_root_accepts_code_review_graph_dir() {
         let dir = TempDir::new().unwrap();
         fs::create_dir(dir.path().join(".code-review-graph")).unwrap();
-        let result = validate_repo_root(dir.path());
+        let result = validate_repo_root(tp(dir.path()));
         assert!(result.is_ok(), "dir with .code-review-graph should be accepted");
     }
 

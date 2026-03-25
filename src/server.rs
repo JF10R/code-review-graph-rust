@@ -20,8 +20,9 @@ use rmcp::{
 };
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
+
+use camino::Utf8PathBuf;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -503,11 +504,11 @@ impl ServerHandler for CodeReviewServer {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Resolve a server-level repo root string to a `PathBuf`, or fall back to
+/// Resolve a server-level repo root string to a `Utf8PathBuf`, or fall back to
 /// the project root auto-detection logic used by `tools.rs`.
-fn resolve_root(repo_root: Option<&str>) -> PathBuf {
+fn resolve_root(repo_root: Option<&str>) -> Utf8PathBuf {
     match repo_root {
-        Some(p) => PathBuf::from(p),
+        Some(p) => Utf8PathBuf::from(p),
         None => crate::incremental::find_project_root(None),
     }
 }
@@ -570,7 +571,7 @@ fn watcher_parse_and_store(
 /// processes the batch, saves to disk, then drops the store. This keeps the
 /// locking surface minimal and is safe with the per-call `get_store()` pattern
 /// used by the tool handlers.
-fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
+fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
     use crate::incremental::{get_db_path, load_ignore_patterns_pub, find_dependents};
@@ -591,12 +592,12 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
     debouncer
         .watcher()
-        .watch(&repo_root, RecursiveMode::Recursive)
+        .watch(repo_root.as_std_path(), RecursiveMode::Recursive)
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
 
     tracing::info!(
         "Background watcher active — watching {}",
-        repo_root.display()
+        repo_root
     );
 
     for result in rx {
@@ -608,15 +609,16 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
             }
         };
 
-        let mut paths_to_update: HashSet<PathBuf> = HashSet::new();
-        let mut paths_to_remove: HashSet<PathBuf> = HashSet::new();
+        // notify returns std::path::PathBuf — keep as-is until we need string boundaries
+        let mut paths_to_update: HashSet<std::path::PathBuf> = HashSet::new();
+        let mut paths_to_remove: HashSet<std::path::PathBuf> = HashSet::new();
 
         for event in events {
             let path = event.path;
             if path.is_symlink() {
                 continue;
             }
-            let rel = match path.strip_prefix(&repo_root) {
+            let rel = match path.strip_prefix(repo_root.as_std_path()) {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
@@ -653,7 +655,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                 tracing::error!("Watcher remove {}: {}", abs_str, e);
             } else {
                 let rel = path
-                    .strip_prefix(&repo_root)
+                    .strip_prefix(repo_root.as_std_path())
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| abs_str.clone());
                 tracing::info!("Watcher removed: {}", rel);
@@ -680,7 +682,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
                     );
                     let rel = path
-                        .strip_prefix(&repo_root)
+                        .strip_prefix(repo_root.as_std_path())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
                     tracing::info!(
@@ -696,7 +698,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                             continue;
                         }
                         processed.insert(dep_path.clone());
-                        let dep = std::path::PathBuf::from(dep_path);
+                        let dep = std::path::Path::new(dep_path);
                         let dep_old_tree = tree_cache.get(dep_path.as_str());
                         match watcher_parse_and_store(&parser, &mut store, &dep, dep_old_tree) {
                             Ok(Some((dn, de, dep_new_tree))) => {
@@ -718,7 +720,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                 }
                 Ok(None) => {
                     let rel = path
-                        .strip_prefix(&repo_root)
+                        .strip_prefix(repo_root.as_std_path())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| abs_str.clone());
                     tracing::debug!("Watcher skipped (hash unchanged): {}", rel);

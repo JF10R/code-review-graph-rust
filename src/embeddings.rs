@@ -18,7 +18,7 @@
 //! postcard/zstd pattern as `graph.rs`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use camino::{Utf8Path, Utf8PathBuf};
 
 #[cfg(feature = "hnsw-index")]
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
@@ -46,11 +46,11 @@ struct EmbeddingData {
 // Persistence helpers (delegates to crate::persistence)
 // ---------------------------------------------------------------------------
 
-fn save_embedding_data(data: &EmbeddingData, path: &Path) -> Result<()> {
+fn save_embedding_data(data: &EmbeddingData, path: &std::path::Path) -> Result<()> {
     persistence::save_blob(data, path, "embeddings")
 }
 
-fn load_embedding_data(path: &Path) -> Result<EmbeddingData> {
+fn load_embedding_data(path: &std::path::Path) -> Result<EmbeddingData> {
     persistence::load_blob(path, "embeddings")
 }
 
@@ -605,7 +605,7 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
 /// Embedding storage backed by a postcard/zstd file.
 pub struct EmbeddingStore {
     data: EmbeddingData,
-    path: PathBuf,
+    path: Utf8PathBuf,
     provider: Option<Box<dyn EmbeddingProvider>>,
 }
 
@@ -613,14 +613,14 @@ impl EmbeddingStore {
     /// Open (or create) the embedding store.
     ///
     /// `store_path` should point to a `.embeddings.bin.zst` file.
-    pub fn new(store_path: &Path) -> Result<Self> {
+    pub fn new(store_path: &Utf8Path) -> Result<Self> {
         let data = if store_path.exists() {
-            match load_embedding_data(store_path) {
+            match load_embedding_data(store_path.as_std_path()) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
                         "Could not load embeddings from {}: {} — starting empty",
-                        store_path.display(),
+                        store_path,
                         e
                     );
                     EmbeddingData::default()
@@ -686,7 +686,7 @@ impl EmbeddingStore {
 
     /// Persist in-memory state to disk.
     pub fn save(&self) -> Result<()> {
-        save_embedding_data(&self.data, &self.path)
+        save_embedding_data(&self.data, self.path.as_std_path())
     }
 
     /// Close the store (no-op — nothing to flush unless explicitly saved).
@@ -832,7 +832,7 @@ pub fn semantic_search(
     emb_store: &mut EmbeddingStore,
     limit: usize,
     compact: bool,
-    repo_root: &std::path::Path,
+    repo_root: &Utf8Path,
 ) -> Result<Vec<serde_json::Value>> {
     if emb_store.provider.is_none() {
         let nodes = store.search_nodes(query, limit)?;
@@ -897,7 +897,7 @@ fn nodes_from_scored(
     scored: Vec<(String, f64)>,
     store: &GraphStore,
     compact: bool,
-    repo_root: &std::path::Path,
+    repo_root: &Utf8Path,
 ) -> Result<Vec<serde_json::Value>> {
     let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
     let mut results = Vec::with_capacity(scored.len());
@@ -951,6 +951,10 @@ pub fn node_to_text(node: &GraphNode) -> String {
 mod tests {
     use super::*;
     use crate::types::{GraphNode, NodeKind};
+
+    fn p(path: &std::path::Path) -> &Utf8Path {
+        Utf8Path::from_path(path).expect("test path is valid UTF-8")
+    }
 
     #[test]
     fn cosine_similarity_identical_vectors() {
@@ -1034,7 +1038,7 @@ mod tests {
     fn embedding_store_count_empty() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test.embeddings.bin.zst");
-        let store = EmbeddingStore::new(&path).unwrap();
+        let store = EmbeddingStore::new(p(&path)).unwrap();
         assert_eq!(store.count().unwrap(), 0);
     }
 
@@ -1042,14 +1046,14 @@ mod tests {
     fn embedding_store_save_reload_roundtrip() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test.embeddings.bin.zst");
-        let mut store = EmbeddingStore::new(&path).unwrap();
+        let mut store = EmbeddingStore::new(p(&path)).unwrap();
         store.data.vectors.insert(
             "mod::foo".to_string(),
             (vec![1.0, 2.0, 3.0], "hash1".to_string(), "test".to_string()),
         );
         store.save().unwrap();
 
-        let reloaded = EmbeddingStore::new(&path).unwrap();
+        let reloaded = EmbeddingStore::new(p(&path)).unwrap();
         assert_eq!(reloaded.count().unwrap(), 1);
         let (vec, hash, provider) = reloaded.data.vectors.get("mod::foo").unwrap();
         assert_eq!(vec, &[1.0, 2.0, 3.0]);

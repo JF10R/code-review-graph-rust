@@ -13,8 +13,7 @@
 //!   code-review-graph config list
 //!   code-review-graph config reset
 
-use std::path::PathBuf;
-
+use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -191,7 +190,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let store = code_review_graph::graph::GraphStore::new(&db_path)?;
             let html_path = root.join(".code-review-graph").join("graph.html");
             code_review_graph::visualization::generate_html(&store, &html_path)?;
-            println!("Visualization: {}", html_path.display());
+            println!("Visualization: {}", html_path);
             println!("Open in browser to explore your codebase graph.");
             store.close()?;
         }
@@ -217,13 +216,13 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 fn resolve_project_root(
     repo: Option<&str>,
     require_git: bool,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<Utf8PathBuf> {
     use code_review_graph::incremental;
 
     if let Some(r) = repo {
-        let path = PathBuf::from(r);
+        let path = Utf8PathBuf::from(r);
         if !path.is_dir() {
-            anyhow::bail!("Repository path is not a directory: {}", path.display());
+            anyhow::bail!("Repository path is not a directory: {}", path);
         }
         return Ok(path);
     }
@@ -245,8 +244,8 @@ fn resolve_project_root(
 fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     use code_review_graph::incremental;
 
-    let root: PathBuf = if let Some(r) = repo {
-        PathBuf::from(r)
+    let root: Utf8PathBuf = if let Some(r) = repo {
+        Utf8PathBuf::from(r)
     } else {
         incremental::find_project_root(None)
     };
@@ -272,7 +271,7 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
                     .and_then(|s| s.get("code-review-graph"))
                     .is_some()
                 {
-                    println!("Already configured in {}", mcp_path.display());
+                    println!("Already configured in {}", mcp_path);
                     return Ok(());
                 }
                 // Merge our entry in
@@ -292,7 +291,7 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
             Err(_) => {
                 eprintln!(
                     "Warning: existing {} has invalid JSON, overwriting.",
-                    mcp_path.display()
+                    mcp_path
                 );
                 entry
             }
@@ -304,7 +303,7 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     let json_str = serde_json::to_string_pretty(&final_config)?;
 
     if dry_run {
-        println!("[dry-run] Would write to {}:", mcp_path.display());
+        println!("[dry-run] Would write to {}:", mcp_path);
         println!("{}", json_str);
         println!();
         println!("[dry-run] No files were modified.");
@@ -312,7 +311,7 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
     }
 
     std::fs::write(&mcp_path, [json_str.as_bytes(), b"\n"].concat())?;
-    println!("Created {}", mcp_path.display());
+    println!("Created {}", mcp_path);
     println!();
     println!("Next steps:");
     println!("  1. code-review-graph build    # build the knowledge graph");
