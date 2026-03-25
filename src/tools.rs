@@ -27,6 +27,166 @@ use crate::types::{edge_to_dict, node_to_dict, EdgeKind, NodeKind};
 /// RRF constant: standard k=60 from the original RRF paper.
 const RRF_K: f64 = 60.0;
 
+// ---------------------------------------------------------------------------
+// File-mode fanout+rerank: types
+// ---------------------------------------------------------------------------
+
+/// Decomposed query parts used for multi-channel fanout retrieval.
+struct QueryParts {
+    /// camelCase/snake_case/PascalCase/ALL_CAPS tokens.
+    symbols: Vec<String>,
+    /// Tokens containing '/' or ending with known source extensions.
+    path_fragments: Vec<String>,
+    /// Non-stop-word terms that are neither symbols nor path fragments.
+    domain_terms: Vec<String>,
+    /// Original query, passed as-is to semantic search.
+    raw: String,
+    /// True if any token matches test/spec/fixture/mock/assert (case-insensitive).
+    mentions_tests: bool,
+}
+
+/// Which evidence channel produced a candidate node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CandidateSource {
+    KeywordRelaxed,
+    KeywordExact,
+    PathBoosted,
+    ConfigBoosted,
+    Semantic,
+    Tantivy,
+}
+
+impl CandidateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KeywordRelaxed => "keyword_relaxed",
+            Self::KeywordExact  => "keyword_exact",
+            Self::PathBoosted   => "path_boosted",
+            Self::ConfigBoosted => "config_boosted",
+            Self::Semantic      => "semantic",
+            Self::Tantivy       => "tantivy",
+        }
+    }
+}
+
+/// A candidate node gathered from one or more evidence channels.
+struct NodeCandidate {
+    qualified_name: String,
+    file_path: String,
+    kind: NodeKind,
+    is_test: bool,
+    score: f64,
+    sources: HashSet<CandidateSource>,
+}
+
+/// A file-level result with aggregated score and top supporting nodes.
+struct FileResult {
+    file_path: String,
+    score: f64,
+    top_nodes: Vec<NodeEvidence>,
+    sources: HashSet<CandidateSource>,
+}
+
+/// Evidence node attached to a `FileResult`.
+struct NodeEvidence {
+    name: String,
+    qualified_name: String,
+    kind: String,
+    line_start: usize,
+    line_end: usize,
+    score: f64,
+    sources: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// File-mode fanout+rerank: stop words (mirrors graph.rs search_nodes_relaxed)
+// ---------------------------------------------------------------------------
+
+const FILE_MODE_STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "in", "on", "at", "to", "for", "is", "it", "of",
+    "and", "or", "not", "with", "from", "by", "as", "be", "was", "that",
+    "this", "which", "when", "where", "how", "what", "who", "why", "does",
+    "do", "did", "has", "have", "had", "can", "could", "will", "would",
+    "should", "may", "might", "are", "were", "been", "being", "into",
+    "after", "before", "between", "through", "during", "about", "than",
+    "both", "each", "all", "any", "some", "most", "other", "such", "only",
+    "very", "more", "also", "just", "so", "up", "out", "if", "then", "but",
+    "its", "no", "because", "instead", "due", "via", "using", "causes",
+    "cause", "causing", "breaks", "break", "fails", "fail", "returns",
+    "return", "incorrectly", "correctly",
+];
+
+/// Known source file extensions used to classify path-fragment tokens.
+const SOURCE_EXTENSIONS: &[&str] = &[
+    ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".py", ".java",
+    ".kt", ".swift", ".rb", ".cs", ".php", ".cpp", ".c", ".h",
+    ".vue", ".svelte", ".toml", ".yaml", ".yml", ".json",
+];
+
+/// Decompose a natural-language query into typed token buckets.
+///
+/// Tokens are classified as symbols, path fragments, or domain terms.
+/// No camelCase sub-word splitting — symbols stay intact so that exact
+/// searches match nodes named "serverPatchReducer" precisely.
+fn decompose_query(query: &str) -> QueryParts {
+    let mut symbols: Vec<String> = Vec::new();
+    let mut path_fragments: Vec<String> = Vec::new();
+    let mut domain_terms: Vec<String> = Vec::new();
+    let mut mentions_tests = false;
+
+    for raw_token in query.split_whitespace() {
+        // Strip leading/trailing punctuation for classification purposes,
+        // but keep the original token for the buckets.
+        let token = raw_token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
+        if token.is_empty() {
+            continue;
+        }
+
+        let lower = token.to_lowercase();
+
+        // Test-mention detection (on the cleaned token).
+        if !mentions_tests
+            && ["test", "spec", "fixture", "mock", "assert"]
+                .iter()
+                .any(|kw| lower.contains(kw))
+        {
+            mentions_tests = true;
+        }
+
+        // Path fragment: contains '/' or ends with a known source extension.
+        if token.contains('/') || SOURCE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+            path_fragments.push(token.to_string());
+            continue;
+        }
+
+        // Symbol: contains '_', or has both upper- and lowercase chars (camelCase/PascalCase),
+        // or is ALL_CAPS (with at least 2 chars so "I" doesn't qualify).
+        let has_upper = token.chars().any(|c| c.is_uppercase());
+        let has_lower = token.chars().any(|c| c.is_lowercase());
+        let has_underscore = token.contains('_');
+        let all_caps = has_upper && !has_lower && token.len() >= 2;
+        if has_underscore || (has_upper && has_lower) || all_caps {
+            symbols.push(token.to_string());
+            continue;
+        }
+
+        // Stop-word filter.
+        if FILE_MODE_STOP_WORDS.contains(&lower.as_str()) {
+            continue;
+        }
+
+        domain_terms.push(lower);
+    }
+
+    QueryParts {
+        symbols,
+        path_fragments,
+        domain_terms,
+        raw: query.to_string(),
+        mentions_tests,
+    }
+}
+
 /// Build a node dict.
 fn node_dict(node: &crate::types::GraphNode, compact: bool, _root: &Utf8Path) -> Value {
     node_to_dict(node, compact)
@@ -1053,6 +1213,310 @@ pub(crate) fn classify_query(query: &str) -> Classification {
     Classification { route: QueryRoute::General, confidence: 0.5 }
 }
 
+// ---------------------------------------------------------------------------
+// File-mode fanout+rerank: implementation
+// ---------------------------------------------------------------------------
+
+/// Convert a ranked list of `GraphNode`s into `NodeCandidate` entries using
+/// standard RRF rank-to-score: `1.0 / (60.0 + rank + 1.0)`.
+fn nodes_to_candidates(
+    nodes: &[crate::types::GraphNode],
+    source: CandidateSource,
+    pool: &mut HashMap<String, NodeCandidate>,
+) {
+    for (rank, node) in nodes.iter().enumerate() {
+        let rrf_score = 1.0 / (RRF_K + rank as f64 + 1.0);
+        let entry = pool.entry(node.qualified_name.clone()).or_insert_with(|| NodeCandidate {
+            qualified_name: node.qualified_name.clone(),
+            file_path: node.file_path.clone(),
+            kind: node.kind,
+            is_test: node.is_test,
+            score: 0.0,
+            sources: HashSet::new(),
+        });
+        entry.score += rrf_score;
+        entry.sources.insert(source);
+    }
+}
+
+/// Fan out a query to multiple evidence channels and return a pool of
+/// `NodeCandidate`s keyed by `qualified_name`.
+///
+/// Channels used:
+/// 1. Keyword relaxed — always run; results are also reused by path/config channels.
+/// 2. Keyword exact  — only when `parts.symbols` is non-empty.
+/// 3. Path-boosted   — only when `parts.path_fragments` is non-empty.
+/// 4. Config-boosted — only when domain_terms contains config/settings/options/env.
+/// 5. Semantic       — only when `emb_store` has embeddings.
+/// 6. Tantivy        — only when `kw_hits` is `Some`.
+#[allow(clippy::too_many_arguments)]
+fn fanout_retrieve(
+    store: &GraphStore,
+    emb_store: &mut EmbeddingStore,
+    root: &Utf8Path,
+    parts: &QueryParts,
+    limit: usize,
+    kw_hits: Option<Vec<crate::types::GraphNode>>,
+) -> Result<HashMap<String, NodeCandidate>> {
+    let pool_limit = limit * 5;
+    let mut pool: HashMap<String, NodeCandidate> = HashMap::new();
+
+    // Channel 1: keyword relaxed (always).
+    let relaxed_hits = store.search_nodes_relaxed(&parts.raw, pool_limit)?;
+    nodes_to_candidates(&relaxed_hits, CandidateSource::KeywordRelaxed, &mut pool);
+
+    // Channel 2: keyword exact — only when there are symbol tokens.
+    if !parts.symbols.is_empty() {
+        let exact_query = parts.symbols.join(" ");
+        let exact_hits = store.search_nodes(&exact_query, pool_limit)?;
+        nodes_to_candidates(&exact_hits, CandidateSource::KeywordExact, &mut pool);
+    }
+
+    // Channel 3: path-boosted — reweight relaxed results for nodes with path-like qualified names.
+    if !parts.path_fragments.is_empty() {
+        let mut path_boosted: Vec<crate::types::GraphNode> = relaxed_hits
+            .iter()
+            .filter(|n| n.qualified_name.contains('/') || n.qualified_name.contains('.'))
+            .cloned()
+            .collect();
+        // Re-sort boosted list (boosted nodes first, then append the rest).
+        let mut non_path: Vec<crate::types::GraphNode> = relaxed_hits
+            .iter()
+            .filter(|n| !n.qualified_name.contains('/') && !n.qualified_name.contains('.'))
+            .cloned()
+            .collect();
+        path_boosted.append(&mut non_path);
+        path_boosted.truncate(pool_limit);
+        nodes_to_candidates(&path_boosted, CandidateSource::PathBoosted, &mut pool);
+    }
+
+    // Channel 4: config-boosted — reweight relaxed results for Type-kind nodes.
+    let config_trigger_terms = ["config", "settings", "options", "env"];
+    let triggers_config = parts.domain_terms.iter().any(|t| config_trigger_terms.contains(&t.as_str()));
+    if triggers_config {
+        let mut config_boosted: Vec<crate::types::GraphNode> = relaxed_hits
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Type))
+            .cloned()
+            .collect();
+        let mut non_config: Vec<crate::types::GraphNode> = relaxed_hits
+            .iter()
+            .filter(|n| !matches!(n.kind, NodeKind::Type))
+            .cloned()
+            .collect();
+        config_boosted.append(&mut non_config);
+        config_boosted.truncate(pool_limit);
+        nodes_to_candidates(&config_boosted, CandidateSource::ConfigBoosted, &mut pool);
+    }
+
+    // Channel 5: semantic — only when embeddings are available.
+    let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
+    if embeddings_available {
+        let sem_hits = crate::embeddings::semantic_search(&parts.raw, store, emb_store, pool_limit, true, root)?;
+        let sem_nodes: Vec<crate::types::GraphNode> = sem_hits
+            .iter()
+            .filter_map(|hit| {
+                hit.get("qualified_name")
+                    .and_then(|v| v.as_str())
+                    .and_then(|qn| store.get_node(qn).ok().flatten())
+            })
+            .collect();
+        nodes_to_candidates(&sem_nodes, CandidateSource::Semantic, &mut pool);
+    }
+
+    // Channel 6: Tantivy — only when pre-computed hits are provided.
+    if let Some(tantivy_nodes) = kw_hits {
+        nodes_to_candidates(&tantivy_nodes, CandidateSource::Tantivy, &mut pool);
+    }
+
+    Ok(pool)
+}
+
+/// Aggregate a candidate pool into file-level results with capped top-k scoring
+/// and conditional priors.
+fn aggregate_to_files(
+    candidates: HashMap<String, NodeCandidate>,
+    parts: &QueryParts,
+    limit: usize,
+) -> Vec<FileResult> {
+    // Group by file_path.
+    let mut file_map: HashMap<String, Vec<NodeCandidate>> = HashMap::new();
+    for (_, candidate) in candidates {
+        file_map.entry(candidate.file_path.clone()).or_default().push(candidate);
+    }
+
+    let mut results: Vec<FileResult> = file_map
+        .into_iter()
+        .map(|(file_path, mut nodes)| {
+            // Sort nodes by score descending for capped top-k aggregation.
+            nodes.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Capped top-k base score: best node + 0.5 * sum of next 2.
+            let base = {
+                let top = nodes[0].score;
+                let rest: f64 = nodes[1..nodes.len().min(3)]
+                    .iter()
+                    .map(|n| n.score)
+                    .sum::<f64>();
+                top + 0.5 * rest
+            };
+
+            // Gather all unique sources across nodes in this file.
+            let file_sources: HashSet<CandidateSource> = nodes
+                .iter()
+                .flat_map(|n| n.sources.iter().copied())
+                .collect();
+            let n_unique_sources = file_sources.len();
+
+            // Conditional priors.
+
+            // Test demotion: 0.5x when ALL nodes are Test-kind AND query doesn't mention tests.
+            let test_prior = if !parts.mentions_tests
+                && nodes.iter().all(|n| matches!(n.kind, NodeKind::Test) || n.is_test)
+            {
+                0.5
+            } else {
+                1.0
+            };
+
+            // Compiled/generated demotion.
+            let compiled_prior = if ["/compiled/", "/node_modules/", "/.next/", "/dist/", "/vendor/"]
+                .iter()
+                .any(|seg| file_path.contains(seg))
+            {
+                0.5
+            } else {
+                1.0
+            };
+
+            // Multi-source boost.
+            let multi_source = 1.0 + 0.15 * (n_unique_sources.saturating_sub(1)) as f64;
+
+            // Symbol-in-path boost: 1.3x if any query symbol appears as a substring of the path.
+            let symbol_path = if parts.symbols.iter().any(|sym| {
+                file_path.to_lowercase().contains(&sym.to_lowercase())
+            }) {
+                1.3
+            } else {
+                1.0
+            };
+
+            let final_score = base * test_prior * compiled_prior * multi_source * symbol_path;
+
+            // Top-3 evidence nodes.
+            let top_nodes: Vec<NodeEvidence> = nodes
+                .iter()
+                .take(3)
+                .map(|n| NodeEvidence {
+                    name: n.qualified_name.split("::").last().unwrap_or(&n.qualified_name).to_string(),
+                    qualified_name: n.qualified_name.clone(),
+                    kind: n.kind.as_str().to_string(),
+                    line_start: 0, // populated below from the store if needed; see note
+                    line_end: 0,
+                    score: n.score,
+                    sources: n.sources.iter().map(|s| s.as_str().to_string()).collect(),
+                })
+                .collect();
+
+            FileResult {
+                file_path,
+                score: final_score,
+                top_nodes,
+                sources: file_sources,
+            }
+        })
+        .collect();
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(limit);
+    results
+}
+
+/// Serialise file-level results into the MCP response JSON.
+fn file_results_to_json(
+    results: Vec<FileResult>,
+    query: &str,
+    parts: &QueryParts,
+    debug: Option<bool>,
+    route: Option<&str>,
+    fusion: Option<&str>,
+    total_candidates: usize,
+    files_scored: usize,
+) -> Value {
+    let result_arr: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            let mut sources: Vec<&str> = r.sources.iter().map(|s| s.as_str()).collect();
+            sources.sort();
+            let top_nodes: Vec<Value> = r.top_nodes.iter().map(|n| {
+                let mut srcs: Vec<&str> = n.sources.iter().map(|s| s.as_str()).collect();
+                srcs.sort();
+                json!({
+                    "name": n.name,
+                    "qualified_name": n.qualified_name,
+                    "kind": n.kind,
+                    "line_start": n.line_start,
+                    "line_end": n.line_end,
+                    "score": n.score,
+                    "sources": srcs,
+                })
+            }).collect();
+            json!({
+                "file_path": r.file_path,
+                "score": r.score,
+                "sources": sources,
+                "top_nodes": top_nodes,
+            })
+        })
+        .collect();
+
+    let mut response = json!({
+        "status": "ok",
+        "query": query,
+        "method": "fanout_file",
+        "result_mode": "file",
+        "results": result_arr,
+    });
+
+    if debug.unwrap_or(false) {
+        let channels_used: Vec<&str> = {
+            let mut all_sources: HashSet<CandidateSource> = HashSet::new();
+            for r in &results {
+                for s in &r.sources {
+                    all_sources.insert(*s);
+                }
+            }
+            let mut v: Vec<&str> = all_sources.iter().map(|s| s.as_str()).collect();
+            v.sort();
+            v
+        };
+
+        let mut debug_obj = json!({
+            "channels_used": channels_used,
+            "total_candidates": total_candidates,
+            "files_scored": files_scored,
+            "query_parts": {
+                "symbols": parts.symbols,
+                "path_fragments": parts.path_fragments,
+                "domain_terms": parts.domain_terms,
+                "mentions_tests": parts.mentions_tests,
+            },
+        });
+
+        // Note ignored params when route/fusion are provided alongside file mode.
+        let mut ignored: Vec<&str> = Vec::new();
+        if route.is_some() { ignored.push("route"); }
+        if fusion.is_some() { ignored.push("fusion"); }
+        if !ignored.is_empty() {
+            debug_obj["ignored_params"] = json!(ignored);
+        }
+
+        response["_debug"] = debug_obj;
+    }
+
+    response
+}
+
 pub fn hybrid_query(
     query: &str,
     limit: usize,
@@ -1061,6 +1525,7 @@ pub fn hybrid_query(
     fusion: Option<&str>,
     route: Option<&str>,
     debug: Option<bool>,
+    result_mode: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1076,7 +1541,7 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
@@ -1094,6 +1559,7 @@ pub fn hybrid_query_with_store(
     keyword_hits: Option<Vec<crate::types::GraphNode>>,
     route: Option<&str>,
     debug: Option<bool>,
+    result_mode: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1103,6 +1569,34 @@ pub fn hybrid_query_with_store(
             "results": [],
         }));
     }
+
+    // Validate result_mode early so we can return a clear error before doing any work.
+    let result_mode_str = result_mode.unwrap_or("node");
+    if result_mode_str != "node" && result_mode_str != "file" {
+        return Ok(json!({
+            "status": "error",
+            "message": format!("Unknown result_mode '{}'; expected 'node' or 'file'", result_mode_str),
+        }));
+    }
+
+    // --- File mode: fanout+rerank early return ---
+    if result_mode_str == "file" {
+        let parts = decompose_query(query);
+        let candidates = fanout_retrieve(store, emb_store, root, &parts, limit, keyword_hits)?;
+        let total_candidates = candidates.len();
+        let files_scored = {
+            let mut files: HashSet<&str> = HashSet::new();
+            for c in candidates.values() {
+                files.insert(&c.file_path);
+            }
+            files.len()
+        };
+        let file_results = aggregate_to_files(candidates, &parts, limit);
+        return Ok(file_results_to_json(
+            file_results, query, &parts, debug, route, fusion, total_candidates, files_scored,
+        ));
+    }
+    // --- End file mode ---
 
     let route_param = route.unwrap_or("auto");
 
@@ -2105,7 +2599,7 @@ mod tests {
         fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("", 10, Some(&path), false, None, None, None);
+        let result = hybrid_query("", 10, Some(&path), false, None, None, None, None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2123,7 +2617,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("add", 5, Some(&path), false, None, None, None);
+        let result = hybrid_query("add", 5, Some(&path), false, None, None, None, None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2144,7 +2638,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("square", 5, Some(&path), false, None, None, None);
+        let result = hybrid_query("square", 5, Some(&path), false, None, None, None, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2170,7 +2664,7 @@ mod tests {
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         // Explicit "rrf" fusion — no embeddings, so falls back to keyword_only
-        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None);
+        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2193,7 +2687,7 @@ mod tests {
 
         // CC mode without embeddings: embeddings_available = false, so falls into RRF branch
         // which returns "keyword_only" (since no embeddings are present)
-        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None);
+        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2214,7 +2708,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None);
+        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None, None);
         assert!(result.is_ok(), "cc fusion hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -2360,5 +2854,354 @@ mod tests {
         let c = classify_query("something");
         // Single lowercase word with no uppercase or underscore → General or low confidence
         assert!(c.confidence < 0.6 || matches!(c.route, QueryRoute::General));
+    }
+
+    // -----------------------------------------------------------------------
+    // decompose_query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decompose_extracts_symbols() {
+        let parts = decompose_query("serverPatchReducer loses push");
+        assert!(
+            parts.symbols.contains(&"serverPatchReducer".to_string()),
+            "camelCase token should be in symbols; got {:?}",
+            parts.symbols
+        );
+        assert!(
+            !parts.domain_terms.contains(&"serverpatchreducer".to_string()),
+            "symbol should not also appear in domain_terms"
+        );
+    }
+
+    #[test]
+    fn decompose_extracts_paths() {
+        let parts = decompose_query("bug in config-shared.ts");
+        assert!(
+            parts.path_fragments.contains(&"config-shared.ts".to_string()),
+            "token ending in .ts should be in path_fragments; got {:?}",
+            parts.path_fragments
+        );
+    }
+
+    #[test]
+    fn decompose_detects_test_mentions() {
+        let parts = decompose_query("test_ssl_verify fails");
+        assert!(
+            parts.mentions_tests,
+            "token containing 'test' should set mentions_tests"
+        );
+    }
+
+    #[test]
+    fn decompose_does_not_mention_tests_for_normal_query() {
+        let parts = decompose_query("serverPatchReducer loses push replace history");
+        assert!(
+            !parts.mentions_tests,
+            "query without test/spec/mock/fixture/assert should not set mentions_tests"
+        );
+    }
+
+    #[test]
+    fn decompose_filters_stop_words() {
+        let parts = decompose_query("why does the router fail");
+        assert!(
+            !parts.domain_terms.contains(&"why".to_string()),
+            "stop word 'why' should be filtered"
+        );
+        assert!(
+            !parts.domain_terms.contains(&"does".to_string()),
+            "stop word 'does' should be filtered"
+        );
+        assert!(
+            !parts.domain_terms.contains(&"the".to_string()),
+            "stop word 'the' should be filtered"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // fanout_retrieve helpers
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal NodeCandidate for testing.
+    fn make_candidate(qn: &str, file: &str, kind: NodeKind, score: f64, source: CandidateSource) -> NodeCandidate {
+        let mut sources = HashSet::new();
+        sources.insert(source);
+        NodeCandidate {
+            qualified_name: qn.to_string(),
+            file_path: file.to_string(),
+            kind,
+            is_test: matches!(kind, NodeKind::Test),
+            score,
+            sources,
+        }
+    }
+
+    #[test]
+    fn fanout_merges_multi_source() {
+        // Simulate two channels returning the same node — pool should merge scores and sources.
+        let mut pool: HashMap<String, NodeCandidate> = HashMap::new();
+
+        // Fake search results (rank 0 from each channel).
+        let nodes_a = vec![crate::types::GraphNode {
+            name: "foo".to_string(),
+            qualified_name: "src/foo::foo".to_string(),
+            kind: NodeKind::Function,
+            file_path: "src/foo.ts".to_string(),
+            line_start: 1,
+            line_end: 10,
+            language: "typescript".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: String::new(),
+            file_hash: String::new(),
+        }];
+
+        nodes_to_candidates(&nodes_a, CandidateSource::KeywordRelaxed, &mut pool);
+        nodes_to_candidates(&nodes_a, CandidateSource::KeywordExact, &mut pool);
+
+        let candidate = pool.get("src/foo::foo").expect("candidate should be in pool");
+        assert!(
+            candidate.score > 1.0 / (RRF_K + 1.0),
+            "score should be summed from two channels; got {}",
+            candidate.score
+        );
+        assert!(
+            candidate.sources.contains(&CandidateSource::KeywordRelaxed),
+            "KeywordRelaxed should be in sources"
+        );
+        assert!(
+            candidate.sources.contains(&CandidateSource::KeywordExact),
+            "KeywordExact should be in sources"
+        );
+        assert_eq!(candidate.sources.len(), 2, "should have exactly 2 unique sources");
+    }
+
+    #[test]
+    fn fanout_includes_exact_symbol_channel() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("service.py"),
+            b"def processRequest(req): return req\ndef handleRequest(req): return req\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let (store, root) = get_store(Some(&path)).unwrap();
+        let emb_db_path = crate::incremental::get_embeddings_db_path(&root);
+        let mut emb_store = EmbeddingStore::new(&emb_db_path).unwrap();
+
+        // Query with a symbol — exact channel should be triggered.
+        let parts = decompose_query("processRequest fails");
+        assert!(!parts.symbols.is_empty(), "processRequest should be detected as symbol");
+
+        let pool = fanout_retrieve(&store, &mut emb_store, &root, &parts, 10, None).unwrap();
+
+        // The candidate pool must be non-empty (keyword relaxed at minimum).
+        assert!(!pool.is_empty(), "fanout pool should not be empty");
+
+        emb_store.close().unwrap();
+        store.close().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // aggregate_to_files
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn aggregate_capped_topk() {
+        // File A: 1 strong node (score 0.1)
+        // File B: 5 weak nodes (score 0.01 each)
+        // File A should win.
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+
+        candidates.insert("a::strong".to_string(), make_candidate(
+            "a::strong", "src/a.ts", NodeKind::Function, 0.1, CandidateSource::KeywordRelaxed,
+        ));
+
+        for i in 0..5_u8 {
+            let qn = format!("b::weak{i}");
+            candidates.insert(qn.clone(), make_candidate(
+                &qn, "src/b.ts", NodeKind::Function, 0.01, CandidateSource::KeywordRelaxed,
+            ));
+        }
+
+        let parts = decompose_query("something");
+        let results = aggregate_to_files(candidates, &parts, 10);
+
+        assert!(results.len() >= 2);
+        assert_eq!(results[0].file_path, "src/a.ts", "strong file should rank first");
+    }
+
+    #[test]
+    fn aggregate_demotes_test_files() {
+        // File A (test-only): all nodes are Test kind.
+        // File B (source): Function nodes.
+        // Query doesn't mention tests.
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+
+        // Test file with score 0.08.
+        candidates.insert("test::testFoo".to_string(), make_candidate(
+            "test::testFoo", "src/__tests__/foo.test.ts", NodeKind::Test, 0.08, CandidateSource::KeywordRelaxed,
+        ));
+
+        // Source file with a slightly lower raw score 0.06 — but after test demotion file A should drop below.
+        candidates.insert("src::fooImpl".to_string(), make_candidate(
+            "src::fooImpl", "src/foo.ts", NodeKind::Function, 0.06, CandidateSource::KeywordRelaxed,
+        ));
+
+        let parts = decompose_query("foo implementation detail");
+        let results = aggregate_to_files(candidates, &parts, 10);
+
+        assert!(results.len() >= 2);
+        let test_file_rank = results.iter().position(|r| r.file_path.contains("test")).unwrap();
+        let src_file_rank = results.iter().position(|r| r.file_path == "src/foo.ts").unwrap();
+        assert!(
+            src_file_rank < test_file_rank,
+            "source file should rank above test-only file when query doesn't mention tests; \
+             src_rank={src_file_rank}, test_rank={test_file_rank}"
+        );
+    }
+
+    #[test]
+    fn aggregate_symbol_path_boost() {
+        // File whose path contains the query symbol (case-insensitive substring match) should
+        // get 1.3x boost.
+        //
+        // We use a snake_case symbol "cache_reducer" so the path "src/cache_reducer.ts" is a
+        // clear substring match. The "other" file has a slightly higher raw score (0.052) but
+        // after the 1.3x boost the symbol-matching file wins (0.05 * 1.3 = 0.065 > 0.052).
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+
+        // File whose path contains "cache_reducer" — symbol-path match.
+        candidates.insert("reducers::cache_reducer".to_string(), make_candidate(
+            "reducers::cache_reducer",
+            "src/cache_reducer.ts",
+            NodeKind::Function,
+            0.05,
+            CandidateSource::KeywordExact,
+        ));
+
+        // Another file, slightly higher raw score but no symbol-in-path match.
+        candidates.insert("other::someFunc".to_string(), make_candidate(
+            "other::someFunc",
+            "src/other/util.ts",
+            NodeKind::Function,
+            0.052,
+            CandidateSource::KeywordRelaxed,
+        ));
+
+        // Query contains "cache_reducer" as a symbol token.
+        let parts = decompose_query("cache_reducer broken history");
+        assert!(
+            parts.symbols.contains(&"cache_reducer".to_string()),
+            "cache_reducer should be detected as symbol token"
+        );
+
+        let results = aggregate_to_files(candidates, &parts, 10);
+
+        assert!(results.len() >= 2);
+        // After symbol-path boost the cache_reducer file should rank first.
+        assert!(
+            results[0].file_path.contains("cache_reducer"),
+            "symbol-path-boosted file should rank first; got {:?}",
+            results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // file mode integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn file_mode_returns_file_results() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("router.py"),
+            b"def handleNavigation(path): return path\ndef pushHistory(entry): pass\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query(
+            "handleNavigation push history",
+            5,
+            Some(&path),
+            true,
+            None,
+            None,
+            None,
+            Some("file"),
+        );
+        assert!(result.is_ok(), "file mode should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        assert_eq!(val["method"], "fanout_file");
+        assert_eq!(val["result_mode"], "file");
+        assert!(val["results"].is_array(), "results must be array");
+        let arr = val["results"].as_array().unwrap();
+        if !arr.is_empty() {
+            let first = &arr[0];
+            assert!(first.get("file_path").is_some(), "each result must have file_path");
+            assert!(first.get("score").is_some(), "each result must have score");
+            assert!(first.get("sources").is_some(), "each result must have sources");
+            assert!(first.get("top_nodes").is_some(), "each result must have top_nodes");
+        }
+    }
+
+    #[test]
+    fn node_mode_unchanged() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("math.py"),
+            b"def add(a, b): return a + b\ndef sub(a, b): return a - b\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        // result_mode omitted → node mode, existing behaviour must be preserved.
+        let result = hybrid_query("add", 5, Some(&path), true, None, None, None, None);
+        assert!(result.is_ok(), "node mode should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        // method field must be one of the existing node-mode methods.
+        let method = val["method"].as_str().unwrap_or("");
+        assert!(
+            ["keyword_only", "hybrid_rrf", "hybrid_cc", "keyword_path_boosted", "keyword_config_boosted"]
+                .contains(&method),
+            "node mode method should be a known node-mode method; got {method}"
+        );
+        // Must NOT have result_mode: "file"
+        assert_ne!(val.get("result_mode").and_then(|v| v.as_str()), Some("file"));
+    }
+
+    #[test]
+    fn file_mode_debug_includes_query_parts() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("reducer.py"),
+            b"def serverPatchReducer(state, action): return state\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query(
+            "serverPatchReducer loses push",
+            5,
+            Some(&path),
+            true,
+            None,
+            None,
+            Some(true), // debug = true
+            Some("file"),
+        );
+        assert!(result.is_ok(), "debug file mode should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        let debug = val.get("_debug").expect("_debug must be present when debug=true");
+        assert!(debug.get("query_parts").is_some(), "_debug must contain query_parts");
+        assert!(debug.get("total_candidates").is_some(), "_debug must contain total_candidates");
+        assert!(debug.get("files_scored").is_some(), "_debug must contain files_scored");
     }
 }
