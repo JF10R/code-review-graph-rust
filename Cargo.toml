@@ -1,6 +1,6 @@
 [package]
 name = "code-review-graph"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 description = "Persistent incremental knowledge graph for token-efficient, context-aware code reviews"
 license = "MIT"

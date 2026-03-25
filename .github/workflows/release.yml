@@ -30,7 +30,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/code-review-graph"
+          if [ -f "${src}.exe" ]; then
+            cp "${src}.exe" "${{ matrix.asset }}"
+          else
+            cp "${src}" "${{ matrix.asset }}"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/code-review-graph*
+          files: ${{ matrix.asset }}
+          generate_release_notes: true
