@@ -12,10 +12,30 @@ Rust rewrite of [code-review-graph](https://github.com/tirth8205/code-review-gra
 
 Claude Code reads entire files to review changes. On large codebases, that burns context on irrelevant code. This tool builds a graph of functions, classes, and their relationships — Claude queries the graph to find exactly what's impacted, then reads only those files. **6.8x average token reduction** (up to 49x on monorepos).
 
-## Quick Start
+## Install
+
+### Prebuilt binaries (recommended)
+
+Download the latest release for your platform from [Releases](https://github.com/JF10R/code-review-graph-rust/releases/latest):
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `code-review-graph-linux-amd64` |
+| macOS x86_64 | `code-review-graph-macos-amd64` |
+| macOS ARM64 | `code-review-graph-macos-arm64` |
+| Windows x86_64 | `code-review-graph-windows-amd64.exe` |
+
+Place the binary somewhere on your `PATH` and rename it to `code-review-graph` (or `code-review-graph.exe` on Windows).
+
+### From source
 
 ```bash
 cargo install --git https://github.com/JF10R/code-review-graph-rust
+```
+
+## Quick Start
+
+```bash
 cd your-project
 code-review-graph install   # Creates .mcp.json
 code-review-graph build     # Parses codebase
@@ -87,6 +107,27 @@ Exclude files via `.code-review-graphignore` (gitignore syntax).
 ```
 
 > Only match `Edit|Write`, never `Bash`. Including `Bash` triggers rebuilds on every shell command.
+
+### Recommended CLAUDE.md snippet
+
+Add this to your project's `CLAUDE.md` to guide Claude Code (and sub-agents) toward graph queries instead of grep for code discovery:
+
+```markdown
+## Code Review Graph (MCP)
+
+Prefer these tools over grep/read for code discovery:
+
+| Tool | When to use |
+|------|-------------|
+| `semantic_search_nodes` | Find code by concept — use INSTEAD OF grep |
+| `trace_call_chain(from, to)` | Trace how function A reaches function B |
+| `query_graph(callers_of)` | Who calls this function? |
+| `query_graph(callees_of)` | What does this function call? |
+| `get_review_context` | Token-efficient review bundle for changed files |
+| `hybrid_query` | Combined keyword + semantic search |
+
+Always pass `compact: true`. Discover with graph tools first, then `Read` only the files you need.
+```
 
 ## CLI
 

@@ -2,6 +2,8 @@
 
 ## v1.2.0
 
+- **Release binaries** — Prebuilt binaries for Linux, macOS (x86_64 + ARM64), and Windows published to GitHub Releases on each version tag. No Rust toolchain needed.
+- **Release workflow fix** — Release notes are now generated once (not per-platform), eliminating duplicated descriptions.
 - **Compact response mode** — All MCP tools accept `compact: true`, stripping low-value fields and repo-root path prefixes. Reduces response tokens ~40%.
 - **`trace_call_chain` tool** — Find the shortest call path between two functions via BFS on CALLS edges.
 - **Framework-aware edge inference** — JSX component usage, Express/Koa middleware, event emitters, and pytest fixtures detected as CALLS edges. Next.js gained +149K edges from JSX alone.

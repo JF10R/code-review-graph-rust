@@ -4,3 +4,4 @@
 *.db-shm
 *.db-journal
 .code-review-graph/
+CLAUDE.md

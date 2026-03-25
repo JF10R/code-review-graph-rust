@@ -40,7 +40,21 @@ jobs:
           else
             cp "${src}" "${{ matrix.asset }}"
           fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: artifacts/*
           generate_release_notes: true
