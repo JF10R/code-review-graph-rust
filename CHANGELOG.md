@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.4.0
+
+### Retrieval Quality
+
+- **File-level fanout+rerank** (`result_mode: "file"`) — New experimental retrieval mode fans out to 6 evidence channels (keyword relaxed, keyword exact, path-boosted, config-boosted, semantic, Tantivy), aggregates results by file, and returns evidence-rich results with supporting nodes. **Hit@5 improved 7% → 29%** on 28-case eval set across 6 open-source repos.
+- **Query decomposition** — Natural-language queries are decomposed into symbols, path fragments, and domain terms before searching. Each component targets a different retriever channel.
+- **Multi-source evidence scoring** — Files found by multiple retriever channels get a corroboration boost. Conditional priors demote test files (0.5x when query doesn't mention tests) and compiled/vendor paths (0.5x).
+- **Relaxed OR-matching for NL queries** — `search_nodes_relaxed` uses OR-logic with stop-word filtering and match-ratio scoring for natural-language bug descriptions. Eliminates the 60% empty-result rate caused by AND-logic on long queries.
+- **Empty-route fallback** — Specialized routes (FilePath, ConfigLookup) fall through to General when they return empty results instead of failing closed.
+
+### Evaluation
+
+- **Gold eval set** — 28 hand-curated cases across 6 repos (httpx, FastAPI, Next.js, VS Code, Kubernetes, Rust compiler) with ground-truth root-cause files. See `eval/gold-eval-set.json`.
+- **Benchmark infrastructure** — `eval/BENCHMARK_2C_RESULTS.md` documents pre/post measurement methodology and results.
+
 ## v1.3.0
 
 ### Performance

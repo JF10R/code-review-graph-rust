@@ -56,6 +56,8 @@ The MCP server starts automatically and keeps the graph fresh via a background w
 | **Framework edges** | JSX components, Express middleware, event emitters, pytest fixtures auto-detected |
 | **Compact mode** | `compact: true` strips paths + low-value fields, reducing response tokens ~40% |
 | **Hybrid search** | Reciprocal Rank Fusion of keyword + semantic results |
+| **File-level retrieval** | `result_mode: "file"` — multi-channel fanout, file aggregation, evidence-rich results |
+| **Query decomposition** | Extracts symbols, path fragments, domain terms from NL queries for targeted search |
 | **Always fresh** | Background watcher + hash-skip + lazy stale-check per query |
 
 ## vs Python version
@@ -69,6 +71,10 @@ The MCP server starts automatically and keeps the graph fresh via a background w
 | Blast radius | BFS, all edges equal | PPR, weighted, direction-aware |
 | Embeddings | API key required | Free local (Jina Code v2) |
 | Graph freshness | Manual rebuild | Auto watcher + stale-check |
+| Search | Keyword only | **Multi-channel fanout** (keyword + semantic + path + config) |
+| Result granularity | Node only | **Node + file-level** with evidence |
+| Query handling | Raw string match | **Query decomposition** (symbols, paths, domain terms) |
+| Eval suite | None | **28-case gold set**, 6 repos, Hit@5 tracked |
 
 ## Embeddings
 
@@ -126,6 +132,7 @@ Prefer these tools over grep/read for code discovery:
 | `query_graph(callees_of)` | What does this function call? |
 | `get_review_context` | Token-efficient review bundle for changed files |
 | `hybrid_query` | Combined keyword + semantic search |
+| `hybrid_query(result_mode: "file")` | File-level results with supporting node evidence |
 
 Always pass `compact: true`. Discover with graph tools first, then `Read` only the files you need.
 ```
