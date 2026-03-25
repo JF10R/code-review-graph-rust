@@ -1,0 +1,8 @@
+---
+source: tests/integration.rs
+expression: result
+---
+{
+  "status": "no_path",
+  "summary": "[summary]"
+}

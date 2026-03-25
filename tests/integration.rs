@@ -7,7 +7,8 @@ use code_review_graph::graph::GraphStore;
 use code_review_graph::incremental::{full_build, get_db_path, incremental_update};
 use code_review_graph::parser::CodeParser;
 use code_review_graph::tools::{
-    build_or_update_graph, hybrid_query, list_graph_stats, measure_token_reduction, query_graph,
+    build_or_update_graph, find_large_functions, get_impact_radius, hybrid_query, list_graph_stats,
+    measure_token_reduction, query_graph, semantic_search_nodes, trace_call_chain,
 };
 use tempfile::TempDir;
 
@@ -545,4 +546,159 @@ fn measure_token_reduction_naive_bytes_exceeds_context_for_changed_files() {
         naive >= context,
         "naive_bytes ({naive}) should be >= context_bytes ({context}) when reviewing a subset of files"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot tests (insta)
+// ---------------------------------------------------------------------------
+
+/// Walk a JSON value and replace any string that contains the temp dir path
+/// (in any platform path format) with `[path]`.
+fn redact_temp_paths(val: &mut serde_json::Value, temp_dir: &str) {
+    // Strip the Windows extended-length prefix (//?/) and normalise separators
+    // so the match works regardless of how the path was recorded.
+    let norm = temp_dir.replace('\\', "/");
+    let plain = norm.trim_start_matches("//?/");
+
+    match val {
+        serde_json::Value::String(s) => {
+            // Normalise both sides to forward slashes and strip the Windows
+            // extended-length prefix (//?/) before matching.
+            let s_plain = s.replace('\\', "/");
+            let s_plain = s_plain.trim_start_matches("//?/");
+            if s_plain.contains(plain) {
+                *s = "[path]".to_string();
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_temp_paths(item, temp_dir);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                redact_temp_paths(v, temp_dir);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sort an array-of-objects field by the given key, if it exists.
+fn sort_array_by_key(val: &mut serde_json::Value, array_ptr: &str, key: &str) {
+    if let Some(arr) = val.pointer_mut(array_ptr).and_then(|v| v.as_array_mut()) {
+        arr.sort_by(|a, b| {
+            let ka = a.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            let kb = b.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            ka.cmp(kb)
+        });
+    }
+}
+
+#[test]
+fn snapshot_list_graph_stats() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let mut result = list_graph_stats(Some(&root_str)).unwrap();
+    // languages order is non-deterministic — sort for stable snapshot
+    if let Some(langs) = result.get_mut("languages").and_then(|v| v.as_array_mut()) {
+        langs.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    }
+    insta::assert_json_snapshot!(result, {
+        ".last_updated" => "[timestamp]",
+        ".summary" => "[summary]",
+    });
+}
+
+#[test]
+fn snapshot_query_graph_children_of() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let mut result = query_graph("children_of", "utils.py", Some(&root_str), false).unwrap();
+    let temp_dir = dir.path().to_string_lossy().into_owned();
+    redact_temp_paths(&mut result, &temp_dir);
+    sort_array_by_key(&mut result, "/results", "name");
+    sort_array_by_key(&mut result, "/candidates", "name");
+    insta::assert_json_snapshot!(result, {
+        ".summary" => "[summary]",
+    });
+}
+
+#[test]
+fn snapshot_find_large_functions() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    // min_lines=1 to capture the small functions in the test repo
+    let mut result = find_large_functions(1, None, None, 20, Some(&root_str), true).unwrap();
+    let temp_dir = dir.path().to_string_lossy().into_owned();
+    redact_temp_paths(&mut result, &temp_dir);
+    sort_array_by_key(&mut result, "/results", "name");
+    insta::assert_json_snapshot!(result, {
+        ".summary" => "[summary]",
+    });
+}
+
+#[test]
+fn snapshot_get_impact_radius() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let mut result = get_impact_radius(
+        Some(vec!["utils.py".to_string()]),
+        3,
+        Some(&root_str),
+        "HEAD",
+        true,
+    ).unwrap();
+    let temp_dir = dir.path().to_string_lossy().into_owned();
+    redact_temp_paths(&mut result, &temp_dir);
+    sort_array_by_key(&mut result, "/changed_nodes", "name");
+    sort_array_by_key(&mut result, "/impacted_nodes", "name");
+    insta::assert_json_snapshot!(result, {
+        ".summary" => "[summary]",
+    });
+}
+
+#[test]
+fn snapshot_trace_call_chain() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    // run calls add — trace the chain
+    let mut result = trace_call_chain("run", "add", 5, false, Some(&root_str)).unwrap();
+    let temp_dir = dir.path().to_string_lossy().into_owned();
+    redact_temp_paths(&mut result, &temp_dir);
+    insta::assert_json_snapshot!(result, {
+        ".summary" => "[summary]",
+    });
+}
+
+#[test]
+fn snapshot_semantic_search_nodes() {
+    if !grammars_available() { return; }
+    let dir = setup_test_repo();
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let mut result = semantic_search_nodes("add function", None, 5, Some(&root_str), true).unwrap();
+    let temp_dir = dir.path().to_string_lossy().into_owned();
+    redact_temp_paths(&mut result, &temp_dir);
+    sort_array_by_key(&mut result, "/results", "name");
+    insta::assert_json_snapshot!(result, {
+        ".results[].similarity" => "[score]",
+        ".summary" => "[summary]",
+    });
 }
