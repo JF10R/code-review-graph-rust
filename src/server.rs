@@ -517,12 +517,15 @@ fn resolve_root(repo_root: Option<&str>) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Parse `path` from disk and store its nodes/edges into `store`.
-/// Returns `(node_count, edge_count)` on success, or an error string on failure.
+///
+/// Returns `Ok(None)` when the file hash is unchanged (skip).
+/// Returns `Ok(Some((node_count, edge_count)))` on a successful update.
+/// Returns `Err(String)` on failure.
 fn watcher_parse_and_store(
     parser: &crate::parser::CodeParser,
     store: &mut crate::graph::GraphStore,
     path: &std::path::Path,
-) -> Result<(usize, usize), String> {
+) -> Result<Option<(usize, usize)>, String> {
     use crate::incremental::{is_binary_pub, sha256_bytes_pub};
     if is_binary_pub(path) {
         return Err(format!("{}: binary file skipped", path.display()));
@@ -530,6 +533,12 @@ fn watcher_parse_and_store(
     let source = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
     let fhash = sha256_bytes_pub(&source);
     let abs_str = path.to_string_lossy();
+
+    // Hash-skip: avoid re-parsing when file content hasn't changed.
+    if store.get_file_hash(&abs_str) == Some(fhash.as_str()) {
+        return Ok(None);
+    }
+
     let (nodes, edges) = parser
         .parse_bytes(path, &source)
         .map_err(|e| format!("{}: {}", path.display(), e))?;
@@ -538,7 +547,7 @@ fn watcher_parse_and_store(
     store
         .store_file_nodes_edges(&abs_str, &nodes, &edges, &fhash)
         .map_err(|e| format!("{}: {}", path.display(), e))?;
-    Ok((n, e))
+    Ok(Some((n, e)))
 }
 
 /// Spawn a background OS thread that watches `repo_root` for source-file
@@ -641,7 +650,7 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
         for path in &paths_to_update {
             let abs_str = path.to_string_lossy().into_owned();
             match watcher_parse_and_store(&parser, &mut store, path) {
-                Ok((n, e)) => {
+                Ok(Some((n, e))) => {
                     let _ = store.set_metadata(
                         "last_updated",
                         &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -661,13 +670,24 @@ fn run_background_watcher(repo_root: PathBuf) -> crate::error::Result<()> {
                         processed.insert(dep_path.clone());
                         let dep = std::path::PathBuf::from(dep_path);
                         match watcher_parse_and_store(&parser, &mut store, &dep) {
-                            Ok((dn, de)) => log::debug!(
+                            Ok(Some((dn, de))) => log::debug!(
                                 "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
                                 dep_path, dn, de
+                            ),
+                            Ok(None) => log::debug!(
+                                "Watcher dependent unchanged (hash match): {}",
+                                dep_path
                             ),
                             Err(e) => log::warn!("Watcher dependent {}: {}", dep_path, e),
                         }
                     }
+                }
+                Ok(None) => {
+                    let rel = path
+                        .strip_prefix(&repo_root)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| abs_str.clone());
+                    log::debug!("Watcher skipped (hash unchanged): {}", rel);
                 }
                 Err(err) => log::error!("Watcher {}", err),
             }

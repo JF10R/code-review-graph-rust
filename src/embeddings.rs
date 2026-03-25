@@ -655,6 +655,35 @@ impl EmbeddingStore {
         Ok(())
     }
 
+    /// Remove embeddings for nodes that no longer exist in the graph.
+    ///
+    /// Builds the set of live qualified names from the graph store and drops
+    /// any vector whose key is not present.  Returns the number of entries
+    /// removed.
+    pub fn gc(&mut self, store: &GraphStore) -> Result<usize> {
+        let live_qns: HashSet<String> = store
+            .get_all_files()?
+            .iter()
+            .flat_map(|f| store.get_nodes_by_file(f).unwrap_or_default())
+            .map(|n| n.qualified_name.clone())
+            .collect();
+        let stale_keys: Vec<String> = self
+            .data
+            .vectors
+            .keys()
+            .filter(|k| !live_qns.contains(k.as_str()))
+            .cloned()
+            .collect();
+        let removed = stale_keys.len();
+        if removed > 0 {
+            log::info!("Embedding GC: removing {} stale vector(s)", removed);
+            for k in &stale_keys {
+                self.data.vectors.remove(k);
+            }
+        }
+        Ok(removed)
+    }
+
     /// Persist in-memory state to disk.
     pub fn save(&self) -> Result<()> {
         save_embedding_data(&self.data, &self.path)
@@ -746,31 +775,14 @@ pub fn embed_all_nodes(
     store: &GraphStore,
     emb_store: &mut EmbeddingStore,
 ) -> Result<usize> {
-    let provider = match &emb_store.provider {
-        Some(p) => p,
-        None => return Ok(0),
-    };
+    if emb_store.provider.is_none() {
+        return Ok(0);
+    }
 
     // GC: remove embeddings for nodes no longer in the graph.
-    let live_qns: HashSet<String> = store
-        .get_all_files()?
-        .iter()
-        .flat_map(|f| store.get_nodes_by_file(f).unwrap_or_default())
-        .map(|n| n.qualified_name.clone())
-        .collect();
-    let stale_keys: Vec<String> = emb_store
-        .data
-        .vectors
-        .keys()
-        .filter(|k| !live_qns.contains(k.as_str()))
-        .cloned()
-        .collect();
-    if !stale_keys.is_empty() {
-        log::info!("Embedding GC: removing {} stale vector(s)", stale_keys.len());
-        for k in &stale_keys {
-            emb_store.data.vectors.remove(k);
-        }
-    }
+    emb_store.gc(store)?;
+
+    let provider = emb_store.provider.as_ref().expect("checked above");
 
     // (qualified_name, text, hash) — hash computed once here, reused on insert
     let mut to_embed: Vec<(String, String, String)> = vec![];
@@ -822,18 +834,30 @@ pub fn semantic_search(
     compact: bool,
     repo_root: &std::path::Path,
 ) -> Result<Vec<serde_json::Value>> {
-    let provider = match &emb_store.provider {
-        Some(p) => p,
-        None => {
-            let nodes = store.search_nodes(query, limit)?;
-            let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
-            return Ok(nodes.iter().map(|n| {
-                let mut d = node_to_dict(n, compact);
-                if let Some(ref p) = prefix { p.strip(&mut d); }
-                d
-            }).collect());
+    if emb_store.provider.is_none() {
+        let nodes = store.search_nodes(query, limit)?;
+        let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
+        return Ok(nodes.iter().map(|n| {
+            let mut d = node_to_dict(n, compact);
+            if let Some(ref p) = prefix { p.strip(&mut d); }
+            d
+        }).collect());
+    }
+
+    // GC stale embeddings when vector count has grown more than 20% beyond live nodes.
+    {
+        let live_count: usize = store
+            .get_all_files()
+            .unwrap_or_default()
+            .iter()
+            .map(|f| store.get_nodes_by_file(f).unwrap_or_default().len())
+            .sum();
+        if emb_store.data.vectors.len() > live_count.saturating_add(live_count / 5) {
+            emb_store.gc(store)?;
         }
-    };
+    }
+
+    let provider = emb_store.provider.as_ref().expect("provider checked above");
 
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
     let query_vec = &query_vecs[0];

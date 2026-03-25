@@ -151,8 +151,19 @@ fn maybe_auto_update(store: &mut GraphStore, repo_root: &Path) {
     if changed.is_empty() {
         return;
     }
-    // Only update if there are actually changed files not yet in the graph
-    if let Err(e) = crate::incremental::incremental_update(repo_root, store, "HEAD", Some(changed)) {
+    // Filter to only files with supported source extensions — skip .json, .md,
+    // .lock, etc. to avoid triggering incremental_update for non-parseable files.
+    let source_changed: Vec<String> = changed
+        .into_iter()
+        .filter(|f| {
+            crate::parser::detect_language(std::path::Path::new(f)).is_some()
+        })
+        .collect();
+    if source_changed.is_empty() {
+        return;
+    }
+    // Only update if there are actually changed source files not yet in the graph
+    if let Err(e) = crate::incremental::incremental_update(repo_root, store, "HEAD", Some(source_changed)) {
         log::warn!("auto-update failed: {}", e);
     }
 }
@@ -532,7 +543,22 @@ pub fn query_graph(
             }
         }
         QueryPattern::FileSummary => {
-            let abs_path = root.join(target).to_string_lossy().into_owned();
+            // Prefer the canonical file_path stored in the graph node — this
+            // avoids root.join() mangling on Windows when `target` is already
+            // an absolute path or uses a different path separator.
+            let abs_path = match &node {
+                Some(n) => n.file_path.clone(),
+                None => {
+                    // Try absolute target first (handles Windows absolute paths),
+                    // then fall back to root-relative join.
+                    let as_is = target.to_string();
+                    if store.get_nodes_by_file(&as_is)?.is_empty() {
+                        root.join(target).to_string_lossy().into_owned()
+                    } else {
+                        as_is
+                    }
+                }
+            };
             for n in store.get_nodes_by_file(&abs_path)? {
                 results.push(node_dict(&n, compact, &root));
             }

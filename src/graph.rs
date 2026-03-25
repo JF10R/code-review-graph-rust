@@ -406,6 +406,13 @@ impl GraphStore {
 
     // -- Impact analysis --
 
+    /// Get the stored SHA-256 file hash for a given file path.
+    ///
+    /// Returns `None` if the file has not been indexed yet.
+    pub fn get_file_hash(&self, file_path: &str) -> Option<&str> {
+        self.data.file_hashes.get(file_path).map(|s| s.as_str())
+    }
+
     /// Get body_hashes for all nodes in a file.
     /// Returns a map of qualified_name → body_hash.
     pub fn get_body_hashes(&self, file_path: &str) -> HashMap<String, String> {

@@ -235,6 +235,39 @@ fn is_test_function(name: &str, file_path: &str) -> bool {
     false
 }
 
+/// Returns `true` when a Rust function node has a `#[test]` or
+/// `#[tokio::test]` attribute among its preceding siblings in the parent.
+///
+/// In tree-sitter-rust, `#[test]` is represented as an `attribute_item` node
+/// that appears as a sibling just before the `function_item`.  We walk the
+/// parent's children looking for `attribute_item` nodes that precede `fn_node`
+/// and whose text contains "test".
+fn rust_fn_has_test_attr(parent: &Node, fn_node: &Node, source: &[u8]) -> bool {
+    let mut cur = parent.walk();
+    let mut found_test_attr = false;
+    for sibling in parent.children(&mut cur) {
+        if sibling.id() == fn_node.id() {
+            // We've reached the function itself — return whatever we found so far.
+            return found_test_attr;
+        }
+        if sibling.kind() == "attribute_item" {
+            let text = node_text(&sibling, source);
+            // Match #[test] or #[tokio::test] or #[async_std::test] etc.
+            if text.contains("test") {
+                found_test_attr = true;
+            } else {
+                // Reset: a non-test attribute between the last test attr and
+                // the fn means the test attr belongs to something else.
+                found_test_attr = false;
+            }
+        } else if !sibling.is_extra() && sibling.kind() != "line_comment" && sibling.kind() != "block_comment" {
+            // Any non-attribute, non-comment node resets the attribute window.
+            found_test_attr = false;
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // SHA-256 body hash
 // ---------------------------------------------------------------------------
@@ -883,7 +916,9 @@ fn extract_from_tree(
         // --- Functions ---
         if lt.is_func(node_type) {
             if let Some(name) = get_name(&child, language, "function", source) {
-                let is_test = is_test_function(&name, file_path);
+                let has_test_attr = *language == "rust"
+                    && rust_fn_has_test_attr(root, &child, source);
+                let is_test = has_test_attr || is_test_function(&name, file_path);
                 let kind = if is_test { NodeKind::Test } else { NodeKind::Function };
                 let qualified = qualify(&name, file_path, enclosing_class);
                 let line_start = child.start_position().row + 1;
