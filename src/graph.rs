@@ -658,23 +658,28 @@ impl GraphStore {
     }
 
     /// Collect edges where both endpoints are in `qualified_names`.
+    ///
+    /// Iterates only the outgoing edges of nodes in the set rather than scanning
+    /// all edges, dropping complexity from O(E) to O(sum of degrees of nodes in set).
     fn get_edges_among(&self, qualified_names: &HashSet<String>) -> Vec<GraphEdge> {
-        use petgraph::stable_graph::EdgeReference;
-        (&self.data.graph)
-            .edge_references()
-            .filter(|e: &EdgeReference<'_, EdgeKind>| {
-                let src_qn = &self.data.graph[e.source()].qualified_name;
-                let tgt_qn = &self.data.graph[e.target()].qualified_name;
-                qualified_names.contains(src_qn) && qualified_names.contains(tgt_qn)
-            })
-            .map(|e: EdgeReference<'_, EdgeKind>| GraphEdge {
-                kind: *e.weight(),
-                source_qualified: self.data.graph[e.source()].qualified_name.clone(),
-                target_qualified: self.data.graph[e.target()].qualified_name.clone(),
-                file_path: self.data.graph[e.source()].file_path.clone(),
-                line: 0,
-            })
-            .collect()
+        let mut edges = Vec::new();
+        for qn in qualified_names {
+            if let Some(&idx) = self.data.node_index.get(qn) {
+                for edge in self.data.graph.edges_directed(idx, Direction::Outgoing) {
+                    let tgt = &self.data.graph[edge.target()];
+                    if qualified_names.contains(&tgt.qualified_name) {
+                        edges.push(GraphEdge {
+                            kind: *edge.weight(),
+                            source_qualified: qn.clone(),
+                            target_qualified: tgt.qualified_name.clone(),
+                            file_path: self.data.graph[idx].file_path.clone(),
+                            line: 0,
+                        });
+                    }
+                }
+            }
+        }
+        edges
     }
 
     /// Find the shortest call path between two nodes using BFS on Calls edges.
@@ -1628,5 +1633,70 @@ mod tests {
             .get_incoming_edges_for_file_nodes("nonexistent.py")
             .unwrap();
         assert!(edges.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // get_edges_among
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_edges_among_full_set_returns_all_internal_edges() {
+        let (mut store, _dir) = test_store();
+        // A → B → C (chain)
+        let nodes = vec![
+            make_node("a", "f.py::a", "f.py", NodeKind::Function),
+            make_node("b", "f.py::b", "f.py", NodeKind::Function),
+            make_node("c", "f.py::c", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![
+            make_edge("f.py::a", "f.py::b", EdgeKind::Calls, "f.py"),
+            make_edge("f.py::b", "f.py::c", EdgeKind::Calls, "f.py"),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        let set: HashSet<String> = ["f.py::a", "f.py::b", "f.py::c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let result = store.get_edges_among(&set);
+        assert_eq!(result.len(), 2, "both A→B and B→C should be returned");
+
+        let pairs: Vec<(&str, &str)> = result
+            .iter()
+            .map(|e| (e.source_qualified.as_str(), e.target_qualified.as_str()))
+            .collect();
+        assert!(pairs.contains(&("f.py::a", "f.py::b")));
+        assert!(pairs.contains(&("f.py::b", "f.py::c")));
+    }
+
+    #[test]
+    fn get_edges_among_partial_set_excludes_external_edges() {
+        let (mut store, _dir) = test_store();
+        // A → B → C; only A and B are in the set — B→C must be excluded
+        let nodes = vec![
+            make_node("a", "f.py::a", "f.py", NodeKind::Function),
+            make_node("b", "f.py::b", "f.py", NodeKind::Function),
+            make_node("c", "f.py::c", "f.py", NodeKind::Function),
+        ];
+        let edges = vec![
+            make_edge("f.py::a", "f.py::b", EdgeKind::Calls, "f.py"),
+            make_edge("f.py::b", "f.py::c", EdgeKind::Calls, "f.py"),
+        ];
+        store
+            .store_file_nodes_edges("f.py", &nodes, &edges, "h1")
+            .unwrap();
+
+        let set: HashSet<String> = ["f.py::a", "f.py::b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let result = store.get_edges_among(&set);
+        assert_eq!(result.len(), 1, "only A→B should be returned; B→C is excluded");
+        assert_eq!(result[0].source_qualified, "f.py::a");
+        assert_eq!(result[0].target_qualified, "f.py::b");
     }
 }
