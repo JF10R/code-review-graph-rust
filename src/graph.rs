@@ -40,9 +40,9 @@ pub struct GraphData {
     /// file_path → SHA-256 (kept for hash-skip in incremental)
     file_hashes: HashMap<String, String>,
     /// Precomputed lowercase names for fast keyword search.
-    /// Maps NodeIndex to (lowercase_name, lowercase_qualified_name).
+    /// Maps NodeIndex to (lowercase_name, lowercase_qualified_name, lowercase_file_path).
     #[serde(skip)]
-    lowercase_cache: HashMap<NodeIndex, (String, String)>,
+    lowercase_cache: HashMap<NodeIndex, (String, String, String)>,
 }
 
 impl GraphData {
@@ -165,6 +165,9 @@ impl GraphStore {
         for node_info in nodes {
             let norm_qn = normalize_qualified(&node_info.qualified_name);
             let norm_fp = normalize_path(&node_info.file_path);
+            let name_lower = node_info.name.to_lowercase();
+            let qn_lower = norm_qn.to_lowercase();
+            let fp_lower = norm_fp.to_lowercase();
             let graph_node = GraphNode {
                 kind: node_info.kind,
                 name: node_info.name.clone(),
@@ -181,8 +184,9 @@ impl GraphStore {
             };
             let idx = self.data.graph.add_node(graph_node);
             self.data.lowercase_cache.insert(idx, (
-                node_info.name.to_lowercase(),
-                norm_qn.to_lowercase(),
+                name_lower,
+                qn_lower,
+                fp_lower,
             ));
             self.data
                 .node_index
@@ -290,7 +294,11 @@ impl GraphStore {
             let node = &self.data.graph[idx];
             self.data.lowercase_cache.insert(
                 idx,
-                (node.name.to_lowercase(), node.qualified_name.to_lowercase()),
+                (
+                    node.name.to_lowercase(),
+                    node.qualified_name.to_lowercase(),
+                    node.file_path.to_lowercase(),
+                ),
             );
         }
     }
@@ -299,6 +307,11 @@ impl GraphStore {
     ///
     /// Results are sorted by relevance: exact name match (0) > prefix match (1) > contains (2),
     /// then alphabetically by name for stable ordering within each tier.
+    ///
+    /// Path-aware adjustments:
+    /// - Nodes whose file path matches query words are promoted by one tier.
+    /// - Nodes in compiled/minified paths (e.g. `/compiled/`, `/node_modules/`, `/.next/`)
+    ///   are demoted by one tier.
     pub fn search_nodes(&self, query: &str, limit: usize) -> Result<Vec<GraphNode>> {
         let words: Vec<String> = query
             .split_whitespace()
@@ -315,20 +328,39 @@ impl GraphStore {
             .node_index
             .iter()
             .filter_map(|(_, &idx)| {
-                let (name_lower, qn_lower) = self.data.lowercase_cache.get(&idx)?;
-                if !words
-                    .iter()
-                    .all(|w| name_lower.contains(w.as_str()) || qn_lower.contains(w.as_str()))
-                {
+                let (name_lower, qn_lower, path_lower) =
+                    self.data.lowercase_cache.get(&idx)?;
+                if !words.iter().all(|w| {
+                    name_lower.contains(w.as_str())
+                        || qn_lower.contains(w.as_str())
+                        || path_lower.contains(w.as_str())
+                }) {
                     return None;
                 }
-                let relevance = if name_lower == &query_lower || qn_lower == &query_lower {
+                let mut relevance = if name_lower == &query_lower || qn_lower == &query_lower {
                     0u8
                 } else if name_lower.starts_with(&query_lower) {
                     1u8
                 } else {
                     2u8
                 };
+
+                // Path-segment boost: promote if any query word appears in the file path.
+                if relevance > 0 && words.iter().any(|w| path_lower.contains(w.as_str())) {
+                    relevance = relevance.saturating_sub(1);
+                }
+
+                // Demote compiled/minified paths.
+                if path_lower.contains("/compiled/")
+                    || path_lower.starts_with("compiled/")
+                    || path_lower.contains("/node_modules/")
+                    || path_lower.starts_with("node_modules/")
+                    || path_lower.contains("/.next/")
+                    || path_lower.starts_with(".next/")
+                {
+                    relevance = relevance.saturating_add(1);
+                }
+
                 Some((relevance, self.data.graph[idx].clone()))
             })
             .collect();
@@ -1259,6 +1291,98 @@ mod tests {
 
         let results = store.search_nodes("   ", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_nodes_path_segment_boosts_relevant_results() {
+        let (mut store, _dir) = test_store();
+        // Node in a config path
+        let config_node = make_node(
+            "validate",
+            "src/config.ts::validate",
+            "src/config.ts",
+            NodeKind::Function,
+        );
+        // Node in a compiled path
+        let compiled_node = make_node(
+            "validate",
+            "compiled/utils.js::validate",
+            "compiled/utils.js",
+            NodeKind::Function,
+        );
+        store
+            .store_file_nodes_edges("src/config.ts", &[config_node], &[], "h1")
+            .unwrap();
+        store
+            .store_file_nodes_edges("compiled/utils.js", &[compiled_node], &[], "h2")
+            .unwrap();
+
+        let results = store.search_nodes("validate config", 10).unwrap();
+        assert!(results.len() >= 1);
+        // The config path node should rank first (path matches "config")
+        assert_eq!(results[0].file_path, "src/config.ts");
+    }
+
+    #[test]
+    fn search_nodes_demotes_compiled_paths() {
+        let (mut store, _dir) = test_store();
+        let src_node = make_node(
+            "loader",
+            "src/loader.ts::loader",
+            "src/loader.ts",
+            NodeKind::Function,
+        );
+        let compiled_node = make_node(
+            "loader",
+            "compiled/loader.js::loader",
+            "compiled/loader.js",
+            NodeKind::Function,
+        );
+        store
+            .store_file_nodes_edges("src/loader.ts", &[src_node], &[], "h1")
+            .unwrap();
+        store
+            .store_file_nodes_edges("compiled/loader.js", &[compiled_node], &[], "h2")
+            .unwrap();
+
+        let results = store.search_nodes("loader", 10).unwrap();
+        assert!(results.len() >= 2);
+        // Source node should rank before compiled node
+        assert_eq!(results[0].file_path, "src/loader.ts");
+    }
+
+    #[test]
+    fn search_nodes_file_node_matches_path_segments() {
+        let (mut store, _dir) = test_store();
+        // A File node — its name IS the file path
+        let file_node = make_node(
+            "src/server/config-shared.ts",
+            "src/server/config-shared.ts",
+            "src/server/config-shared.ts",
+            NodeKind::File,
+        );
+        let func_node = make_node(
+            "parseConfig",
+            "src/utils.ts::parseConfig",
+            "src/utils.ts",
+            NodeKind::Function,
+        );
+        store
+            .store_file_nodes_edges(
+                "src/server/config-shared.ts",
+                &[file_node],
+                &[],
+                "h1",
+            )
+            .unwrap();
+        store
+            .store_file_nodes_edges("src/utils.ts", &[func_node], &[], "h2")
+            .unwrap();
+
+        let results = store.search_nodes("config", 10).unwrap();
+        assert!(results.len() >= 1);
+        // File node should appear because "config" is in its path/name
+        assert!(results.iter().any(|n| n.name.contains("config-shared")));
     }
 
     // -----------------------------------------------------------------------
