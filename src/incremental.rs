@@ -543,8 +543,19 @@ pub fn incremental_update(
         edges: Vec<EdgeInfo>,
         fhash: String,
     }
-    let mut parsed_files: Vec<ParsedFile> = Vec::new();
 
+    // Serial pre-filter: apply ignore/existence/language checks and handle
+    // removed files (needs &mut store). Collect store-dependent data so the
+    // parallel phase needs no store access.
+    struct IncrCandidate {
+        rel_path: String,
+        abs_path: std::path::PathBuf,
+        abs_path_str: String,
+        old_hashes: HashMap<String, String>,
+        /// Known file hash from the store; None if not yet indexed.
+        known_hash: Option<String>,
+    }
+    let mut candidates: Vec<IncrCandidate> = Vec::new();
     for rel_path in &all_files {
         if should_ignore(rel_path, &ignore_patterns) {
             continue;
@@ -557,36 +568,54 @@ pub fn incremental_update(
         if parser.detect_language(abs_path.as_std_path()).is_none() {
             continue;
         }
-
         let abs_path_str = abs_path.as_str().to_owned();
-
-        let source = match fs::read(abs_path.as_std_path()) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        let fhash = sha256_bytes(&source);
-
-        if file_hash_unchanged(store, &abs_path_str, &fhash) {
-            continue;
-        }
-
         let old_hashes = store.get_body_hashes(&abs_path_str);
+        let known_hash = store.get_file_hash(&abs_path_str).map(str::to_owned);
+        candidates.push(IncrCandidate {
+            rel_path: rel_path.clone(),
+            abs_path: abs_path.as_std_path().to_owned(),
+            abs_path_str,
+            old_hashes,
+            known_hash,
+        });
+    }
 
-        match parser.parse_bytes(abs_path.as_std_path(), &source) {
-            Ok((nodes, edges)) => {
-                parsed_files.push(ParsedFile {
-                    abs_path_str,
-                    old_hashes,
+    // Parallel phase: I/O + sha256 + tree-sitter parse (no store access).
+    // Use std::result::Result directly because the local Result alias is single-param.
+    type ParResult = std::result::Result<ParsedFile, (String, String)>;
+    let par_results: Vec<ParResult> = candidates
+        .par_iter()
+        .filter_map(|c| {
+            let source = match fs::read(&c.abs_path) {
+                Ok(bytes) => bytes,
+                Err(_) => return None,
+            };
+            let fhash = sha256_bytes(&source);
+            if c.known_hash.as_deref() == Some(fhash.as_str()) {
+                return None;
+            }
+            match parser.parse_bytes(&c.abs_path, &source) {
+                Ok((nodes, edges)) => Some(Ok(ParsedFile {
+                    abs_path_str: c.abs_path_str.clone(),
+                    old_hashes: c.old_hashes.clone(),
                     nodes,
                     edges,
                     fhash,
-                });
+                })),
+                Err(e) => Some(Err((c.rel_path.clone(), e.to_string()))),
             }
-            Err(e) => {
-                warn!("Error parsing {}: {}", rel_path, e);
+        })
+        .collect();
+
+    let mut parsed_files: Vec<ParsedFile> = Vec::new();
+    for result in par_results {
+        match result {
+            Ok(pf) => parsed_files.push(pf),
+            Err((rel_path, msg)) => {
+                warn!("Error parsing {}: {}", rel_path, msg);
                 errors.push(BuildError {
-                    file: rel_path.to_owned(),
-                    error: e.to_string(),
+                    file: rel_path,
+                    error: msg,
                 });
             }
         }
