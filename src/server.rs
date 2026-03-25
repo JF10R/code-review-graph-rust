@@ -322,6 +322,7 @@ enum WorkerCommand {
     WatcherRemove {
         paths: Vec<std::path::PathBuf>,
     },
+    #[allow(dead_code)]
     Shutdown,
 }
 

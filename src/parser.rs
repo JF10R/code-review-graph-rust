@@ -1229,7 +1229,7 @@ fn walk_for_framework_edges_inner(
             let kind = child.kind();
             if kind == "identifier" {
                 let text = node_text(&child, source);
-                if text.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if text.chars().next().is_some_and(|c| c.is_uppercase()) {
                     Some(text.to_string())
                 } else {
                     None
@@ -1238,7 +1238,7 @@ fn walk_for_framework_edges_inner(
                 // <UI.Button /> → extract "Button" (last segment)
                 let full = node_text(&child, source);
                 let last = full.rsplit('.').next().unwrap_or(full);
-                if last.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if last.chars().next().is_some_and(|c| c.is_uppercase()) {
                     Some(last.to_string())
                 } else {
                     None
@@ -1277,8 +1277,8 @@ fn walk_for_framework_edges_inner(
                 let args_node = children.iter().find(|n| n.kind() == "arguments");
 
                 // Pattern 2: Express/Koa route handler — app.get('/path', handler)
-                let is_express_route = obj_name.map_or(false, |o| EXPRESS_OBJECTS.contains(&o))
-                    && method_name.map_or(false, |m| HTTP_METHODS.contains(&m));
+                let is_express_route = obj_name.is_some_and(|o| EXPRESS_OBJECTS.contains(&o))
+                    && method_name.is_some_and(|m| HTTP_METHODS.contains(&m));
 
                 if is_express_route {
                     if let Some(args) = args_node {
@@ -1291,7 +1291,7 @@ fn walk_for_framework_edges_inner(
 
                 // Pattern 3: Event emitter — emitter.on('event', handler)
                 let is_event_listener =
-                    method_name.map_or(false, |m| EVENT_LISTENER_METHODS.contains(&m));
+                    method_name.is_some_and(|m| EVENT_LISTENER_METHODS.contains(&m));
 
                 if is_event_listener {
                     if let Some(args) = args_node {

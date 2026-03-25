@@ -681,6 +681,7 @@ impl GraphStore {
     /// Tries outgoing direction first (callee chain), then incoming (caller chain).
     /// Returns the path as a sequence of `(GraphNode, Option<GraphEdge>)` pairs.
     /// The last element has `edge=None` (destination, no outgoing edge in path).
+    #[allow(clippy::type_complexity)]
     pub fn trace_call_chain(
         &self,
         from_qn: &str,
