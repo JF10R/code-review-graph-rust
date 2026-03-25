@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use camino::Utf8Path;
 use code_review_graph::{
     graph::GraphStore,
     parser::CodeParser,
@@ -8,6 +9,10 @@ use code_review_graph::{
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;
 use tempfile::TempDir;
+
+fn temp_db_path(dir: &TempDir) -> camino::Utf8PathBuf {
+    Utf8Path::from_path(dir.path()).unwrap().join("graph.bin.zst")
+}
 
 fn grammar_check_ok(parser: &CodeParser, path: &Path, label: &str) -> bool {
     match parser.parse_bytes(path, b"") {
@@ -90,7 +95,7 @@ fn populate_graph(store: &mut GraphStore, num_files: usize, nodes_per_file: usiz
 
 fn build_graph_in_tempdir() -> (TempDir, GraphStore) {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("graph.bin.zst");
+    let db_path = temp_db_path(&dir);
     let mut store = GraphStore::new(&db_path).unwrap();
     // 10 files × 100 nodes = 1000 nodes; 99 intra-file call edges per file → ~990 total.
     populate_graph(&mut store, 10, 100);
@@ -125,7 +130,7 @@ fn bench_parse_typescript(c: &mut Criterion) {
 
 fn bench_graph_save(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("graph.bin.zst");
+    let db_path = temp_db_path(&dir);
     let mut store = GraphStore::new(&db_path).unwrap();
     populate_graph(&mut store, 10, 100);
 
@@ -136,7 +141,7 @@ fn bench_graph_save(c: &mut Criterion) {
 
 fn bench_graph_load(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("graph.bin.zst");
+    let db_path = temp_db_path(&dir);
     {
         let mut store = GraphStore::new(&db_path).unwrap();
         populate_graph(&mut store, 10, 100);

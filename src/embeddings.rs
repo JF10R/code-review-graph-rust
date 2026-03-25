@@ -320,6 +320,7 @@ struct FastEmbedProvider {
 #[cfg(feature = "embeddings-fastembed")]
 impl FastEmbedProvider {
     fn new() -> Result<Self> {
+        #[allow(unused_mut)]
         let mut init = fastembed::InitOptions::new(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode)
             .with_show_download_progress(true);
 
