@@ -22,25 +22,16 @@ use crate::embeddings::{embed_all_nodes, semantic_search, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
-use crate::types::{edge_to_dict, node_to_dict, NormalizedPrefix, EdgeKind};
+use crate::types::{edge_to_dict, node_to_dict, EdgeKind};
 
-/// Wrapper: build a node dict, then strip repo-root prefix if compact.
-/// For batch results, prefer `node_dict_batch` with a pre-computed prefix.
-fn node_dict(node: &crate::types::GraphNode, compact: bool, root: &Utf8Path) -> Value {
-    let mut d = node_to_dict(node, compact);
-    if compact {
-        NormalizedPrefix::new(root).strip(&mut d);
-    }
-    d
+/// Build a node dict.
+fn node_dict(node: &crate::types::GraphNode, compact: bool, _root: &Utf8Path) -> Value {
+    node_to_dict(node, compact)
 }
 
-/// Batch-optimized: build a node dict using a pre-computed prefix.
-fn node_dict_batch(node: &crate::types::GraphNode, compact: bool, prefix: &Option<NormalizedPrefix>) -> Value {
-    let mut d = node_to_dict(node, compact);
-    if let Some(p) = prefix {
-        p.strip(&mut d);
-    }
-    d
+/// Batch node dict (paths already normalized at source; no prefix stripping needed).
+fn node_dict_batch(node: &crate::types::GraphNode, compact: bool, _prefix: &Option<()>) -> Value {
+    node_to_dict(node, compact)
 }
 
 /// Common JS/TS builtin method names filtered from callers_of results.
@@ -104,9 +95,8 @@ fn validate_repo_root(path: &Utf8Path) -> Result<Utf8PathBuf> {
     let resolved_std = path.as_std_path().canonicalize().map_err(|e| {
         CrgError::InvalidRepoRoot(format!("{}: {}", path, e))
     })?;
-    let resolved = Utf8PathBuf::from_path_buf(resolved_std).map_err(|p| {
-        CrgError::InvalidRepoRoot(format!("non-UTF-8 path: {}", p.display()))
-    })?;
+    let resolved_str = crate::paths::normalize_path(&resolved_std.to_string_lossy());
+    let resolved = camino::Utf8PathBuf::from(resolved_str);
     if !resolved.is_dir() {
         return Err(CrgError::InvalidRepoRoot(format!(
             "not a directory: {}",
@@ -272,7 +262,7 @@ pub fn get_impact_radius(
 
     let impact = store.get_impact_radius(&abs_files, max_depth, MAX_RESULTS, None)?;
 
-    let prefix = if compact { Some(NormalizedPrefix::new(&root)) } else { None };
+    let prefix: Option<()> = None;
     let changed_dicts: Vec<Value> = impact.changed_nodes.iter().map(|n| node_dict_batch(n, compact, &prefix)).collect();
     let impacted_dicts: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_dict_batch(n, compact, &prefix)).collect();
     let edge_dicts: Vec<Value> = impact.edges.iter().map(edge_to_dict).collect();
@@ -614,7 +604,7 @@ pub fn get_review_context(
 
     let impact = store.get_impact_radius(&abs_files, max_depth, 500, None)?;
 
-    let rc_prefix = if compact { Some(NormalizedPrefix::new(&root)) } else { None };
+    let rc_prefix: Option<()> = None;
     let rc_changed: Vec<Value> = impact.changed_nodes.iter().map(|n| node_dict_batch(n, compact, &rc_prefix)).collect();
     let rc_impacted: Vec<Value> = impact.impacted_nodes.iter().map(|n| node_dict_batch(n, compact, &rc_prefix)).collect();
 

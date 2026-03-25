@@ -10,6 +10,7 @@ pub mod graph;
 pub mod incremental;
 pub mod intern;
 pub mod parser;
+pub mod paths;
 pub mod persistence;
 pub mod server;
 pub mod tools;

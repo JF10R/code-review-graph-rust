@@ -9,30 +9,30 @@ expression: result
   ],
   "changed_nodes": [
     {
-      "file_path": "utils.py",
+      "file_path": "[path]",
       "kind": "File",
       "line_end": 7,
       "line_start": 1,
       "name": "[path]",
-      "qualified_name": "utils.py",
+      "qualified_name": "[path]",
       "signature": ""
     },
     {
-      "file_path": "utils.py",
+      "file_path": "[path]",
       "kind": "Function",
       "line_end": 3,
       "line_start": 2,
       "name": "add",
-      "qualified_name": "utils.py::add",
+      "qualified_name": "[path]",
       "signature": "(a, b)"
     },
     {
-      "file_path": "utils.py",
+      "file_path": "[path]",
       "kind": "Function",
       "line_end": 6,
       "line_start": 5,
       "name": "subtract",
-      "qualified_name": "utils.py::subtract",
+      "qualified_name": "[path]",
       "signature": "(a, b)"
     }
   ],

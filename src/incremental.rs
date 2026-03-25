@@ -23,12 +23,15 @@ use walkdir::WalkDir;
 
 use crate::error::Result;
 use crate::graph::GraphStore;
+use crate::paths::normalize_path;
 use crate::types::EdgeInfo;
 use crate::parser::CodeParser;
 use crate::types::EdgeKind;
 
 // Default ignore patterns
 const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    ".claude/**",
+    ".fastembed_cache/**",
     ".code-review-graph/**",
     "node_modules/**",
     ".git/**",
@@ -309,10 +312,11 @@ pub fn collect_all_files(repo_root: &Utf8Path) -> Vec<String> {
 
 /// Find files that import from or depend on the given file.
 pub fn find_dependents(store: &GraphStore, file_path: &str) -> Result<Vec<String>> {
+    let file_path = normalize_path(file_path);
     let mut dependents: HashSet<String> = HashSet::new();
 
     // CALLS/IMPORTS_FROM/INHERITS/IMPLEMENTS edges targeting nodes in this file
-    let nodes = store.get_nodes_by_file(file_path)?;
+    let nodes = store.get_nodes_by_file(&file_path)?;
     for node in &nodes {
         let node_edges = store.get_edges_by_target(&node.qualified_name)?;
         for e in node_edges {
@@ -328,7 +332,7 @@ pub fn find_dependents(store: &GraphStore, file_path: &str) -> Result<Vec<String
         }
     }
 
-    dependents.remove(file_path);
+    dependents.remove(&file_path);
     Ok(dependents.into_iter().collect())
 }
 
@@ -1161,6 +1165,7 @@ mod tests {
 
         let dependents = find_dependents(&mut store, &abs_b).unwrap();
 
+        let norm_a = crate::paths::normalize_path(&abs_a);
         assert_eq!(
             dependents.len(),
             1,
@@ -1168,7 +1173,7 @@ mod tests {
             dependents
         );
         assert_eq!(
-            dependents[0], abs_a,
+            dependents[0], norm_a,
             "a.py should be the dependent of b.py"
         );
     }
@@ -1252,7 +1257,10 @@ mod tests {
         let mut dependents = find_dependents(&mut store, &abs_b).unwrap();
         dependents.sort();
 
-        let mut expected = vec![abs_a.clone(), abs_c.clone()];
+        let mut expected = vec![
+            crate::paths::normalize_path(&abs_a),
+            crate::paths::normalize_path(&abs_c),
+        ];
         expected.sort();
 
         assert_eq!(
@@ -1285,8 +1293,9 @@ mod tests {
 
         let dependents = find_dependents(&mut store, &abs_b).unwrap();
 
+        let norm_a = crate::paths::normalize_path(&abs_a);
         assert!(
-            dependents.contains(&abs_a),
+            dependents.contains(&norm_a),
             "a.py imports from b.py and should be in dependents; got: {:?}",
             dependents
         );

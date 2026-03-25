@@ -833,16 +833,11 @@ pub fn semantic_search(
     emb_store: &mut EmbeddingStore,
     limit: usize,
     compact: bool,
-    repo_root: &Utf8Path,
+    repo_root: &camino::Utf8Path,
 ) -> Result<Vec<serde_json::Value>> {
     if emb_store.provider.is_none() {
         let nodes = store.search_nodes(query, limit)?;
-        let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
-        return Ok(nodes.iter().map(|n| {
-            let mut d = node_to_dict(n, compact);
-            if let Some(ref p) = prefix { p.strip(&mut d); }
-            d
-        }).collect());
+        return Ok(nodes.iter().map(|n| node_to_dict(n, compact)).collect());
     }
 
     // GC stale embeddings when vector count has grown more than 20% beyond live nodes.
@@ -898,14 +893,12 @@ fn nodes_from_scored(
     scored: Vec<(String, f64)>,
     store: &GraphStore,
     compact: bool,
-    repo_root: &Utf8Path,
+    _repo_root: &camino::Utf8Path, // kept for API compatibility; paths already normalized at source
 ) -> Result<Vec<serde_json::Value>> {
-    let prefix = if compact { Some(crate::types::NormalizedPrefix::new(repo_root)) } else { None };
     let mut results = Vec::with_capacity(scored.len());
     for (qn, score) in scored {
         if let Some(node) = store.get_node(&qn)? {
             let mut d = node_to_dict(&node, compact);
-            if let Some(ref p) = prefix { p.strip(&mut d); }
             d["similarity_score"] =
                 serde_json::Value::from((score * 10_000.0).round() / 10_000.0);
             results.push(d);

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub use petgraph::stable_graph::NodeIndex;
 
 use crate::error::Result;
+use crate::paths::{normalize_path, normalize_qualified};
 use crate::persistence;
 use crate::types::{
     EdgeInfo, EdgeKind, GraphEdge, GraphNode, GraphStats, ImpactResult, NodeInfo, NodeKind,
@@ -122,8 +123,20 @@ impl GraphStore {
         edges: &[EdgeInfo],
         file_hash: &str,
     ) -> Result<()> {
-        self.store_file_nodes_only(file_path, nodes, file_hash)?;
-        self.insert_edges(edges, false);
+        let fp = normalize_path(file_path);
+        let normalized_nodes: Vec<NodeInfo> = nodes.iter().map(|n| NodeInfo {
+            file_path: normalize_path(&n.file_path),
+            qualified_name: normalize_qualified(&n.qualified_name),
+            ..n.clone()
+        }).collect();
+        let normalized_edges: Vec<EdgeInfo> = edges.iter().map(|e| EdgeInfo {
+            source_qualified: normalize_qualified(&e.source_qualified),
+            target_qualified: normalize_qualified(&e.target_qualified),
+            file_path: normalize_path(&e.file_path),
+            ..e.clone()
+        }).collect();
+        self.store_file_nodes_only(&fp, &normalized_nodes, file_hash)?;
+        self.insert_edges(&normalized_edges, false);
         Ok(())
     }
 
@@ -136,17 +149,20 @@ impl GraphStore {
         nodes: &[NodeInfo],
         file_hash: &str,
     ) -> Result<()> {
-        self.remove_file_data_inner(file_path);
+        let file_path = normalize_path(file_path);
+        self.remove_file_data_inner(&file_path);
 
         let file_hash_owned = file_hash.to_string();
         let file_path_owned = file_path.to_string();
         let mut new_idxs: Vec<NodeIndex> = Vec::with_capacity(nodes.len());
         for node_info in nodes {
+            let norm_qn = normalize_qualified(&node_info.qualified_name);
+            let norm_fp = normalize_path(&node_info.file_path);
             let graph_node = GraphNode {
                 kind: node_info.kind,
                 name: node_info.name.clone(),
-                qualified_name: node_info.qualified_name.clone(),
-                file_path: node_info.file_path.clone(),
+                qualified_name: norm_qn.clone(),
+                file_path: norm_fp,
                 line_start: node_info.line_start,
                 line_end: node_info.line_end,
                 language: node_info.language.clone(),
@@ -159,7 +175,7 @@ impl GraphStore {
             let idx = self.data.graph.add_node(graph_node);
             self.data
                 .node_index
-                .insert(node_info.qualified_name.clone(), idx);
+                .insert(norm_qn, idx);
             new_idxs.push(idx);
         }
         self.data.file_index.insert(file_path_owned.clone(), new_idxs);
@@ -173,8 +189,10 @@ impl GraphStore {
     /// skipped — safe when the graph was just cleared (full-build phase 2).
     pub fn insert_edges(&mut self, edges: &[EdgeInfo], skip_dedup: bool) {
         for edge_info in edges {
-            let src_idx = self.data.node_index.get(&edge_info.source_qualified).copied();
-            let tgt_idx = self.data.node_index.get(&edge_info.target_qualified).copied();
+            let norm_src = normalize_qualified(&edge_info.source_qualified);
+            let norm_tgt = normalize_qualified(&edge_info.target_qualified);
+            let src_idx = self.data.node_index.get(&norm_src).copied();
+            let tgt_idx = self.data.node_index.get(&norm_tgt).copied();
             if let (Some(src), Some(tgt)) = (src_idx, tgt_idx) {
                 if skip_dedup {
                     self.data.graph.add_edge(src, tgt, edge_info.kind);
@@ -194,7 +212,8 @@ impl GraphStore {
 
     /// Remove all nodes and edges associated with a file.
     pub fn remove_file_data(&mut self, file_path: &str) -> Result<()> {
-        self.remove_file_data_inner(file_path);
+        let fp = normalize_path(file_path);
+        self.remove_file_data_inner(&fp);
         Ok(())
     }
 
@@ -219,20 +238,22 @@ impl GraphStore {
 
     /// Get a node by qualified name.
     pub fn get_node(&self, qualified_name: &str) -> Result<Option<GraphNode>> {
+        let qn = normalize_qualified(qualified_name);
         let node = self
             .data
             .node_index
-            .get(qualified_name)
+            .get(&qn)
             .map(|&idx| self.data.graph[idx].clone());
         Ok(node)
     }
 
     /// Get all nodes in a file.
     pub fn get_nodes_by_file(&self, file_path: &str) -> Result<Vec<GraphNode>> {
+        let fp = normalize_path(file_path);
         let nodes = self
             .data
             .file_index
-            .get(file_path)
+            .get(&fp)
             .map(|idxs| {
                 idxs.iter()
                     .map(|&idx| self.data.graph[idx].clone())
@@ -341,7 +362,8 @@ impl GraphStore {
 
     /// Get edges originating from a qualified name.
     pub fn get_edges_by_source(&self, qualified_name: &str) -> Result<Vec<GraphEdge>> {
-        let edges = match self.data.node_index.get(qualified_name) {
+        let qualified_name = normalize_qualified(qualified_name);
+        let edges = match self.data.node_index.get(&qualified_name) {
             None => vec![],
             Some(&idx) => self
                 .data
@@ -361,7 +383,8 @@ impl GraphStore {
 
     /// Get edges targeting a qualified name.
     pub fn get_edges_by_target(&self, qualified_name: &str) -> Result<Vec<GraphEdge>> {
-        let edges = match self.data.node_index.get(qualified_name) {
+        let qualified_name = normalize_qualified(qualified_name);
+        let edges = match self.data.node_index.get(&qualified_name) {
             None => vec![],
             Some(&idx) => self
                 .data
@@ -381,6 +404,7 @@ impl GraphStore {
 
     /// Search edges where target_qualified equals `name` and kind is CALLS.
     pub fn search_edges_by_target_name(&self, name: &str) -> Result<Vec<GraphEdge>> {
+        let name = normalize_path(name);
         // Find any node whose qualified_name ends with or equals `name`
         let edges: Vec<GraphEdge> = self
             .data
@@ -411,15 +435,17 @@ impl GraphStore {
     ///
     /// Returns `None` if the file has not been indexed yet.
     pub fn get_file_hash(&self, file_path: &str) -> Option<&str> {
-        self.data.file_hashes.get(file_path).map(|s| s.as_str())
+        let fp = normalize_path(file_path);
+        self.data.file_hashes.get(&fp).map(|s| s.as_str())
     }
 
     /// Get body_hashes for all nodes in a file.
     /// Returns a map of qualified_name → body_hash.
     pub fn get_body_hashes(&self, file_path: &str) -> HashMap<String, String> {
+        let file_path = normalize_path(file_path);
         self.data
             .file_index
-            .get(file_path)
+            .get(&file_path)
             .map(|idxs| {
                 idxs.iter()
                     .map(|&idx| {
@@ -581,10 +607,11 @@ impl GraphStore {
     /// More efficient than iterating all nodes when the file has many nodes:
     /// uses `file_index` for O(nodes_in_file) lookup instead of O(all_nodes).
     pub fn get_incoming_edges_for_file_nodes(&self, file_path: &str) -> Result<Vec<GraphEdge>> {
+        let file_path = normalize_path(file_path);
         let node_indices = self
             .data
             .file_index
-            .get(file_path)
+            .get(&file_path)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 

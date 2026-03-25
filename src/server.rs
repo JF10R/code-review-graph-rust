@@ -579,7 +579,7 @@ fn watcher_parse_and_store(
     }
     let source = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
     let fhash = sha256_bytes_pub(&source);
-    let abs_str = path.to_string_lossy();
+    let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
 
     // Hash-skip: avoid re-parsing when file content hasn't changed.
     if store.get_file_hash(&abs_str) == Some(fhash.as_str()) {
@@ -690,7 +690,7 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
         };
 
         for path in &paths_to_remove {
-            let abs_str = path.to_string_lossy().into_owned();
+            let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
             tree_cache.remove(&abs_str);
             if let Err(e) = store.remove_file_data(&abs_str) {
                 tracing::error!("Watcher remove {}: {}", abs_str, e);
@@ -706,11 +706,11 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
         // Track processed paths to guard against circular import cycles.
         let mut processed: HashSet<String> = paths_to_update
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| crate::paths::normalize_path(&p.to_string_lossy()))
             .collect();
 
         for path in &paths_to_update {
-            let abs_str = path.to_string_lossy().into_owned();
+            let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
             let old_tree = tree_cache.get(&abs_str);
             let incremental = old_tree.is_some();
             match watcher_parse_and_store(&parser, &mut store, path, old_tree) {

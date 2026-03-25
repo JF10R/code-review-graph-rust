@@ -252,43 +252,6 @@ pub fn node_to_dict(node: &GraphNode, compact: bool) -> serde_json::Value {
     }
 }
 
-/// Pre-computed normalized prefix for path stripping.
-/// Construct once per query, reuse across all nodes in the result set.
-pub struct NormalizedPrefix {
-    fwd: String,
-    fwd_unc: String, // "//?/" prefixed variant (Windows UNC)
-}
-
-impl NormalizedPrefix {
-    pub fn new(repo_root: &camino::Utf8Path) -> Self {
-        let fwd = repo_root.as_str().replace('\\', "/");
-        let fwd_unc = format!("//?/{}", fwd);
-        Self { fwd, fwd_unc }
-    }
-
-    /// Strip the repo root prefix from `file_path` and `qualified_name` fields.
-    pub fn strip(&self, dict: &mut serde_json::Value) {
-        for key in &["file_path", "qualified_name"] {
-            if let Some(val) = dict.get_mut(*key).and_then(|v| v.as_str().map(|s| s.to_string())) {
-                let normalized = val.replace('\\', "/");
-                let stripped = normalized
-                    .strip_prefix(self.fwd.as_str())
-                    .or_else(|| normalized.strip_prefix(self.fwd_unc.as_str()))
-                    .map(|s| s.trim_start_matches('/').to_string())
-                    .unwrap_or(val);
-                dict[*key] = serde_json::Value::String(stripped);
-            }
-        }
-    }
-}
-
-/// Strip the repo root prefix from `file_path` and `qualified_name` fields
-/// in a node dict. For batch operations, prefer `NormalizedPrefix::new()` +
-/// `.strip()` to avoid recomputing the prefix on every node.
-pub fn strip_paths_prefix(dict: &mut serde_json::Value, repo_root: &camino::Utf8Path) {
-    NormalizedPrefix::new(repo_root).strip(dict);
-}
-
 /// Convert a GraphEdge to a JSON-serializable map.
 pub fn edge_to_dict(edge: &GraphEdge) -> serde_json::Value {
     serde_json::json!({
