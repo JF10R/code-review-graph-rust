@@ -1244,6 +1244,34 @@ pub fn batch_open_node_context(
     }))
 }
 
+pub fn batch_open_node_context_with_store(
+    store: &GraphStore,
+    root: &Utf8Path,
+    targets: Vec<String>,
+    compact: bool,
+) -> Result<Value> {
+    let capped: Vec<String> = targets.into_iter().take(5).collect();
+    let mut results: Vec<Value> = Vec::with_capacity(capped.len());
+    for target in &capped {
+        match open_node_context_with_store(store, root, target, compact) {
+            Ok(v) => {
+                if v["status"] == "not_found" || v["status"] == "ambiguous" {
+                    results.push(json!({
+                        "target": target,
+                        "status": v["status"],
+                        "summary": v["summary"],
+                    }));
+                } else {
+                    results.push(v);
+                }
+            }
+            Err(_) => results.push(json!({ "target": target, "status": "not_found" })),
+        }
+    }
+    let count = results.len();
+    Ok(json!({ "status": "ok", "results": results, "count": count }))
+}
+
 // ---------------------------------------------------------------------------
 // Tool 11: measure_token_reduction
 // ---------------------------------------------------------------------------
@@ -1493,7 +1521,7 @@ pub fn trace_call_chain_with_store(
 // ---------------------------------------------------------------------------
 
 /// Resolve changed files from the provided list or from git diff.
-fn resolve_changed_files(
+pub fn resolve_changed_files(
     changed_files: Option<Vec<String>>,
     root: &Utf8Path,
     base: &str,

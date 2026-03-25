@@ -1,14 +1,16 @@
 //! MCP server wiring via rmcp.
 //!
-//! Registers all 9 tools and runs the server over stdio transport.
-//! All tool handlers delegate to `tokio::task::spawn_blocking` to avoid
-//! blocking the async event loop during heavy operations (SQLite writes,
-//! tree-sitter parsing, embedding).
+//! Registers all tools and runs the server over stdio transport.
 //!
-//! When started via `code-review-graph serve`, a background OS thread watches
-//! the repository for file changes and incrementally updates the graph stored
-//! on disk. Tool handlers continue to open the store per-call (Option B), so
-//! they always read the latest on-disk snapshot produced by the watcher.
+//! Architecture: a single worker OS thread owns GraphStore + EmbeddingStore.
+//! MCP tool handlers send typed WorkerCommand messages over a std::sync::mpsc
+//! channel and await replies via tokio::sync::oneshot. The background file
+//! watcher runs as a notify debouncer and also sends commands to the worker
+//! (single-writer guarantee — no concurrent SQLite/disk writes).
+//!
+//! tree_sitter::Tree is !Send, so the worker must be a plain OS thread (not
+//! a tokio task). Reply channels use tokio::sync::oneshot so async handlers
+//! can await them without blocking the event loop.
 
 use rmcp::{
     ServerHandler,
@@ -19,6 +21,7 @@ use rmcp::{
     transport,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -227,16 +230,344 @@ fn default_large_limit() -> usize { 50 }
 fn default_chain_depth() -> usize { 10 }
 
 // ---------------------------------------------------------------------------
+// Worker command channel
+// ---------------------------------------------------------------------------
+
+/// Commands sent to the worker thread that owns GraphStore + EmbeddingStore.
+///
+/// Read-only variants carry a `reply` oneshot so the async handler can await
+/// the result without blocking the tokio runtime. Mutation variants (BuildGraph,
+/// EmbedGraph) reload the worker's in-memory store from disk after the tool
+/// function finishes (those functions open their own stores and write to disk).
+/// Watcher variants have no reply — they are fire-and-forget.
+enum WorkerCommand {
+    // Read-only queries
+    QueryGraph {
+        pattern: String,
+        target: String,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    SemanticSearch {
+        query: String,
+        kind: Option<String>,
+        limit: usize,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    OpenNodeContext {
+        target: String,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    BatchNodeContext {
+        targets: Vec<String>,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    ImpactRadius {
+        changed_files: Option<Vec<String>>,
+        max_depth: usize,
+        compact: bool,
+        base: String,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    TraceCallChain {
+        from: String,
+        to: String,
+        max_depth: usize,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    HybridQuery {
+        query: String,
+        limit: usize,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    ListStats {
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    FindLargeFunctions {
+        min_lines: usize,
+        kind: Option<String>,
+        file_path_pattern: Option<String>,
+        limit: usize,
+        compact: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    GetReviewContext {
+        changed_files: Option<Vec<String>>,
+        max_depth: usize,
+        include_source: bool,
+        max_lines: usize,
+        compact: bool,
+        base: String,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    // Mutations — these tools open their own stores and write to disk;
+    // the worker reloads from disk afterwards.
+    BuildGraph {
+        full_rebuild: bool,
+        base: String,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    EmbedGraph {
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    // Watcher events — fire-and-forget (no reply)
+    WatcherUpdate {
+        paths: Vec<std::path::PathBuf>,
+    },
+    WatcherRemove {
+        paths: Vec<std::path::PathBuf>,
+    },
+    Shutdown,
+}
+
+// ---------------------------------------------------------------------------
+// Worker thread
+// ---------------------------------------------------------------------------
+
+/// OS thread that owns GraphStore, EmbeddingStore, CodeParser, and tree_cache.
+///
+/// Processes WorkerCommand messages sequentially (single writer), eliminating
+/// concurrent disk-write races between tool handlers and the file watcher.
+fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<WorkerCommand>) {
+    use crate::incremental::{find_dependents, get_db_path, get_embeddings_db_path};
+
+    let db_path = get_db_path(&root);
+    let emb_path = get_embeddings_db_path(&root);
+
+    // GraphStore::new creates an empty graph when the file doesn't exist yet.
+    let mut store = crate::graph::GraphStore::new(&db_path)
+        .unwrap_or_else(|e| panic!("Worker: cannot open store: {e}"));
+    let mut emb_store = match crate::embeddings::EmbeddingStore::new(&emb_path) {
+        Ok(s) => s,
+        Err(e) => panic!("Worker: cannot open embedding store: {e}"),
+    };
+    let parser = crate::parser::CodeParser::new();
+    let mut tree_cache: HashMap<String, tree_sitter::Tree> = HashMap::new();
+
+    /// Reload the graph store from disk (called after BuildGraph mutations).
+    macro_rules! reload_store {
+        () => {
+            match crate::graph::GraphStore::new(&db_path) {
+                Ok(s) => { store = s; }
+                Err(e) => tracing::error!("Worker: reload store failed: {e}"),
+            }
+        };
+    }
+
+    /// Reload the embedding store from disk (called after EmbedGraph mutations).
+    macro_rules! reload_emb {
+        () => {
+            match crate::embeddings::EmbeddingStore::new(&emb_path) {
+                Ok(s) => { emb_store = s; }
+                Err(e) => tracing::error!("Worker: reload emb store failed: {e}"),
+            }
+        };
+    }
+
+    for cmd in cmd_rx {
+        match cmd {
+            WorkerCommand::QueryGraph { pattern, target, compact, reply } => {
+                let result = crate::tools::query_graph_with_store(&store, &root, &pattern, &target, compact)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::SemanticSearch { query, kind, limit, compact, reply } => {
+                let result = crate::tools::semantic_search_nodes_with_store(
+                    &store, &mut emb_store, &root, &query, kind.as_deref(), limit, compact,
+                ).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::OpenNodeContext { target, compact, reply } => {
+                let result = crate::tools::open_node_context_with_store(&store, &root, &target, compact)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::BatchNodeContext { targets, compact, reply } => {
+                let result = crate::tools::batch_open_node_context_with_store(&store, &root, targets, compact)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::ImpactRadius { changed_files, max_depth, compact, base, reply } => {
+                let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
+                let result = crate::tools::get_impact_radius_with_store(&store, &root, files, max_depth, compact)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::TraceCallChain { from, to, max_depth, compact, reply } => {
+                let result = crate::tools::trace_call_chain_with_store(&store, &root, &from, &to, max_depth, compact)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::HybridQuery { query, limit, compact, reply } => {
+                let result = crate::tools::hybrid_query_with_store(&store, &mut emb_store, &root, &query, limit, compact)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::ListStats { reply } => {
+                let result = crate::tools::list_graph_stats_with_store(&store, &root)
+                    .map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::FindLargeFunctions { min_lines, kind, file_path_pattern, limit, compact, reply } => {
+                let result = crate::tools::find_large_functions_with_store(
+                    &store, &root, min_lines, kind.as_deref(), file_path_pattern.as_deref(), limit, compact,
+                ).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::GetReviewContext { changed_files, max_depth, include_source, max_lines, compact, base, reply } => {
+                let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
+                let result = crate::tools::get_review_context_with_store(
+                    &store, &root, files, max_depth, include_source, max_lines, compact,
+                ).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::BuildGraph { full_rebuild, base, reply } => {
+                // build_or_update_graph opens its own store, writes to disk, closes it.
+                let root_str = root.as_str().to_owned();
+                let result = crate::tools::build_or_update_graph(full_rebuild, Some(&root_str), &base)
+                    .map_err(|e| e.to_string());
+                // Reload worker's in-memory store from disk.
+                reload_store!();
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::EmbedGraph { reply } => {
+                // embed_graph opens its own stores, writes to disk, closes them.
+                let root_str = root.as_str().to_owned();
+                let result = crate::tools::embed_graph(Some(&root_str))
+                    .map_err(|e| e.to_string());
+                // Reload worker's in-memory embedding store from disk.
+                reload_emb!();
+                let _ = reply.send(result);
+            }
+
+            WorkerCommand::WatcherUpdate { paths } => {
+                // Track processed paths to guard against circular import cycles.
+                let mut processed: HashSet<String> = paths
+                    .iter()
+                    .map(|p| crate::paths::normalize_path(&p.to_string_lossy()))
+                    .collect();
+
+                for path in &paths {
+                    let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
+                    let old_tree = tree_cache.get(&abs_str);
+                    let incremental = old_tree.is_some();
+                    match watcher_parse_and_store(&parser, &mut store, path, old_tree) {
+                        Ok(Some((n, e, new_tree))) => {
+                            if let Some(t) = new_tree {
+                                tree_cache.insert(abs_str.clone(), t);
+                            }
+                            let _ = store.set_metadata(
+                                "last_updated",
+                                &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                            );
+                            let rel = path
+                                .strip_prefix(root.as_std_path())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| abs_str.clone());
+                            tracing::info!(
+                                "Worker updated: {} ({n} nodes, {e} edges, {})",
+                                rel,
+                                if incremental { "incremental" } else { "full parse" }
+                            );
+
+                            // Re-parse dependents so cross-file edges stay fresh.
+                            let deps = find_dependents(&store, &abs_str).unwrap_or_default();
+                            for dep_path in &deps {
+                                if processed.contains(dep_path.as_str()) {
+                                    continue;
+                                }
+                                processed.insert(dep_path.clone());
+                                let dep = std::path::Path::new(dep_path);
+                                let dep_old_tree = tree_cache.get(dep_path.as_str());
+                                match watcher_parse_and_store(&parser, &mut store, dep, dep_old_tree) {
+                                    Ok(Some((dn, de, dep_new_tree))) => {
+                                        if let Some(t) = dep_new_tree {
+                                            tree_cache.insert(dep_path.clone(), t);
+                                        }
+                                        tracing::debug!(
+                                            "Worker re-parsed dependent: {} ({dn} nodes, {de} edges)",
+                                            dep_path
+                                        );
+                                    }
+                                    Ok(None) => tracing::debug!(
+                                        "Worker dependent unchanged (hash match): {dep_path}"
+                                    ),
+                                    Err(e) => tracing::warn!("Worker dependent {dep_path}: {e}"),
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let rel = path
+                                .strip_prefix(root.as_std_path())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| abs_str.clone());
+                            tracing::debug!("Worker skipped (hash unchanged): {rel}");
+                        }
+                        Err(err) => tracing::error!("Worker parse: {err}"),
+                    }
+                }
+
+                if let Err(e) = store.commit() {
+                    tracing::error!("Worker commit error: {e}");
+                }
+            }
+
+            WorkerCommand::WatcherRemove { paths } => {
+                for path in &paths {
+                    let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
+                    tree_cache.remove(&abs_str);
+                    if let Err(e) = store.remove_file_data(&abs_str) {
+                        tracing::error!("Worker remove {abs_str}: {e}");
+                    } else {
+                        tracing::info!("Worker removed: {abs_str}");
+                    }
+                }
+                if let Err(e) = store.commit() {
+                    tracing::error!("Worker commit error (remove): {e}");
+                }
+            }
+
+            WorkerCommand::Shutdown => break,
+        }
+    }
+
+    tracing::info!("Worker thread shutting down");
+    if let Err(e) = store.close() {
+        tracing::error!("Worker: store close error: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // MCP server struct
 // ---------------------------------------------------------------------------
 
-/// The MCP server for code-review-graph. Holds the optional default repo root
-/// and the generated tool router.
+/// The MCP server for code-review-graph.
+///
+/// `worker_tx` is `Some` in server mode (the worker thread is running).
+/// `Clone` is required by rmcp — `Sender<WorkerCommand>` is `Clone`.
 #[derive(Clone)]
 pub struct CodeReviewServer {
     /// Default repo root passed via the CLI `--repo` flag.
     repo_root: Option<Arc<String>>,
     tool_router: ToolRouter<Self>,
+    /// Channel to the worker thread. None only in unit-test / CLI shim contexts.
+    worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>,
 }
 
 impl std::fmt::Debug for CodeReviewServer {
@@ -248,11 +579,17 @@ impl std::fmt::Debug for CodeReviewServer {
 }
 
 impl CodeReviewServer {
-    pub fn new(repo_root: Option<String>) -> Self {
+    fn new_inner(repo_root: Option<String>, worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>) -> Self {
         Self {
             repo_root: repo_root.map(Arc::new),
             tool_router: Self::tool_router(),
+            worker_tx,
         }
+    }
+
+    /// CLI / test constructor — no worker thread, falls back to spawn_blocking.
+    pub fn new(repo_root: Option<String>) -> Self {
+        Self::new_inner(repo_root, None)
     }
 
     /// Resolve the effective repo root: prefer the per-call value, fall back to
@@ -260,10 +597,37 @@ impl CodeReviewServer {
     fn resolve_repo_root(&self, per_call: Option<String>) -> Option<String> {
         per_call.or_else(|| self.repo_root.as_deref().map(|s| s.to_string()))
     }
+
+    /// Send a command to the worker and await the reply.
+    ///
+    /// Returns `Err("worker died")` if the channel is closed.
+    async fn worker_call(
+        &self,
+        make_cmd: impl FnOnce(tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>) -> WorkerCommand,
+    ) -> Result<String, String> {
+        let tx = self.worker_tx.as_ref().ok_or_else(|| "no worker channel".to_string())?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(make_cmd(reply_tx)).map_err(|_| "worker died".to_string())?;
+        reply_rx.await
+            .map_err(|_| "worker died (reply dropped)".to_string())?
+            .map(|v| v.to_string())
+    }
+
+    /// Fallback path used only when no worker_tx is available (CLI / tests).
+    async fn spawn_blocking_fallback<F>(&self, f: F) -> Result<String, String>
+    where
+        F: FnOnce() -> crate::error::Result<serde_json::Value> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            f().map(|v| v.to_string()).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Tool implementations (thin async wrappers → spawn_blocking → sync tools)
+// Tool implementations
 // ---------------------------------------------------------------------------
 
 #[tool_router]
@@ -279,17 +643,17 @@ impl CodeReviewServer {
         Parameters(p): Parameters<BuildOrUpdateParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::build_or_update_graph(
-                p.full_rebuild,
-                repo_root.as_deref(),
-                &p.base,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::BuildGraph {
+                full_rebuild: p.full_rebuild,
+                base: p.base,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::build_or_update_graph(p.full_rebuild, repo_root.as_deref(), &p.base)
+            }).await
+        }
     }
 
     /// Analyze the blast radius of code changes — shows which functions,
@@ -302,19 +666,19 @@ impl CodeReviewServer {
         Parameters(p): Parameters<ImpactRadiusParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::get_impact_radius(
-                p.changed_files,
-                p.max_depth,
-                repo_root.as_deref(),
-                &p.base,
-                p.compact,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::ImpactRadius {
+                changed_files: p.changed_files,
+                max_depth: p.max_depth,
+                compact: p.compact,
+                base: p.base,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::get_impact_radius(p.changed_files, p.max_depth, repo_root.as_deref(), &p.base, p.compact)
+            }).await
+        }
     }
 
     /// Explore structural code relationships — use INSTEAD of grepping for
@@ -329,18 +693,18 @@ impl CodeReviewServer {
         Parameters(p): Parameters<QueryGraphParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::query_graph(
-                &p.pattern,
-                &p.target,
-                repo_root.as_deref(),
-                p.compact,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::QueryGraph {
+                pattern: p.pattern,
+                target: p.target,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::query_graph(&p.pattern, &p.target, repo_root.as_deref(), p.compact)
+            }).await
+        }
     }
 
     /// Generate a focused, token-efficient review context for code changes.
@@ -353,21 +717,24 @@ impl CodeReviewServer {
         Parameters(p): Parameters<ReviewContextParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::get_review_context(
-                p.changed_files,
-                p.max_depth,
-                p.include_source,
-                p.max_lines_per_file,
-                repo_root.as_deref(),
-                &p.base,
-                p.compact,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::GetReviewContext {
+                changed_files: p.changed_files,
+                max_depth: p.max_depth,
+                include_source: p.include_source,
+                max_lines: p.max_lines_per_file,
+                compact: p.compact,
+                base: p.base,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::get_review_context(
+                    p.changed_files, p.max_depth, p.include_source,
+                    p.max_lines_per_file, repo_root.as_deref(), &p.base, p.compact,
+                )
+            }).await
+        }
     }
 
     /// Search for code entities by name, keyword, or semantic similarity.
@@ -384,19 +751,19 @@ impl CodeReviewServer {
         Parameters(p): Parameters<SemanticSearchParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::semantic_search_nodes(
-                &p.query,
-                p.kind.as_deref(),
-                p.limit,
-                repo_root.as_deref(),
-                p.compact,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::SemanticSearch {
+                query: p.query,
+                kind: p.kind,
+                limit: p.limit,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::semantic_search_nodes(&p.query, p.kind.as_deref(), p.limit, repo_root.as_deref(), p.compact)
+            }).await
+        }
     }
 
     /// Get aggregate statistics about the code knowledge graph.
@@ -409,13 +776,13 @@ impl CodeReviewServer {
         Parameters(p): Parameters<StatsParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::list_graph_stats(repo_root.as_deref())
-                .map(|v| v.to_string())
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::ListStats { reply }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::list_graph_stats(repo_root.as_deref())
+            }).await
+        }
     }
 
     /// Compute vector embeddings for all graph nodes to enable semantic search.
@@ -429,13 +796,13 @@ impl CodeReviewServer {
         Parameters(p): Parameters<EmbedParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::embed_graph(repo_root.as_deref())
-                .map(|v| v.to_string())
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::EmbedGraph { reply }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::embed_graph(repo_root.as_deref())
+            }).await
+        }
     }
 
     /// Get a specific section from the LLM-optimized documentation reference.
@@ -448,14 +815,11 @@ impl CodeReviewServer {
         &self,
         Parameters(p): Parameters<DocsParams>,
     ) -> std::result::Result<String, String> {
+        // get_docs_section only does a filesystem scan — no store read required.
         let repo_root = self.resolve_repo_root(None);
-        tokio::task::spawn_blocking(move || {
+        self.spawn_blocking_fallback(move || {
             crate::tools::get_docs_section(&p.section_name, repo_root.as_deref())
-                .map(|v| v.to_string())
-                .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        }).await
     }
 
     /// Find complex functions by line count — useful for identifying where
@@ -468,20 +832,23 @@ impl CodeReviewServer {
         Parameters(p): Parameters<LargeFunctionsParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::find_large_functions(
-                p.min_lines,
-                p.kind.as_deref(),
-                p.file_path_pattern.as_deref(),
-                p.limit,
-                repo_root.as_deref(),
-                p.compact,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::FindLargeFunctions {
+                min_lines: p.min_lines,
+                kind: p.kind,
+                file_path_pattern: p.file_path_pattern,
+                limit: p.limit,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::find_large_functions(
+                    p.min_lines, p.kind.as_deref(), p.file_path_pattern.as_deref(),
+                    p.limit, repo_root.as_deref(), p.compact,
+                )
+            }).await
+        }
     }
 
     /// Trace how data flows between two functions — finds the shortest
@@ -498,19 +865,19 @@ impl CodeReviewServer {
         Parameters(p): Parameters<TraceCallChainParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::trace_call_chain(
-                &p.from,
-                &p.to,
-                p.max_depth,
-                p.compact,
-                repo_root.as_deref(),
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::TraceCallChain {
+                from: p.from,
+                to: p.to,
+                max_depth: p.max_depth,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::trace_call_chain(&p.from, &p.to, p.max_depth, p.compact, repo_root.as_deref())
+            }).await
+        }
     }
 
     /// Smart search combining keyword matching with semantic similarity
@@ -525,18 +892,18 @@ impl CodeReviewServer {
         Parameters(p): Parameters<HybridQueryParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::hybrid_query(
-                &p.query,
-                p.limit,
-                repo_root.as_deref(),
-                p.compact,
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::HybridQuery {
+                query: p.query,
+                limit: p.limit,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact)
+            }).await
+        }
     }
 
     /// Get complete context for a function or class in one call — source preview,
@@ -549,17 +916,17 @@ impl CodeReviewServer {
         Parameters(p): Parameters<OpenNodeContextParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::open_node_context(
-                &p.target,
-                p.compact,
-                repo_root.as_deref(),
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::OpenNodeContext {
+                target: p.target,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::open_node_context(&p.target, p.compact, repo_root.as_deref())
+            }).await
+        }
     }
 
     /// Inspect multiple functions at once — saves N-1 tool calls compared to
@@ -571,17 +938,17 @@ impl CodeReviewServer {
         Parameters(p): Parameters<BatchNodeContextParams>,
     ) -> std::result::Result<String, String> {
         let repo_root = self.resolve_repo_root(p.repo_root);
-        tokio::task::spawn_blocking(move || {
-            crate::tools::batch_open_node_context(
-                p.targets,
-                p.compact,
-                repo_root.as_deref(),
-            )
-            .map(|v| v.to_string())
-            .map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        if self.worker_tx.is_some() {
+            self.worker_call(|reply| WorkerCommand::BatchNodeContext {
+                targets: p.targets,
+                compact: p.compact,
+                reply,
+            }).await
+        } else {
+            self.spawn_blocking_fallback(move || {
+                crate::tools::batch_open_node_context(p.targets, p.compact, repo_root.as_deref())
+            }).await
+        }
     }
 }
 
@@ -624,7 +991,7 @@ fn resolve_root(repo_root: Option<&str>) -> Utf8PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Background file watcher (Option B: saves to disk, tools reload per call)
+// Parse + store helper (used by worker for watcher events)
 // ---------------------------------------------------------------------------
 
 /// Parse `path` from disk and store its nodes/edges into `store`.
@@ -673,29 +1040,26 @@ fn watcher_parse_and_store(
     Ok(Some((n, e, new_tree)))
 }
 
-/// Spawn a background OS thread that watches `repo_root` for source-file
-/// changes and incrementally updates `graph.bin.zst` on disk.
+// ---------------------------------------------------------------------------
+// Background watcher notifier (sends paths to worker, no store access here)
+// ---------------------------------------------------------------------------
+
+/// Spawn a notify debouncer that watches `repo_root` for source-file changes
+/// and forwards path batches to the worker via `cmd_tx`.
 ///
-/// Uses the same notify debouncer logic as `incremental::watch()` but runs
-/// independently of any `Arc<Mutex<GraphStore>>` — it opens a fresh store,
-/// processes the batch, saves to disk, then drops the store. This keeps the
-/// locking surface minimal and is safe with the per-call `get_store()` pattern
-/// used by the tool handlers.
-fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
+/// The worker owns GraphStore and performs all actual parsing + writes.
+/// This function only handles filesystem events and routing.
+fn run_watcher_notifier(
+    repo_root: Utf8PathBuf,
+    cmd_tx: std::sync::mpsc::Sender<WorkerCommand>,
+) -> crate::error::Result<()> {
     use notify::RecursiveMode;
     use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
-    use crate::incremental::{get_db_path, load_ignore_patterns_pub, find_dependents};
-    use crate::graph::GraphStore;
+    use crate::incremental::{load_ignore_patterns_pub, should_ignore_pub};
     use crate::parser::CodeParser;
-    use std::collections::HashMap;
 
     let ignore_patterns = load_ignore_patterns_pub(&repo_root);
     let parser = CodeParser::new();
-
-    // Per-file parse-tree cache for incremental re-parsing.
-    // `tree_sitter::Tree` is `!Send`, but this entire watcher runs on one
-    // dedicated OS thread, so a plain HashMap is safe here.
-    let mut tree_cache: HashMap<String, tree_sitter::Tree> = HashMap::new();
 
     let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     let mut debouncer = new_debouncer(Duration::from_millis(300), tx)
@@ -705,10 +1069,7 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
         .watch(repo_root.as_std_path(), RecursiveMode::Recursive)
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
 
-    tracing::info!(
-        "Background watcher active — watching {}",
-        repo_root
-    );
+    tracing::info!("Background watcher active — watching {}", repo_root);
 
     for result in rx {
         let events = match result {
@@ -719,7 +1080,6 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
             }
         };
 
-        // notify returns std::path::PathBuf — keep as-is until we need string boundaries
         let mut paths_to_update: HashSet<std::path::PathBuf> = HashSet::new();
         let mut paths_to_remove: HashSet<std::path::PathBuf> = HashSet::new();
 
@@ -732,7 +1092,7 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
-            if crate::incremental::should_ignore_pub(&rel, &ignore_patterns) {
+            if should_ignore_pub(&rel, &ignore_patterns) {
                 continue;
             }
             if path.is_file() {
@@ -748,99 +1108,20 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
             continue;
         }
 
-        // Open the store once per batch, apply all changes, save, close.
-        let db_path = get_db_path(&repo_root);
-        let mut store = match GraphStore::new(&db_path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Background watcher: could not open store: {}", e);
-                continue;
-            }
-        };
-
-        for path in &paths_to_remove {
-            let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
-            tree_cache.remove(&abs_str);
-            if let Err(e) = store.remove_file_data(&abs_str) {
-                tracing::error!("Watcher remove {}: {}", abs_str, e);
-            } else {
-                let rel = path
-                    .strip_prefix(repo_root.as_std_path())
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| abs_str.clone());
-                tracing::info!("Watcher removed: {}", rel);
+        if !paths_to_remove.is_empty() {
+            let remove_vec: Vec<_> = paths_to_remove.into_iter().collect();
+            if cmd_tx.send(WorkerCommand::WatcherRemove { paths: remove_vec }).is_err() {
+                tracing::warn!("Watcher: worker channel closed, stopping");
+                break;
             }
         }
 
-        // Track processed paths to guard against circular import cycles.
-        let mut processed: HashSet<String> = paths_to_update
-            .iter()
-            .map(|p| crate::paths::normalize_path(&p.to_string_lossy()))
-            .collect();
-
-        for path in &paths_to_update {
-            let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
-            let old_tree = tree_cache.get(&abs_str);
-            let incremental = old_tree.is_some();
-            match watcher_parse_and_store(&parser, &mut store, path, old_tree) {
-                Ok(Some((n, e, new_tree))) => {
-                    if let Some(t) = new_tree {
-                        tree_cache.insert(abs_str.clone(), t);
-                    }
-                    let _ = store.set_metadata(
-                        "last_updated",
-                        &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                    );
-                    let rel = path
-                        .strip_prefix(repo_root.as_std_path())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| abs_str.clone());
-                    tracing::info!(
-                        "Watcher updated: {} ({} nodes, {} edges, {})",
-                        rel, n, e,
-                        if incremental { "incremental" } else { "full parse" }
-                    );
-
-                    // Re-parse dependents so cross-file edges stay fresh.
-                    let deps = find_dependents(&store, &abs_str).unwrap_or_default();
-                    for dep_path in &deps {
-                        if processed.contains(dep_path.as_str()) {
-                            continue;
-                        }
-                        processed.insert(dep_path.clone());
-                        let dep = std::path::Path::new(dep_path);
-                        let dep_old_tree = tree_cache.get(dep_path.as_str());
-                        match watcher_parse_and_store(&parser, &mut store, &dep, dep_old_tree) {
-                            Ok(Some((dn, de, dep_new_tree))) => {
-                                if let Some(t) = dep_new_tree {
-                                    tree_cache.insert(dep_path.clone(), t);
-                                }
-                                tracing::debug!(
-                                    "Watcher re-parsed dependent: {} ({} nodes, {} edges)",
-                                    dep_path, dn, de
-                                );
-                            }
-                            Ok(None) => tracing::debug!(
-                                "Watcher dependent unchanged (hash match): {}",
-                                dep_path
-                            ),
-                            Err(e) => tracing::warn!("Watcher dependent {}: {}", dep_path, e),
-                        }
-                    }
-                }
-                Ok(None) => {
-                    let rel = path
-                        .strip_prefix(repo_root.as_std_path())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| abs_str.clone());
-                    tracing::debug!("Watcher skipped (hash unchanged): {}", rel);
-                }
-                Err(err) => tracing::error!("Watcher {}", err),
+        if !paths_to_update.is_empty() {
+            let update_vec: Vec<_> = paths_to_update.into_iter().collect();
+            if cmd_tx.send(WorkerCommand::WatcherUpdate { paths: update_vec }).is_err() {
+                tracing::warn!("Watcher: worker channel closed, stopping");
+                break;
             }
-        }
-
-        if let Err(e) = store.commit() {
-            tracing::error!("Watcher commit error: {}", e);
         }
     }
 
@@ -850,22 +1131,33 @@ fn run_background_watcher(repo_root: Utf8PathBuf) -> crate::error::Result<()> {
 
 /// Run the MCP server over stdio. Blocks until the client disconnects.
 pub async fn run_server(repo_root: Option<String>) -> crate::error::Result<()> {
-    // Resolve the repository root once so we can start the background watcher.
+    // Resolve the repository root once.
     let root = resolve_root(repo_root.as_deref());
 
-    // Only start the watcher when we have a usable root directory.
-    if root.exists() {
+    // Spawn the worker thread and watcher only when we have a usable root.
+    let worker_tx = if root.exists() {
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerCommand>();
+
+        // Worker thread — owns GraphStore, EmbeddingStore, CodeParser, tree_cache.
+        let worker_root = root.clone();
+        std::thread::spawn(move || run_worker_thread(worker_root, rx));
+
+        // Watcher notifier thread — only routes paths to the worker.
         let watcher_root = root.clone();
+        let watcher_tx = tx.clone();
         std::thread::spawn(move || {
-            if let Err(e) = run_background_watcher(watcher_root) {
+            if let Err(e) = run_watcher_notifier(watcher_root, watcher_tx) {
                 tracing::error!("Background watcher error: {}", e);
             }
         });
-    } else {
-        tracing::info!("No repo root detected, background watcher disabled");
-    }
 
-    let server = CodeReviewServer::new(repo_root);
+        Some(tx)
+    } else {
+        tracing::info!("No repo root detected, worker + watcher disabled");
+        None
+    };
+
+    let server = CodeReviewServer::new_inner(repo_root, worker_tx);
     let (stdin, stdout) = transport::io::stdio();
     serve_server(server, (stdin, stdout))
         .await
