@@ -976,6 +976,7 @@ pub fn hybrid_query(
     limit: usize,
     repo_root: Option<&str>,
     compact: bool,
+    fusion: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -991,7 +992,7 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
@@ -1004,6 +1005,7 @@ pub fn hybrid_query_with_store(
     query: &str,
     limit: usize,
     compact: bool,
+    fusion: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1014,45 +1016,102 @@ pub fn hybrid_query_with_store(
         }));
     }
 
-    const RRF_K: f64 = 60.0;
-
-    // Keyword results
+    // Keyword results (used by both fusion modes)
     let keyword_hits = store.search_nodes(query, limit * 2)?;
+    let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
 
-    let method;
-    let mut rrf_scores: HashMap<String, f64> = HashMap::new();
+    let fusion_method = fusion.unwrap_or("rrf");
 
-    // Populate keyword ranks
-    for (rank, node) in keyword_hits.iter().enumerate() {
-        let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-        *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
-    }
+    // Convex combination (CC): inverse-rank scores min-max normalised to [0,1],
+    // then linearly combined as alpha*kw + (1-alpha)*sem.
+    // Falls through to RRF when embeddings are unavailable.
+    let (method, ranked): (&str, Vec<(String, f64)>) = if fusion_method == "cc" && embeddings_available {
+        const ALPHA: f64 = 0.5;
 
-    // Semantic ranks (if available)
-    if emb_store.available() && emb_store.count().unwrap_or(0) > 0 {
-        method = "hybrid_rrf";
+        let mut keyword_scores: HashMap<String, f64> = HashMap::new();
+        for (rank, node) in keyword_hits.iter().enumerate() {
+            keyword_scores.insert(node.qualified_name.clone(), 1.0 / (1.0 + rank as f64));
+        }
+
+        let mut semantic_scores: HashMap<String, f64> = HashMap::new();
         let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
         for (rank, hit) in semantic_hits.iter().enumerate() {
             if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
-                let score = 1.0 / (RRF_K + rank as f64 + 1.0);
-                *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
+                semantic_scores.insert(qn.to_string(), 1.0 / (1.0 + rank as f64));
             }
         }
-    } else {
-        method = "keyword_only";
-    }
 
-    // Sort by RRF score descending
-    let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(limit);
+        // Min-max normalise a score map to [0, 1]. All-equal scores map to 1.
+        let normalize = |scores: &HashMap<String, f64>| -> HashMap<String, f64> {
+            if scores.is_empty() {
+                return HashMap::new();
+            }
+            let min = scores.values().cloned().fold(f64::INFINITY, f64::min);
+            let max = scores.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let range = max - min;
+            if range < f64::EPSILON {
+                scores.keys().map(|k| (k.clone(), 1.0)).collect()
+            } else {
+                scores.iter().map(|(k, v)| (k.clone(), (v - min) / range)).collect()
+            }
+        };
+
+        let kw_norm = normalize(&keyword_scores);
+        let sem_norm = normalize(&semantic_scores);
+
+        let all_qns: HashSet<&String> = kw_norm.keys().chain(sem_norm.keys()).collect();
+        let mut combined: Vec<(String, f64)> = all_qns
+            .into_iter()
+            .map(|qn| {
+                let kw = kw_norm.get(qn).copied().unwrap_or(0.0);
+                let sem = sem_norm.get(qn).copied().unwrap_or(0.0);
+                (qn.clone(), ALPHA * kw + (1.0 - ALPHA) * sem)
+            })
+            .collect();
+
+        combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        combined.truncate(limit);
+        ("hybrid_cc", combined)
+    } else {
+        // RRF score formula: Σ 1 / (k + rank_i) where k = 60 (standard constant)
+        const RRF_K: f64 = 60.0;
+
+        let mut rrf_scores: HashMap<String, f64> = HashMap::new();
+
+        for (rank, node) in keyword_hits.iter().enumerate() {
+            let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+            *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
+        }
+
+        let method = if embeddings_available {
+            let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
+            for (rank, hit) in semantic_hits.iter().enumerate() {
+                if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
+                    let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                    *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
+                }
+            }
+            "hybrid_rrf"
+        } else {
+            "keyword_only"
+        };
+
+        let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(limit);
+        (method, ranked)
+    };
+
+    // Use fusion_method (not method) to determine the score field name — method can be
+    // "keyword_only" for both paths when embeddings are absent, so fusion_method is canonical.
+    let score_field = if fusion_method == "cc" { "cc_score" } else { "rrf_score" };
 
     let results: Vec<Value> = ranked
         .iter()
         .filter_map(|(qn, score)| {
             store.get_node(qn).ok().flatten().map(|node| {
                 let mut d = node_dict(&node, compact, root);
-                d["rrf_score"] = json!(score);
+                d[score_field] = json!(score);
                 d
             })
         })
@@ -1849,7 +1908,7 @@ mod tests {
         fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("", 10, Some(&path), false);
+        let result = hybrid_query("", 10, Some(&path), false, None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1867,7 +1926,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("add", 5, Some(&path), false);
+        let result = hybrid_query("add", 5, Some(&path), false, None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1888,7 +1947,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("square", 5, Some(&path), false);
+        let result = hybrid_query("square", 5, Some(&path), false, None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -1901,6 +1960,70 @@ mod tests {
             let score = results[0]["rrf_score"].as_f64().unwrap();
             assert!(score > 0.0, "rrf_score should be positive, got {score}");
         }
+    }
+
+    #[test]
+    fn hybrid_query_rrf_fusion_uses_hybrid_rrf_or_keyword_only_method() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("ops.py"),
+            b"def multiply(a, b): return a * b\ndef divide(a, b): return a / b\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        // Explicit "rrf" fusion — no embeddings, so falls back to keyword_only
+        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        let method = val["method"].as_str().unwrap();
+        assert!(
+            method == "hybrid_rrf" || method == "keyword_only",
+            "rrf fusion should use hybrid_rrf or keyword_only, got {method}"
+        );
+    }
+
+    #[test]
+    fn hybrid_query_cc_fusion_falls_back_to_keyword_only_without_embeddings() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("math.py"),
+            b"def abs_val(x): return x if x >= 0 else -x\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        // CC mode without embeddings: embeddings_available = false, so falls into RRF branch
+        // which returns "keyword_only" (since no embeddings are present)
+        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"));
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        // Without embeddings the cc branch is skipped entirely, keyword_only is used
+        assert_eq!(
+            val["method"], "keyword_only",
+            "cc fusion without embeddings should fall back to keyword_only"
+        );
+    }
+
+    #[test]
+    fn hybrid_query_cc_fusion_returns_valid_results_structure() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("sort.py"),
+            b"def bubble_sort(lst): return lst\ndef merge_sort(lst): return lst\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"));
+        assert!(result.is_ok(), "cc fusion hybrid_query should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        assert!(val.get("method").is_some(), "result must have method field");
+        assert!(val.get("results").is_some(), "result must have results field");
+        assert!(val["results"].is_array(), "results must be an array");
     }
 
     // -----------------------------------------------------------------------
