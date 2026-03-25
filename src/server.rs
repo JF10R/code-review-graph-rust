@@ -56,8 +56,8 @@ struct ImpactRadiusParams {
     #[schemars(description = "Git ref for auto-detecting changes")]
     #[serde(default = "default_base")]
     base: String,
-    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
-    #[serde(default)]
+    #[schemars(description = "Compact output (default: true). Set false for full node details including docstring, body_hash, language.")]
+    #[serde(default = "default_true")]
     compact: bool,
 }
 
@@ -70,8 +70,8 @@ struct QueryGraphParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
-    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
-    #[serde(default)]
+    #[schemars(description = "Compact output (default: true). Set false for full node details including docstring, body_hash, language.")]
+    #[serde(default = "default_true")]
     compact: bool,
 }
 
@@ -95,8 +95,8 @@ struct ReviewContextParams {
     #[schemars(description = "Git ref for change detection")]
     #[serde(default = "default_base")]
     base: String,
-    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
-    #[serde(default)]
+    #[schemars(description = "Compact output (default: true). Set false for full node details including docstring, body_hash, language.")]
+    #[serde(default = "default_true")]
     compact: bool,
 }
 
@@ -113,8 +113,8 @@ struct SemanticSearchParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
-    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
-    #[serde(default)]
+    #[schemars(description = "Compact output (default: true). Set false for full node details including docstring, body_hash, language.")]
+    #[serde(default = "default_true")]
     compact: bool,
 }
 
@@ -155,8 +155,8 @@ struct LargeFunctionsParams {
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
     repo_root: Option<String>,
-    #[schemars(description = "If true, return slim node objects (name, qualified_name, kind, file_path, line_start, line_end, signature only). Reduces response tokens ~40%.")]
-    #[serde(default)]
+    #[schemars(description = "Compact output (default: true). Set false for full node details including docstring, body_hash, language.")]
+    #[serde(default = "default_true")]
     compact: bool,
 }
 
@@ -169,8 +169,23 @@ struct TraceCallChainParams {
     #[schemars(description = "Maximum number of hops to traverse (default: 10)")]
     #[serde(default = "default_chain_depth")]
     max_depth: usize,
-    #[schemars(description = "If true, return slim node objects. Reduces response tokens ~40%.")]
+    #[schemars(description = "Compact output (default: true). Set false for full node details.")]
+    #[serde(default = "default_true")]
+    compact: bool,
+    #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
+    repo_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct HybridQueryParams {
+    #[schemars(description = "Search query — combines keyword matching with semantic similarity for best results")]
+    query: String,
+    #[schemars(description = "Maximum results (default: 10)")]
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[schemars(description = "Compact output (default: true). Set false for full node details.")]
+    #[serde(default = "default_true")]
     compact: bool,
     #[schemars(description = "Repository root path. Auto-detected if omitted.")]
     #[serde(default)]
@@ -182,7 +197,7 @@ fn default_base() -> String { "HEAD~1".to_string() }
 fn default_max_depth() -> usize { 2 }
 fn default_true() -> bool { true }
 fn default_max_lines() -> usize { 200 }
-fn default_search_limit() -> usize { 20 }
+fn default_search_limit() -> usize { 10 }
 fn default_min_lines() -> usize { 50 }
 fn default_large_limit() -> usize { 50 }
 fn default_chain_depth() -> usize { 10 }
@@ -381,9 +396,9 @@ impl CodeReviewServer {
 
     /// Compute vector embeddings for all graph nodes to enable semantic search.
     ///
-    /// Uses the all-MiniLM-L6-v2 model (384-dim vectors).
+    /// Uses Jina Code Embeddings v2 (768-dim) by default via fastembed.
     /// Only computes embeddings for nodes that don't already have them.
-    /// After running this, semantic_search_nodes_tool uses vector similarity.
+    /// After running this, semantic_search_nodes uses vector similarity.
     #[tool(name = "embed_graph")]
     async fn embed_graph_tool(
         &self,
@@ -466,6 +481,32 @@ impl CodeReviewServer {
                 p.max_depth,
                 p.compact,
                 repo_root.as_deref(),
+            )
+            .map(|v| v.to_string())
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    /// Smart search combining keyword matching with semantic similarity
+    /// via Reciprocal Rank Fusion (RRF). Prefer this over semantic_search_nodes
+    /// when you want the best of both worlds — exact name matches AND
+    /// conceptual similarity in one ranked result set. Falls back to
+    /// keyword-only when embeddings are unavailable.
+    #[tool(name = "hybrid_query")]
+    #[tracing::instrument(skip(self))]
+    async fn hybrid_query_tool(
+        &self,
+        Parameters(p): Parameters<HybridQueryParams>,
+    ) -> std::result::Result<String, String> {
+        let repo_root = self.resolve_repo_root(p.repo_root);
+        tokio::task::spawn_blocking(move || {
+            crate::tools::hybrid_query(
+                &p.query,
+                p.limit,
+                repo_root.as_deref(),
+                p.compact,
             )
             .map(|v| v.to_string())
             .map_err(|e| e.to_string())

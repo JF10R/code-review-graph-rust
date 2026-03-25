@@ -719,6 +719,36 @@ pub fn semantic_search_nodes(
         nodes.iter().map(|n| node_dict(n, compact, &root)).collect()
     };
 
+    // Adaptive source snippets: top 3 results get 10 lines of source inline.
+    // This eliminates follow-up Read calls for the most relevant hits.
+    let mut enriched = results;
+    for (i, result) in enriched.iter_mut().enumerate() {
+        if i >= 3 { break; }
+        if let (Some(fp), Some(ls)) = (
+            result.get("file_path").and_then(|v| v.as_str()),
+            result.get("line_start").and_then(|v| v.as_u64()),
+        ) {
+            // Try to resolve the file path (may be relative after compact stripping)
+            let full_path = if std::path::Path::new(fp).is_absolute() {
+                fp.to_string()
+            } else {
+                root.join(fp).to_string()
+            };
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                let start = ls.saturating_sub(1) as usize;
+                let snippet: String = content
+                    .lines()
+                    .skip(start)
+                    .take(10)
+                    .enumerate()
+                    .map(|(j, line)| format!("{:>4}: {}", start + j + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                result["source_preview"] = json!(snippet);
+            }
+        }
+    }
+
     let kind_suffix = kind.map(|k| format!(" (kind={k})")).unwrap_or_default();
     emb_store.close()?;
     store.close()?;
@@ -726,8 +756,8 @@ pub fn semantic_search_nodes(
         "status": "ok",
         "query": query,
         "search_mode": search_mode,
-        "summary": format!("Found {} node(s) matching '{}'{}", results.len(), query, kind_suffix),
-        "results": results,
+        "summary": format!("Found {} node(s) matching '{}'{}", enriched.len(), query, kind_suffix),
+        "results": enriched,
     }))
 }
 
