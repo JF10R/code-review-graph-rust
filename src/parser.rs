@@ -941,8 +941,12 @@ fn extract_from_tree(
                     body_hash: body_hash(&source[child.byte_range()]),
                 });
 
+                let container = match enclosing_class {
+                    Some(cls) => qualify(cls, file_path, None),
+                    None => file_path.to_string(),
+                };
                 edges.push(EdgeInfo {
-                    source_qualified: file_path.to_string(),
+                    source_qualified: container,
                     target_qualified: qualified.clone(),
                     kind: EdgeKind::Contains,
                     file_path: file_path.to_string(),
@@ -964,7 +968,7 @@ fn extract_from_tree(
                                     if prop_name.is_empty() {
                                         continue;
                                     }
-                                    let prop_qn = format!("{file_path}::{name}.{prop_name}");
+                                    let prop_qn = format!("{qualified}.{prop_name}");
                                     let prop_sig = node_text(&member, source).to_string();
 
                                     nodes.push(NodeInfo {
