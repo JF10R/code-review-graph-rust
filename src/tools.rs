@@ -1351,14 +1351,23 @@ fn aggregate_to_files(
             // Sort nodes by score descending for capped top-k aggregation.
             nodes.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Capped top-k base score: best node + 0.5 * sum of next 2.
+            // Capped top-k base score: top node * 1.5 + 0.3 * sum of next 2.
+            // Heavier top-node weighting prevents many weak-match files from beating
+            // a file with one strong KeywordExact hit.
             let base = {
                 let top = nodes[0].score;
                 let rest: f64 = nodes[1..nodes.len().min(3)]
                     .iter()
                     .map(|n| n.score)
                     .sum::<f64>();
-                top + 0.5 * rest
+                top * 1.5 + 0.3 * rest
+            };
+
+            // KeywordExact boost: the query contained the precise symbol name; reward specificity.
+            let exact_symbol_boost = if nodes[0].sources.contains(&CandidateSource::KeywordExact) {
+                1.5
+            } else {
+                1.0
             };
 
             // Gather all unique sources across nodes in this file.
@@ -1401,7 +1410,7 @@ fn aggregate_to_files(
                 1.0
             };
 
-            let final_score = base * test_prior * compiled_prior * multi_source * symbol_path;
+            let final_score = base * exact_symbol_boost * test_prior * compiled_prior * multi_source * symbol_path;
 
             // Top-3 evidence nodes.
             let top_nodes: Vec<NodeEvidence> = nodes
@@ -3106,6 +3115,87 @@ mod tests {
         assert!(
             results[0].file_path.contains("cache_reducer"),
             "symbol-path-boosted file should rank first; got {:?}",
+            results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn aggregate_exact_symbol_floor() {
+        // File A: 1 node (score 0.05, source: KeywordExact)
+        // File B: 3 nodes (scores 0.04, 0.03, 0.02, source: KeywordRelaxed)
+        // File A should rank higher because the KeywordExact boost (1.5x) lifts it above the volume.
+        //
+        // File A score: 0.05 * 1.5 (top weight) * 1.5 (exact boost) = 0.1125
+        // File B score: 0.04 * 1.5 + 0.3 * (0.03 + 0.02) = 0.06 + 0.015 = 0.075
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+
+        candidates.insert("a::coerce_from_fn_pointer".to_string(), make_candidate(
+            "a::coerce_from_fn_pointer",
+            "src/coercion.rs",
+            NodeKind::Function,
+            0.05,
+            CandidateSource::KeywordExact,
+        ));
+
+        let weak_scores = [0.04_f64, 0.03, 0.02];
+        for (i, &score) in weak_scores.iter().enumerate() {
+            let qn = format!("b::weak{i}");
+            candidates.insert(qn.clone(), make_candidate(
+                &qn,
+                "src/types.rs",
+                NodeKind::Function,
+                score,
+                CandidateSource::KeywordRelaxed,
+            ));
+        }
+
+        let parts = decompose_query("coerce_from_fn_pointer");
+        let results = aggregate_to_files(candidates, &parts, 10);
+
+        assert!(results.len() >= 2);
+        assert_eq!(
+            results[0].file_path, "src/coercion.rs",
+            "KeywordExact file should rank first; got {:?}",
+            results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn aggregate_max_dominance() {
+        // File A: 1 node (score 0.08, source: KeywordRelaxed)
+        // File B: 5 nodes (scores 0.03 each, source: KeywordRelaxed)
+        // File A should rank higher; top node weighting prevents volume from winning.
+        //
+        // File A score: 0.08 * 1.5 = 0.12
+        // File B score: 0.03 * 1.5 + 0.3 * (0.03 + 0.03) = 0.045 + 0.018 = 0.063
+        let mut candidates: HashMap<String, NodeCandidate> = HashMap::new();
+
+        candidates.insert("a::dominant".to_string(), make_candidate(
+            "a::dominant",
+            "src/dominant.rs",
+            NodeKind::Function,
+            0.08,
+            CandidateSource::KeywordRelaxed,
+        ));
+
+        for i in 0..5_u8 {
+            let qn = format!("b::weak{i}");
+            candidates.insert(qn.clone(), make_candidate(
+                &qn,
+                "src/scattered.rs",
+                NodeKind::Function,
+                0.03,
+                CandidateSource::KeywordRelaxed,
+            ));
+        }
+
+        let parts = decompose_query("something");
+        let results = aggregate_to_files(candidates, &parts, 10);
+
+        assert!(results.len() >= 2);
+        assert_eq!(
+            results[0].file_path, "src/dominant.rs",
+            "strong single-node file should rank first; got {:?}",
             results.iter().map(|r| &r.file_path).collect::<Vec<_>>()
         );
     }
