@@ -7,7 +7,8 @@
 //! SQLite is no longer used here — see `embeddings.rs` for the embeddings DB.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+
+use camino::{Utf8Path, Utf8PathBuf};
 
 use petgraph::stable_graph::StableGraph;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
@@ -55,12 +56,12 @@ impl GraphData {
 // Persistence helpers (delegates to crate::persistence)
 // ---------------------------------------------------------------------------
 
-fn save(data: &GraphData, path: &Path) -> Result<()> {
-    persistence::save_blob(data, path, "graph")
+fn save(data: &GraphData, path: &Utf8Path) -> Result<()> {
+    persistence::save_blob(data, path.as_std_path(), "graph")
 }
 
-fn load(path: &Path) -> Result<GraphData> {
-    persistence::load_blob(path, "graph")
+fn load(path: &Utf8Path) -> Result<GraphData> {
+    persistence::load_blob(path.as_std_path(), "graph")
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ fn load(path: &Path) -> Result<GraphData> {
 pub struct GraphStore {
     data: GraphData,
     /// Path to the `.bin.zst` file.
-    bin_path: std::path::PathBuf,
+    bin_path: Utf8PathBuf,
 }
 
 impl GraphStore {
@@ -80,7 +81,7 @@ impl GraphStore {
     ///
     /// `db_path` is the path returned by `incremental::get_db_path()` —
     /// i.e. `<repo>/.code-review-graph/graph.bin.zst`.
-    pub fn new(db_path: &Path) -> Result<Self> {
+    pub fn new(db_path: &Utf8Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -91,7 +92,7 @@ impl GraphStore {
                 Err(e) => {
                     tracing::warn!(
                         "Could not load graph from {}: {} — starting empty",
-                        db_path.display(),
+                        db_path,
                         e
                     );
                     GraphData::new()
@@ -998,6 +999,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn p(path: &std::path::Path) -> &Utf8Path {
+        Utf8Path::from_path(path).expect("test path is valid UTF-8")
+    }
+
     // -----------------------------------------------------------------------
     // Helper: create a fresh in-memory-backed GraphStore with a temp file path
     // -----------------------------------------------------------------------
@@ -1005,7 +1010,7 @@ mod tests {
     fn test_store() -> (GraphStore, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.bin.zst");
-        let store = GraphStore::new(&path).unwrap();
+        let store = GraphStore::new(p(&path)).unwrap();
         (store, dir)
     }
 
@@ -1417,7 +1422,7 @@ mod tests {
         let path = dir.path().join("graph.bin.zst");
 
         {
-            let mut store = GraphStore::new(&path).unwrap();
+            let mut store = GraphStore::new(p(&path)).unwrap();
             let nodes = vec![make_node("roundtrip_fn", "f.py::roundtrip_fn", "f.py", NodeKind::Function)];
             store
                 .store_file_nodes_edges("f.py", &nodes, &[], "hash99")
@@ -1427,7 +1432,7 @@ mod tests {
         }
 
         // Reload from disk
-        let store2 = GraphStore::new(&path).unwrap();
+        let store2 = GraphStore::new(p(&path)).unwrap();
         let node = store2.get_node("f.py::roundtrip_fn").unwrap();
         assert!(node.is_some(), "node should survive save+load");
         assert_eq!(store2.get_metadata("key").unwrap(), Some("value".to_string()));
@@ -1445,7 +1450,7 @@ mod tests {
         std::fs::write(&path, b"BADBYTES_NOT_CRG_MAGIC").unwrap();
 
         // GraphStore::new should not panic — it falls back to empty graph
-        let store = GraphStore::new(&path).unwrap();
+        let store = GraphStore::new(p(&path)).unwrap();
         assert_eq!(store.get_stats().unwrap().total_nodes, 0);
     }
 
@@ -1458,7 +1463,7 @@ mod tests {
         data.extend_from_slice(&[0u8; 100]); // bad CRC + garbage compressed payload
         std::fs::write(&path, &data).unwrap();
 
-        let store = GraphStore::new(&path).unwrap();
+        let store = GraphStore::new(p(&path)).unwrap();
         assert_eq!(store.get_stats().unwrap().total_nodes, 0);
     }
 

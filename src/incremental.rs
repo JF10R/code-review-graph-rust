@@ -6,9 +6,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+use camino::{Utf8Path, Utf8PathBuf};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -60,11 +61,15 @@ fn git_timeout() -> Duration {
 }
 
 /// Walk up from `start` to find the nearest `.git` directory.
-pub fn find_repo_root(start: Option<&Path>) -> Option<PathBuf> {
-    let start = start
+pub fn find_repo_root(start: Option<&Utf8Path>) -> Option<Utf8PathBuf> {
+    let start: Utf8PathBuf = start
         .map(|p| p.to_path_buf())
-        .or_else(|| std::env::current_dir().ok())?;
-    let mut current = start.as_path();
+        .or_else(|| {
+            std::env::current_dir().ok().and_then(|p| {
+                Utf8PathBuf::from_path_buf(p).ok()
+            })
+        })?;
+    let mut current: &Utf8Path = start.as_path();
     loop {
         if current.join(".git").exists() {
             return Some(current.to_path_buf());
@@ -77,22 +82,27 @@ pub fn find_repo_root(start: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// Find the project root: git repo root if available, otherwise cwd.
-pub fn find_project_root(start: Option<&Path>) -> PathBuf {
+pub fn find_project_root(start: Option<&Utf8Path>) -> Utf8PathBuf {
     find_repo_root(start).unwrap_or_else(|| {
         start
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| Utf8PathBuf::from_path_buf(p).ok())
+                    .unwrap_or_default()
+            })
     })
 }
 
 /// Determine the graph binary path for a repository.
 /// Creates `.code-review-graph/` directory and inner `.gitignore`.
-pub fn get_db_path(repo_root: &Path) -> PathBuf {
+pub fn get_db_path(repo_root: &Utf8Path) -> Utf8PathBuf {
     let crg_dir = repo_root.join(".code-review-graph");
     let graph_bin = crg_dir.join("graph.bin.zst");
 
     if let Err(e) = fs::create_dir_all(&crg_dir) {
-        warn!("Could not create {}: {}", crg_dir.display(), e);
+        warn!("Could not create {}: {}", crg_dir, e);
     }
 
     let inner_gitignore = crg_dir.join(".gitignore");
@@ -127,13 +137,13 @@ pub fn get_db_path(repo_root: &Path) -> PathBuf {
 }
 
 /// Determine the embeddings store path for a repository.
-pub fn get_embeddings_db_path(repo_root: &Path) -> PathBuf {
+pub fn get_embeddings_db_path(repo_root: &Utf8Path) -> Utf8PathBuf {
     repo_root
         .join(".code-review-graph")
         .join("embeddings.bin.zst")
 }
 
-fn load_ignore_patterns(repo_root: &Path) -> Vec<glob::Pattern> {
+fn load_ignore_patterns(repo_root: &Utf8Path) -> Vec<glob::Pattern> {
     let mut raw: Vec<String> = DEFAULT_IGNORE_PATTERNS.iter().map(|s| s.to_string()).collect();
     let ignore_file = repo_root.join(".code-review-graphignore");
     if let Ok(content) = fs::read_to_string(ignore_file) {
@@ -153,7 +163,7 @@ fn should_ignore(path: &str, patterns: &[glob::Pattern]) -> bool {
     patterns.iter().any(|p| p.matches(path))
 }
 
-fn is_binary(path: &Path) -> bool {
+fn is_binary(path: &std::path::Path) -> bool {
     let Ok(mut f) = fs::File::open(path) else { return true };
     let mut buf = [0u8; 8192];
     match f.read(&mut buf) {
@@ -182,7 +192,7 @@ fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
-fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
+fn run_git(repo_root: &Utf8Path, args: &[&str]) -> Option<String> {
     let timeout = git_timeout();
     let repo_root = repo_root.to_path_buf();
     // Clone args into owned Strings so the slice can be moved into the spawned thread.
@@ -191,7 +201,7 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
     std::thread::spawn(move || {
         let result = Command::new("git")
             .args(&args)
-            .current_dir(&repo_root)
+            .current_dir(repo_root.as_std_path())
             .output();
         let _ = tx.send(result);
     });
@@ -209,7 +219,7 @@ fn run_git(repo_root: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// Get list of changed files via `git diff`.
-pub fn get_changed_files(repo_root: &Path, base: &str) -> Vec<String> {
+pub fn get_changed_files(repo_root: &Utf8Path, base: &str) -> Vec<String> {
     // Try diff against base
     let out = run_git(repo_root, &["diff", "--name-only", base])
         .or_else(|| run_git(repo_root, &["diff", "--name-only", "--cached"]));
@@ -218,7 +228,7 @@ pub fn get_changed_files(repo_root: &Path, base: &str) -> Vec<String> {
 }
 
 /// Get all modified files (staged + unstaged + untracked).
-pub fn get_staged_and_unstaged(repo_root: &Path) -> Vec<String> {
+pub fn get_staged_and_unstaged(repo_root: &Utf8Path) -> Vec<String> {
     let out = match run_git(repo_root, &["status", "--porcelain"]) {
         Some(s) => s,
         None => return vec![],
@@ -240,7 +250,7 @@ pub fn get_staged_and_unstaged(repo_root: &Path) -> Vec<String> {
 }
 
 /// Get all files tracked by git.
-pub fn get_all_tracked_files(repo_root: &Path) -> Vec<String> {
+pub fn get_all_tracked_files(repo_root: &Utf8Path) -> Vec<String> {
     run_git(repo_root, &["ls-files"])
         .map(|s| parse_file_lines(&s))
         .unwrap_or_default()
@@ -255,7 +265,7 @@ fn parse_file_lines(s: &str) -> Vec<String> {
 }
 
 /// Collect all parseable files in the repo, respecting ignore patterns.
-pub fn collect_all_files(repo_root: &Path) -> Vec<String> {
+pub fn collect_all_files(repo_root: &Utf8Path) -> Vec<String> {
     let ignore_patterns = load_ignore_patterns(repo_root);
     let parser = CodeParser::new();
 
@@ -270,7 +280,7 @@ pub fn collect_all_files(repo_root: &Path) -> Vec<String> {
             .filter(|e| e.file_type().is_file())
             .filter_map(|e| {
                 e.path()
-                    .strip_prefix(repo_root)
+                    .strip_prefix(repo_root.as_std_path())
                     .ok()
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
             })
@@ -283,13 +293,13 @@ pub fn collect_all_files(repo_root: &Path) -> Vec<String> {
             continue;
         }
         let full_path = repo_root.join(&rel_path);
-        if !full_path.is_file() || full_path.is_symlink() {
+        if !full_path.exists() || !full_path.is_file() || full_path.is_symlink() {
             continue;
         }
-        if parser.detect_language(&full_path).is_none() {
+        if parser.detect_language(full_path.as_std_path()).is_none() {
             continue;
         }
-        if is_binary(&full_path) {
+        if is_binary(full_path.as_std_path()) {
             continue;
         }
         files.push(rel_path);
@@ -361,14 +371,14 @@ type ParseResult = std::result::Result<
 /// This is the parallel-safe half: `CodeParser` is a unit struct that creates a
 /// fresh `tree_sitter::Parser` per call, so it is safe to invoke from multiple
 /// rayon threads simultaneously.
-fn parse_file_parallel(parser: &CodeParser, repo_root: &Path, rel_path: &str) -> ParseResult {
+fn parse_file_parallel(parser: &CodeParser, repo_root: &Utf8Path, rel_path: &str) -> ParseResult {
     let full_path = repo_root.join(rel_path);
-    let source = std::fs::read(&full_path).map_err(|e| BuildError {
+    let source = std::fs::read(full_path.as_std_path()).map_err(|e| BuildError {
         file: rel_path.to_owned(),
         error: e.to_string(),
     })?;
     let fhash = sha256_bytes(&source);
-    let (nodes, edges) = parser.parse_bytes(&full_path, &source).map_err(|e| {
+    let (nodes, edges) = parser.parse_bytes(full_path.as_std_path(), &source).map_err(|e| {
         warn!("Error parsing {}: {}", rel_path, e);
         BuildError {
             file: rel_path.to_owned(),
@@ -379,7 +389,7 @@ fn parse_file_parallel(parser: &CodeParser, repo_root: &Path, rel_path: &str) ->
 }
 
 /// Full rebuild of the entire graph.
-pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResult> {
+pub fn full_build(repo_root: &Utf8Path, store: &mut GraphStore) -> Result<BuildResult> {
     let parser = CodeParser::new();
     let files = collect_all_files(repo_root);
     let file_count = files.len();
@@ -388,7 +398,7 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
     let existing_files = store.get_all_files()?;
     let current_abs: HashSet<String> = files
         .iter()
-        .map(|f| repo_root.join(f).to_string_lossy().into_owned())
+        .map(|f| repo_root.join(f).as_str().to_owned())
         .collect();
     for stale in existing_files {
         if !current_abs.contains(&stale) {
@@ -440,7 +450,7 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
             Ok((rel_path, nodes, edges, fhash)) => {
                 let full_path = repo_root.join(&rel_path);
                 match store.store_file_nodes_only(
-                    &full_path.to_string_lossy(),
+                    full_path.as_str(),
                     &nodes,
                     &fhash,
                 ) {
@@ -480,7 +490,7 @@ pub fn full_build(repo_root: &Path, store: &mut GraphStore) -> Result<BuildResul
 
 /// Incremental update: re-parse changed + dependent files only.
 pub fn incremental_update(
-    repo_root: &Path,
+    repo_root: &Utf8Path,
     store: &mut GraphStore,
     base: &str,
     changed_files: Option<Vec<String>>,
@@ -505,12 +515,12 @@ pub fn incremental_update(
     // Find dependent files
     let mut dependent_files: HashSet<String> = HashSet::new();
     for rel_path in &changed_files {
-        let full_path = repo_root.join(rel_path).to_string_lossy().into_owned();
+        let full_path = repo_root.join(rel_path).as_str().to_owned();
         let deps = find_dependents(store, &full_path)?;
         for d in deps {
-            let rel = Path::new(&d)
+            let rel = Utf8Path::new(&d)
                 .strip_prefix(repo_root)
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| p.as_str().to_owned())
                 .unwrap_or(d);
             dependent_files.insert(rel);
         }
@@ -541,16 +551,16 @@ pub fn incremental_update(
         }
         let abs_path = repo_root.join(rel_path);
         if !abs_path.is_file() {
-            let _ = store.remove_file_data(&abs_path.to_string_lossy());
+            let _ = store.remove_file_data(abs_path.as_str());
             continue;
         }
-        if parser.detect_language(&abs_path).is_none() {
+        if parser.detect_language(abs_path.as_std_path()).is_none() {
             continue;
         }
 
-        let abs_path_str = abs_path.to_string_lossy().into_owned();
+        let abs_path_str = abs_path.as_str().to_owned();
 
-        let source = match fs::read(&abs_path) {
+        let source = match fs::read(abs_path.as_std_path()) {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
@@ -562,7 +572,7 @@ pub fn incremental_update(
 
         let old_hashes = store.get_body_hashes(&abs_path_str);
 
-        match parser.parse_bytes(&abs_path, &source) {
+        match parser.parse_bytes(abs_path.as_std_path(), &source) {
             Ok((nodes, edges)) => {
                 parsed_files.push(ParsedFile {
                     abs_path_str,
@@ -628,10 +638,10 @@ pub fn incremental_update(
 }
 
 /// Watch for file changes and auto-update the graph.
-pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
+pub fn watch(repo_root: &Utf8Path, store: &mut GraphStore) -> Result<()> {
     let parser = CodeParser::new();
     let ignore_patterns = load_ignore_patterns(repo_root);
-    let repo_root = repo_root.to_path_buf();
+    let repo_root_std = repo_root.as_std_path().to_path_buf();
 
     // Wrap store in Arc<Mutex<>> so it can be shared with the event handler.
     // Since GraphStore doesn't implement Send, we use a Mutex on the main thread
@@ -643,10 +653,10 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
 
     debouncer
         .watcher()
-        .watch(&repo_root, RecursiveMode::Recursive)
+        .watch(&repo_root_std, RecursiveMode::Recursive)
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
 
-    info!("Watching {} for changes... (Ctrl+C to stop)", repo_root.display());
+    info!("Watching {} for changes... (Ctrl+C to stop)", repo_root);
 
     let mut batch_count: u32 = 0;
     const COMPACT_INTERVAL: u32 = 50;
@@ -660,15 +670,16 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
             }
         };
 
-        let mut paths_to_update: HashSet<PathBuf> = HashSet::new();
-        let mut paths_to_remove: HashSet<PathBuf> = HashSet::new();
+        // notify returns std::path::PathBuf; keep them as-is until boundaries.
+        let mut paths_to_update: HashSet<std::path::PathBuf> = HashSet::new();
+        let mut paths_to_remove: HashSet<std::path::PathBuf> = HashSet::new();
 
         for event in events {
             let path = event.path;
             if path.is_symlink() {
                 continue;
             }
-            let rel = match path.strip_prefix(&repo_root) {
+            let rel = match path.strip_prefix(&repo_root_std) {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
@@ -690,7 +701,7 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
             if let Err(e) = store.remove_file_data(&abs_str) {
                 error!("Error removing {}: {}", abs_str, e);
             } else {
-                let rel = path.strip_prefix(&repo_root)
+                let rel = path.strip_prefix(&repo_root_std)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| abs_str.clone());
                 info!("Removed: {}", rel);
@@ -723,7 +734,7 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
                                     &now_iso(),
                                 );
                                 let _ = store.commit();
-                                let rel = path.strip_prefix(&repo_root)
+                                let rel = path.strip_prefix(&repo_root_std)
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|_| abs_str.clone());
                                 info!("Updated: {} ({} nodes, {} edges)", rel, n, e);
@@ -756,7 +767,7 @@ pub fn watch(repo_root: &Path, store: &mut GraphStore) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Public wrapper around the private `load_ignore_patterns`.
-pub fn load_ignore_patterns_pub(repo_root: &Path) -> Vec<glob::Pattern> {
+pub fn load_ignore_patterns_pub(repo_root: &Utf8Path) -> Vec<glob::Pattern> {
     load_ignore_patterns(repo_root)
 }
 
@@ -766,7 +777,7 @@ pub fn should_ignore_pub(path: &str, patterns: &[glob::Pattern]) -> bool {
 }
 
 /// Public wrapper around the private `is_binary`.
-pub fn is_binary_pub(path: &Path) -> bool {
+pub fn is_binary_pub(path: &std::path::Path) -> bool {
     is_binary(path)
 }
 
@@ -785,6 +796,12 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Convert a `&std::path::Path` to `&Utf8Path`, panicking on non-UTF-8 paths.
+    /// Used in tests where `TempDir::path()` returns `&std::path::Path`.
+    fn p(path: &std::path::Path) -> &Utf8Path {
+        Utf8Path::from_path(path).expect("test path is not valid UTF-8")
+    }
+
     // -----------------------------------------------------------------------
     // find_repo_root
     // -----------------------------------------------------------------------
@@ -796,9 +813,12 @@ mod tests {
         let subdir = dir.path().join("src");
         fs::create_dir(&subdir).unwrap();
 
-        let root = find_repo_root(Some(&subdir));
+        let root = find_repo_root(Some(Utf8Path::from_path(&subdir).unwrap()));
         assert!(root.is_some(), "should find repo root");
-        assert_eq!(root.unwrap().canonicalize().unwrap(), dir.path().canonicalize().unwrap());
+        assert_eq!(
+            root.unwrap().as_std_path().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -813,7 +833,7 @@ mod tests {
         // We can't guarantee the system tmp dir is not inside a git repo, so
         // we just verify the function doesn't panic and returns Some or None.
         // The important thing is it terminates.
-        let _ = find_repo_root(Some(&leaf));
+        let _ = find_repo_root(Utf8Path::from_path(&leaf).map(Some).unwrap_or(None));
     }
 
     // -----------------------------------------------------------------------
@@ -823,17 +843,17 @@ mod tests {
     #[test]
     fn get_db_path_creates_crg_directory() {
         let dir = TempDir::new().unwrap();
-        let path = get_db_path(dir.path());
+        let path = get_db_path(p(dir.path()));
 
         let crg_dir = dir.path().join(".code-review-graph");
         assert!(crg_dir.is_dir(), ".code-review-graph dir should be created");
-        assert_eq!(path, crg_dir.join("graph.bin.zst"));
+        assert_eq!(path.as_std_path(), crg_dir.join("graph.bin.zst"));
     }
 
     #[test]
     fn get_db_path_creates_gitignore() {
         let dir = TempDir::new().unwrap();
-        get_db_path(dir.path());
+        get_db_path(p(dir.path()));
 
         let gitignore = dir.path().join(".code-review-graph").join(".gitignore");
         assert!(gitignore.exists(), ".gitignore should be created inside .code-review-graph");
@@ -867,7 +887,7 @@ mod tests {
 
     #[test]
     fn should_ignore_matches_node_modules() {
-        let patterns = load_ignore_patterns_pub(Path::new("."));
+        let patterns = load_ignore_patterns_pub(Utf8Path::new("."));
         assert!(
             should_ignore_pub("node_modules/react/index.js", &patterns),
             "node_modules should be ignored"
@@ -876,7 +896,7 @@ mod tests {
 
     #[test]
     fn should_ignore_matches_git_dir() {
-        let patterns = load_ignore_patterns_pub(Path::new("."));
+        let patterns = load_ignore_patterns_pub(Utf8Path::new("."));
         assert!(
             should_ignore_pub(".git/config", &patterns),
             ".git should be ignored"
@@ -885,7 +905,7 @@ mod tests {
 
     #[test]
     fn should_ignore_does_not_ignore_src_files() {
-        let patterns = load_ignore_patterns_pub(Path::new("."));
+        let patterns = load_ignore_patterns_pub(Utf8Path::new("."));
         assert!(
             !should_ignore_pub("src/main.py", &patterns),
             "src/main.py should not be ignored"
@@ -940,7 +960,7 @@ mod tests {
         // Create a legitimate Python file
         fs::write(dir.path().join("main.py"), b"def foo(): pass\n").unwrap();
 
-        let files = collect_all_files(dir.path());
+        let files = collect_all_files(p(dir.path()));
         // node_modules should be excluded
         assert!(
             !files.iter().any(|f| f.contains("node_modules")),
@@ -976,9 +996,9 @@ mod tests {
         )
         .unwrap();
 
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
-        let result = full_build(dir.path(), &mut store).unwrap();
+        let result = full_build(p(dir.path()), &mut store).unwrap();
 
         assert!(result.files_parsed >= 2, "should parse at least 2 files");
         assert!(result.total_nodes > 0, "should extract nodes");
@@ -996,13 +1016,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("app.py"), b"def foo(): pass\n").unwrap();
 
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
-        full_build(dir.path(), &mut store).unwrap();
+        full_build(p(dir.path()), &mut store).unwrap();
 
         // Call incremental with the same files — no hash changes
         let result = incremental_update(
-            dir.path(),
+            p(dir.path()),
             &mut store,
             "HEAD",
             Some(vec!["app.py".to_string()]),
@@ -1022,9 +1042,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("app.py"), b"def foo(): pass\n").unwrap();
 
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
-        full_build(dir.path(), &mut store).unwrap();
+        full_build(p(dir.path()), &mut store).unwrap();
 
         // Modify the file
         fs::write(
@@ -1034,7 +1054,7 @@ mod tests {
         .unwrap();
 
         let result = incremental_update(
-            dir.path(),
+            p(dir.path()),
             &mut store,
             "HEAD",
             Some(vec!["app.py".to_string()]),
@@ -1051,10 +1071,10 @@ mod tests {
     #[test]
     fn incremental_update_empty_changed_list_returns_zero() {
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
-        let result = incremental_update(dir.path(), &mut store, "HEAD", Some(vec![])).unwrap();
+        let result = incremental_update(p(dir.path()), &mut store, "HEAD", Some(vec![])).unwrap();
         assert_eq!(result.files_updated, 0);
         assert_eq!(result.total_nodes, 0);
     }
@@ -1131,7 +1151,7 @@ mod tests {
     #[test]
     fn find_dependents_returns_caller_file() {
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
         let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
@@ -1156,7 +1176,7 @@ mod tests {
     #[test]
     fn find_dependents_returns_empty_for_no_dependents() {
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
         let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
@@ -1179,7 +1199,7 @@ mod tests {
         // A file should not appear in its own dependents list even if a
         // self-referential edge somehow exists in the graph.
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
         let abs_b = dir.path().join("b.py").to_string_lossy().into_owned();
@@ -1202,7 +1222,7 @@ mod tests {
     #[test]
     fn find_dependents_returns_multiple_callers() {
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
         let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
@@ -1246,7 +1266,7 @@ mod tests {
         // An ImportsFrom edge at the node level (source imports a symbol from b.py)
         // should also be detected.
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
         let abs_a = dir.path().join("a.py").to_string_lossy().into_owned();
@@ -1314,13 +1334,13 @@ mod tests {
             .output()
             .unwrap();
 
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
-        full_build(dir.path(), &mut store).unwrap();
+        full_build(p(dir.path()), &mut store).unwrap();
 
         // Call incremental with the same unchanged file — hash matches what was stored
         let result = incremental_update(
-            dir.path(),
+            p(dir.path()),
             &mut store,
             "HEAD",
             Some(vec!["stable.py".to_string()]),
@@ -1372,16 +1392,16 @@ mod tests {
             .output()
             .unwrap();
 
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
-        full_build(dir.path(), &mut store).unwrap();
+        full_build(p(dir.path()), &mut store).unwrap();
 
         // Modify the file on disk — new content produces a different hash
         let modified = b"def greet(): return 'world'\ndef farewell(): pass\n";
         fs::write(dir.path().join("greet.py"), modified).unwrap();
 
         let result = incremental_update(
-            dir.path(),
+            p(dir.path()),
             &mut store,
             "HEAD",
             Some(vec!["greet.py".to_string()]),
@@ -1405,7 +1425,7 @@ mod tests {
             return;
         }
         let dir = TempDir::new().unwrap();
-        let db_path = get_db_path(dir.path());
+        let db_path = get_db_path(p(dir.path()));
         let mut store = crate::graph::GraphStore::new(&db_path).unwrap();
 
         // Manually populate the graph: a.py calls func_b defined in b.py
@@ -1422,7 +1442,7 @@ mod tests {
 
         // Trigger incremental on b.py — a.py should appear in dependent_files
         let result = incremental_update(
-            dir.path(),
+            p(dir.path()),
             &mut store,
             "HEAD",
             Some(vec!["b.py".to_string()]),

@@ -4,7 +4,8 @@
 //! force-directed D3.js visualization (dark theme, zoomable, draggable).
 
 use std::collections::HashSet;
-use std::path::Path;
+
+use camino::Utf8Path;
 
 use serde_json::{json, Value};
 
@@ -75,7 +76,7 @@ pub fn export_graph_data(store: &GraphStore) -> Result<Value> {
 /// Generate a self-contained interactive HTML visualization file.
 ///
 /// Writes the HTML to `output_path` and returns on success.
-pub fn generate_html(store: &GraphStore, output_path: &Path) -> Result<()> {
+pub fn generate_html(store: &GraphStore, output_path: &Utf8Path) -> Result<()> {
     let data = export_graph_data(store)?;
 
     // Escape `</script>` inside JSON to prevent premature tag closure.

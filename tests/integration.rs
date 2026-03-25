@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use camino::Utf8Path;
 use code_review_graph::graph::GraphStore;
 use code_review_graph::incremental::{full_build, get_db_path, incremental_update};
 use code_review_graph::parser::CodeParser;
@@ -11,6 +12,10 @@ use code_review_graph::tools::{
     measure_token_reduction, query_graph, semantic_search_nodes, trace_call_chain,
 };
 use tempfile::TempDir;
+
+fn p(path: &std::path::Path) -> &Utf8Path {
+    Utf8Path::from_path(path).expect("test path is valid UTF-8")
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -86,10 +91,10 @@ export function farewell(name: string): string {
 fn full_build_produces_nodes_and_edges() {
     if !grammars_available() { return; }
     let dir = setup_test_repo();
-    let db_path = get_db_path(dir.path());
+    let db_path = get_db_path(p(dir.path()));
     let mut store = GraphStore::new(&db_path).unwrap();
 
-    let result = full_build(dir.path(), &mut store).unwrap();
+    let result = full_build(p(dir.path()), &mut store).unwrap();
 
     // We created 3 source files; at minimum all should parse
     assert!(result.files_parsed >= 3, "should parse at least 3 files, got {}", result.files_parsed);
@@ -140,9 +145,9 @@ fn query_graph_callers_and_callees() {
 fn incremental_update_picks_up_new_function() {
     if !grammars_available() { return; }
     let dir = setup_test_repo();
-    let db_path = get_db_path(dir.path());
+    let db_path = get_db_path(p(dir.path()));
     let mut store = GraphStore::new(&db_path).unwrap();
-    full_build(dir.path(), &mut store).unwrap();
+    full_build(p(dir.path()), &mut store).unwrap();
 
     // Add a new function to utils.py
     fs::write(
@@ -161,7 +166,7 @@ def multiply(a, b):
     .unwrap();
 
     let result = incremental_update(
-        dir.path(),
+        p(dir.path()),
         &mut store,
         "HEAD",
         Some(vec!["utils.py".to_string()]),
@@ -195,12 +200,12 @@ fn save_load_cycle_preserves_graph() {
     )
     .unwrap();
 
-    let db_path = get_db_path(dir.path());
+    let db_path = get_db_path(p(dir.path()));
 
     // Build and close (triggers save)
     {
         let mut store = GraphStore::new(&db_path).unwrap();
-        full_build(dir.path(), &mut store).unwrap();
+        full_build(p(dir.path()), &mut store).unwrap();
         // commit is called inside full_build, but call close() explicitly
         store.close().unwrap();
     }
@@ -278,9 +283,9 @@ fn list_graph_stats_after_build() {
 fn impact_radius_flags_callers_of_changed_function() {
     if !grammars_available() { return; }
     let dir = setup_test_repo();
-    let db_path = get_db_path(dir.path());
+    let db_path = get_db_path(p(dir.path()));
     let mut store = GraphStore::new(&db_path).unwrap();
-    full_build(dir.path(), &mut store).unwrap();
+    full_build(p(dir.path()), &mut store).unwrap();
 
     // utils.py contains add; main.py calls add via run() -> add()
     let abs_utils = dir.path().join("utils.py").to_string_lossy().into_owned();

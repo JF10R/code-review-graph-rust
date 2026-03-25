@@ -8,6 +8,7 @@ pub mod embeddings;
 pub mod error;
 pub mod graph;
 pub mod incremental;
+pub mod intern;
 pub mod parser;
 pub mod persistence;
 pub mod server;
