@@ -466,7 +466,7 @@ fn hybrid_query_returns_ok_with_method_field() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("add", 5, Some(&root_str), false, None, None, None, None).unwrap();
+    let result = hybrid_query("add", 5, Some(&root_str), false, None, None, None, None, Some("thorough")).unwrap();
     assert_eq!(result["status"], "ok");
     // No embeddings in temp test repos — should fall back to keyword_only
     assert_eq!(
@@ -483,7 +483,7 @@ fn hybrid_query_empty_query_returns_empty() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("", 10, Some(&root_str), false, None, None, None, None).unwrap();
+    let result = hybrid_query("", 10, Some(&root_str), false, None, None, None, None, Some("thorough")).unwrap();
     assert_eq!(result["status"], "ok");
     assert!(result["results"].as_array().unwrap().is_empty());
 }
@@ -495,7 +495,7 @@ fn hybrid_query_results_include_rrf_score() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("subtract", 5, Some(&root_str), false, None, None, None, None).unwrap();
+    let result = hybrid_query("subtract", 5, Some(&root_str), false, None, None, None, None, Some("thorough")).unwrap();
     assert_eq!(result["status"], "ok");
     let arr = result["results"].as_array().unwrap();
     if !arr.is_empty() {

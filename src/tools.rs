@@ -60,6 +60,12 @@ impl AblationConfig {
         Self { fanout: false, exact_channels: true, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
     }
 
+    /// Bounded fast mode — file-mode, no expansion, no heavy fanout.
+    /// Cheap exact channels + semantic still active.
+    pub fn fast() -> Self {
+        Self { fanout: false, exact_channels: true, expansion: false, priors: true, scorer: true, decomposition: true, semantic: true }
+    }
+
     /// All components enabled, including fanout. Use for tests that exercise
     /// specific channels, or for future recalibration experiments.
     pub fn all_enabled() -> Self {
@@ -1929,6 +1935,7 @@ pub fn hybrid_query(
     route: Option<&str>,
     debug: Option<bool>,
     result_mode: Option<&str>,
+    budget: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1944,7 +1951,7 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode, None)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode, None, budget)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
@@ -1964,6 +1971,7 @@ pub fn hybrid_query_with_store(
     debug: Option<bool>,
     result_mode: Option<&str>,
     ablation: Option<&AblationConfig>,
+    budget: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1974,22 +1982,45 @@ pub fn hybrid_query_with_store(
         }));
     }
 
+    // Budget: "fast" (default) or "thorough".
+    let budget_str = budget.unwrap_or("fast");
+    let is_fast = budget_str != "thorough";
+
+    // In fast mode: force file-mode, cap limit, use restricted ablation.
+    let effective_limit = if is_fast { limit.min(3) } else { limit };
+    let effective_mode = if is_fast { "file" } else { result_mode.unwrap_or("node") };
+
+    // Build repo profile (always included in response).
+    let repo_profile = match store.get_stats() {
+        Ok(stats) => json!({
+            "file_count": stats.files_count,
+            "node_count": stats.total_nodes,
+            "languages": stats.languages,
+        }),
+        Err(_) => json!({}),
+    };
+
     // Validate result_mode early so we can return a clear error before doing any work.
-    let result_mode_str = result_mode.unwrap_or("node");
-    if result_mode_str != "node" && result_mode_str != "file" {
+    if effective_mode != "node" && effective_mode != "file" {
         return Ok(json!({
             "status": "error",
-            "message": format!("Unknown result_mode '{}'; expected 'node' or 'file'", result_mode_str),
+            "message": format!("Unknown result_mode '{}'; expected 'node' or 'file'", effective_mode),
         }));
     }
 
     // --- File mode: fanout+rerank early return ---
-    if result_mode_str == "file" {
-        let abl = ablation.cloned().unwrap_or_else(AblationConfig::full);
+    if effective_mode == "file" {
+        let abl = if let Some(a) = ablation {
+            a.clone()
+        } else if is_fast {
+            AblationConfig::fast()
+        } else {
+            AblationConfig::full()
+        };
         let parts = if abl.decomposition { decompose_query(query) } else { decompose_query_passthrough(query) };
-        let mut candidates = fanout_retrieve(store, emb_store, root, &parts, limit, keyword_hits, &abl)?;
+        let mut candidates = fanout_retrieve(store, emb_store, root, &parts, effective_limit, keyword_hits, &abl)?;
         if abl.expansion {
-            expand_candidates(store, &mut candidates, limit)?;
+            expand_candidates(store, &mut candidates, effective_limit)?;
         }
         let total_candidates = candidates.len();
         let files_scored = {
@@ -1999,10 +2030,20 @@ pub fn hybrid_query_with_store(
             }
             files.len()
         };
-        let file_results = aggregate_to_files(candidates, &parts, limit, &abl);
-        return Ok(file_results_to_json(
+        let file_results = aggregate_to_files(candidates, &parts, effective_limit, &abl);
+        let results_capped = is_fast && limit > effective_limit;
+        let mut response = file_results_to_json(
             file_results, query, &parts, debug, route, fusion, total_candidates, files_scored,
-        ));
+        );
+        // Inject budget metadata and repo profile.
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("repo_profile".to_string(), repo_profile);
+            obj.insert("budget".to_string(), json!(budget_str));
+            if results_capped {
+                obj.insert("results_capped".to_string(), json!(true));
+            }
+        }
+        return Ok(response);
     }
     // --- End file mode ---
 
@@ -2211,6 +2252,8 @@ pub fn hybrid_query_with_store(
         "query": query,
         "method": method,
         "results": results,
+        "repo_profile": repo_profile,
+        "budget": budget_str,
     });
 
     if debug.unwrap_or(false) {
@@ -3007,7 +3050,7 @@ mod tests {
         fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("", 10, Some(&path), false, None, None, None, None);
+        let result = hybrid_query("", 10, Some(&path), false, None, None, None, None, Some("thorough"));
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3025,7 +3068,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("add", 5, Some(&path), false, None, None, None, None);
+        let result = hybrid_query("add", 5, Some(&path), false, None, None, None, None, Some("thorough"));
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3046,7 +3089,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("square", 5, Some(&path), false, None, None, None, None);
+        let result = hybrid_query("square", 5, Some(&path), false, None, None, None, None, Some("thorough"));
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3072,7 +3115,7 @@ mod tests {
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         // Explicit "rrf" fusion — no embeddings, so falls back to keyword_only
-        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None, None);
+        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None, None, Some("thorough"));
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3095,7 +3138,7 @@ mod tests {
 
         // CC mode without embeddings: embeddings_available = false, so falls into RRF branch
         // which returns "keyword_only" (since no embeddings are present)
-        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None, None);
+        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None, None, Some("thorough"));
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3116,7 +3159,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None, None);
+        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None, None, Some("thorough"));
         assert!(result.is_ok(), "cc fusion hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3713,6 +3756,7 @@ mod tests {
             None,
             None,
             Some("file"),
+            Some("thorough"),
         );
         assert!(result.is_ok(), "file mode should succeed: {:?}", result);
         let val = result.unwrap();
@@ -3741,7 +3785,7 @@ mod tests {
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         // result_mode omitted → node mode, existing behaviour must be preserved.
-        let result = hybrid_query("add", 5, Some(&path), true, None, None, None, None);
+        let result = hybrid_query("add", 5, Some(&path), true, None, None, None, None, Some("thorough"));
         assert!(result.is_ok(), "node mode should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3775,6 +3819,7 @@ mod tests {
             None,
             Some(true), // debug = true
             Some("file"),
+            Some("thorough"),
         );
         assert!(result.is_ok(), "debug file mode should succeed: {:?}", result);
         let val = result.unwrap();

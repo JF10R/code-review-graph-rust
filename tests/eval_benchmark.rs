@@ -108,6 +108,7 @@ fn run_eval(result_mode: Option<&str>) {
             None,
             None,
             result_mode,
+            Some("thorough"),
         );
 
         match result {
@@ -279,6 +280,7 @@ fn run_eval_ablation(ablation: &AblationConfig) -> AblationResult {
             None,            // debug
             Some("file"),    // result_mode
             Some(ablation),  // ablation config
+            Some("thorough"), // budget
         );
 
         match result {
@@ -478,7 +480,7 @@ fn eval_regression_vscode_003() {
     }
     let result = code_review_graph::tools::hybrid_query(
         "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key",
-        10, Some(repo), true, None, None, None, Some("file"),
+        10, Some(repo), true, None, None, None, Some("file"), Some("thorough"),
     ).expect("hybrid_query should succeed");
 
     let results = result["results"].as_array().expect("results array");
@@ -500,7 +502,7 @@ fn eval_regression_kubernetes_004() {
     }
     let result = code_review_graph::tools::hybrid_query(
         "kubelet volume manager deadlocks when reconciler detaches a volume while attach/detach controller holds the global volume lock",
-        10, Some(repo), true, None, None, None, Some("file"),
+        10, Some(repo), true, None, None, None, Some("file"), Some("thorough"),
     ).expect("hybrid_query should succeed");
 
     let results = result["results"].as_array().expect("results array");

@@ -205,6 +205,9 @@ struct HybridQueryParams {
     #[schemars(description = "Experimental: 'node' (default) or 'file' (aggregate results by file with supporting node evidence).")]
     #[serde(default)]
     result_mode: Option<String>,
+    #[schemars(description = "'fast' (default: file-mode, top 3, no expansion) or 'thorough' (full pipeline, all channels).")]
+    #[serde(default)]
+    budget: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -299,6 +302,7 @@ enum WorkerCommand {
         route: Option<String>,
         debug: Option<bool>,
         result_mode: Option<String>,
+        budget: Option<String>,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
     },
     ListStats {
@@ -469,11 +473,11 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 let _ = reply.send(result);
             }
 
-            WorkerCommand::HybridQuery { query, limit, compact, fusion, route, debug, result_mode, reply } => {
+            WorkerCommand::HybridQuery { query, limit, compact, fusion, route, debug, result_mode, budget, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
                 let kw_hits = kw_hits!(&query, limit * 2);
                 let result = crate::tools::hybrid_query_with_store(
-                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None,
+                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None, budget.as_deref(),
                 ).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
@@ -997,11 +1001,12 @@ impl CodeReviewServer {
                 route: p.route,
                 debug: p.debug,
                 result_mode: p.result_mode,
+                budget: p.budget,
                 reply,
             }).await
         } else {
             self.spawn_blocking_fallback(move || {
-                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact, p.fusion.as_deref(), p.route.as_deref(), p.debug, p.result_mode.as_deref())
+                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact, p.fusion.as_deref(), p.route.as_deref(), p.debug, p.result_mode.as_deref(), p.budget.as_deref())
             }).await
         }
     }
