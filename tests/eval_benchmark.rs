@@ -453,9 +453,9 @@ fn eval_benchmark_ablation() {
 fn eval_ablation_leave_one_out() {
     let components = ["fanout", "expansion", "priors", "scorer", "decomposition", "semantic"];
 
-    // Full baseline first.
-    println!("Running: full (baseline)");
-    let mut results = vec![run_eval_ablation(&AblationConfig::full())];
+    // Baseline: all components enabled (not production default).
+    println!("Running: all_enabled (baseline)");
+    let mut results = vec![run_eval_ablation(&AblationConfig::all_enabled())];
 
     // Leave-one-out for each component.
     for component in &components {
@@ -466,19 +466,19 @@ fn eval_ablation_leave_one_out() {
     print_ablation_comparison(&results);
 }
 
-/// Regression: vscode-003 must stay Hit@5 with the default config (fanout OFF).
-/// This query was a MISS under the old config D (fanout ON + decomposition ON).
-///
-/// Run with:
-///   cargo test --release --ignored eval_regression_vscode_003 -- --nocapture
+/// Regression: vscode-003 must stay Hit@5 with the production default (fanout OFF).
+/// This query was a MISS under config D (fanout ON + decomposition ON).
+/// Skips gracefully if bench repo is not on disk.
 #[test]
-#[ignore]
 fn eval_regression_vscode_003() {
+    let repo = "D:\\GitHub\\bench-repos\\vscode";
+    if !Path::new(repo).exists() {
+        eprintln!("SKIP: vscode bench repo not found at {repo}");
+        return;
+    }
     let result = code_review_graph::tools::hybrid_query(
         "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key",
-        10,
-        Some("D:\\GitHub\\bench-repos\\vscode"),
-        true, None, None, None, Some("file"),
+        10, Some(repo), true, None, None, None, Some("file"),
     ).expect("hybrid_query should succeed");
 
     let results = result["results"].as_array().expect("results array");
@@ -488,19 +488,19 @@ fn eval_regression_vscode_003() {
     println!("vscode-003: HIT@{}", rank.unwrap());
 }
 
-/// Regression: kubernetes-004 must stay Hit@5 with the default config (fanout OFF).
-/// This query was a MISS under the old config D (fanout ON + decomposition ON).
-///
-/// Run with:
-///   cargo test --release --ignored eval_regression_kubernetes_004 -- --nocapture
+/// Regression: kubernetes-004 must stay Hit@5 with the production default (fanout OFF).
+/// This query was a MISS under config D (fanout ON + decomposition ON).
+/// Skips gracefully if bench repo is not on disk.
 #[test]
-#[ignore]
 fn eval_regression_kubernetes_004() {
+    let repo = "D:\\GitHub\\bench-repos\\kubernetes";
+    if !Path::new(repo).exists() {
+        eprintln!("SKIP: kubernetes bench repo not found at {repo}");
+        return;
+    }
     let result = code_review_graph::tools::hybrid_query(
         "kubelet volume manager deadlocks when reconciler detaches a volume while attach/detach controller holds the global volume lock",
-        10,
-        Some("D:\\GitHub\\bench-repos\\kubernetes"),
-        true, None, None, None, Some("file"),
+        10, Some(repo), true, None, None, None, Some("file"),
     ).expect("hybrid_query should succeed");
 
     let results = result["results"].as_array().expect("results array");
@@ -520,13 +520,13 @@ fn eval_regression_kubernetes_004() {
 #[ignore]
 fn eval_ablation_interaction() {
     // A: minimal — no fanout, no decomposition (semantic + kw_relaxed + scorer + priors + expansion)
-    let a = AblationConfig { fanout: false, decomposition: false, ..AblationConfig::full() };
-    // B: + decomposition only
-    let b = AblationConfig { fanout: false, decomposition: true, ..AblationConfig::full() };
+    let a = AblationConfig { fanout: false, decomposition: false, ..AblationConfig::all_enabled() };
+    // B: + decomposition only (= current production default)
+    let b = AblationConfig { fanout: false, decomposition: true, ..AblationConfig::all_enabled() };
     // C: + fanout only
-    let c = AblationConfig { fanout: true, decomposition: false, ..AblationConfig::full() };
-    // D: full (both enabled) — current production
-    let d = AblationConfig::full();
+    let c = AblationConfig { fanout: true, decomposition: false, ..AblationConfig::all_enabled() };
+    // D: all enabled (both fanout and decomposition ON)
+    let d = AblationConfig::all_enabled();
 
     let configs: Vec<(&str, AblationConfig)> = vec![
         ("A: minimal", a),

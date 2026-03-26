@@ -64,9 +64,10 @@ impl AblationConfig {
         Self { fanout: true, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
     }
 
-    /// All components enabled except the named one.
+    /// All components enabled except the named one. Derives from
+    /// `all_enabled()`, not `full()`, so ablation baselines are correct.
     pub fn without(component: &str) -> Self {
-        let mut cfg = Self::full();
+        let mut cfg = Self::all_enabled();
         match component {
             "fanout" => cfg.fanout = false,
             "expansion" => cfg.expansion = false,
