@@ -174,6 +174,18 @@ cargo install ... --no-default-features      # Minimal binary (no embeddings)
 
 **MCP is faster in 5/8 cases, averaging 1.8x speedup.** Value comes from structural queries (`query_graph`, `trace_call_chain`) on large repos where grep is slow. Tokens are similar or slightly higher; the win is wall-clock time.
 
+### PR Review Benchmark
+
+4-case review benchmark: agent reviews a changed file for bugs, risks, and affected callers.
+
+| Metric | No-MCP | MCP | Delta |
+|--------|--------|-----|-------|
+| Time | 2.4m | **2.0m** | **1.2x faster** |
+| Tool calls | 30 | **21** | **-30%** |
+| Tokens | 54,865 | 59,269 | +8% |
+
+**MCP faster in all 4 review cases with zero losses.** `get_review_context` provides callers, callees, and blast radius in one call — the designed use case for this tool.
+
 ## Performance (v1.3.0)
 
 | Operation | Before | After |

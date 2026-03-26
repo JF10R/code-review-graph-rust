@@ -112,3 +112,35 @@ On the CSS complex issue (same query, same repo):
 | Quality | Good | Excellent |
 
 v1.3+ used **33% fewer tokens** and **42% less time** with better quality.
+
+## PR Review Benchmark
+
+4 cases testing `get_review_context` + `get_impact_radius` for code review (vs grep-based review).
+
+### Setup
+
+- **Task**: "Review this changed file for correctness, bugs, edge cases, and risks"
+- **MCP agents**: instructed to start with `get_review_context` and `get_impact_radius`, then `open_node_context`/`query_graph`
+- **No-MCP agents**: same prompt without MCP instruction
+- **Cases**: nextjs-001 (simple), nextjs-006 (medium), vscode-003 (complex), fastapi-001 (medium)
+
+### Results
+
+| Case | Repo | No-MCP Tok | No-MCP Time | MCP Tok | MCP Time | MCP Speedup |
+|------|------|------------|-------------|---------|----------|-------------|
+| nextjs-001 | next.js | 57,033 | 3.7m | 59,195 | **2.8m** | **1.3x** |
+| nextjs-006 | next.js | 43,344 | 1.9m | 47,950 | **1.8m** | **1.1x** |
+| vscode-003 | vscode | 55,710 | 1.9m | 65,547 | **1.6m** | **1.2x** |
+| fastapi-001 | fastapi | 63,372 | 2.0m | 64,382 | **1.7m** | **1.2x** |
+
+### Summary
+
+| Metric | No-MCP avg | MCP avg | Delta |
+|--------|------------|---------|-------|
+| Tokens | 54,865 | 59,269 | +8% |
+| Tool calls | 30 | 21 | **-30%** |
+| Time | 2.4m | 2.0m | **1.2x faster** |
+
+**MCP is faster in all 4 review cases** with no losses. The bounded nature of a review task (understand one file, find callers, assess risk) aligns perfectly with `get_review_context` — it provides callers, callees, and blast radius in a single call, replacing 5-10 grep/read cycles.
+
+Unlike investigation benchmarks where MCP sometimes over-explored, review benchmarks show **consistent, no-downside improvement**. This is the tool's designed use case.
