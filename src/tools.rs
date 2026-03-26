@@ -18,7 +18,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::embeddings::{embed_all_nodes, semantic_search, EmbeddingStore};
+use crate::embeddings::{embed_all_files, embed_all_nodes, semantic_search, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
@@ -1157,18 +1157,22 @@ pub fn embed_graph(repo_root: Option<&str>) -> Result<Value> {
     }
 
     let newly_embedded = embed_all_nodes(&store, &mut emb_store)?;
+    let newly_embedded_files = embed_all_files(&store, &mut emb_store)?;
     let total = emb_store.count()?;
+    let total_files = emb_store.file_count()?;
     emb_store.close()?;
     store.close()?;
 
     Ok(json!({
         "status": "ok",
         "summary": format!(
-            "Embedded {} new node(s). Total embeddings: {}. Semantic search is now active.",
-            newly_embedded, total
+            "Embedded {} new node(s), {} new file(s). Total: {} nodes, {} files. Semantic search is now active.",
+            newly_embedded, newly_embedded_files, total, total_files
         ),
         "newly_embedded": newly_embedded,
+        "newly_embedded_files": newly_embedded_files,
         "total_embeddings": total,
+        "total_file_embeddings": total_files,
     }))
 }
 

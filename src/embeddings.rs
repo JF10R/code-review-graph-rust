@@ -103,6 +103,20 @@ impl EmbeddingDataV2 {
         }
         map
     }
+
+    /// Build reverse map: name → string_idx.
+    fn build_name_to_idx(&self) -> HashMap<String, u32> {
+        self.names.iter().enumerate().map(|(i, n)| (n.clone(), i as u32)).collect()
+    }
+
+    /// Build reverse map: text_hash → vector_idx.
+    fn build_hash_to_vec(&self) -> HashMap<[u8; 8], u32> {
+        let mut map = HashMap::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            map.insert(entry.text_hash, entry.vector_idx);
+        }
+        map
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -872,10 +886,28 @@ pub struct EmbeddingStore {
     data: EmbeddingDataV2,
     /// Runtime lookup: qualified_name → (vector_idx, text_hash).
     lookup: HashMap<String, (usize, [u8; 8])>,
+    /// Reverse map: name → string_idx (O(1) insert instead of linear scan).
+    name_to_idx: HashMap<String, u32>,
+    /// Reverse map: text_hash → vector_idx (cross-run dedup).
+    hash_to_vec: HashMap<[u8; 8], u32>,
+    /// File-level embeddings (separate on-disk store).
+    file_data: EmbeddingDataV2,
+    /// Runtime lookup: file_path → (vector_idx, text_hash).
+    file_lookup: HashMap<String, (usize, [u8; 8])>,
+    /// Reverse maps for file data.
+    file_name_to_idx: HashMap<String, u32>,
+    file_hash_to_vec: HashMap<[u8; 8], u32>,
     path: Utf8PathBuf,
+    file_path: Utf8PathBuf,
     provider: Option<Box<dyn EmbeddingProvider>>,
     #[cfg(feature = "hnsw-index")]
     hnsw_cache: Option<HnswIndex>,
+}
+
+/// Derive the file-embeddings path from the node-embeddings path.
+fn file_embeddings_path(node_path: &Utf8Path) -> Utf8PathBuf {
+    let parent = node_path.parent().unwrap_or(Utf8Path::new("."));
+    parent.join("file-embeddings.bin.zst")
 }
 
 impl EmbeddingStore {
@@ -900,11 +932,32 @@ impl EmbeddingStore {
         };
 
         let lookup = data.build_lookup();
+        let name_to_idx = data.build_name_to_idx();
+        let hash_to_vec = data.build_hash_to_vec();
+
+        // Load file-level embeddings from sibling file.
+        let fp = file_embeddings_path(store_path);
+        let file_data = if fp.exists() {
+            load_embedding_data(fp.as_std_path()).unwrap_or_default()
+        } else {
+            EmbeddingDataV2::default()
+        };
+        let file_lookup = file_data.build_lookup();
+        let file_name_to_idx = file_data.build_name_to_idx();
+        let file_hash_to_vec = file_data.build_hash_to_vec();
+
         let provider = detect_provider();
         Ok(Self {
             data,
             lookup,
+            name_to_idx,
+            hash_to_vec,
+            file_data,
+            file_lookup,
+            file_name_to_idx,
+            file_hash_to_vec,
             path: store_path.to_path_buf(),
+            file_path: fp,
             provider,
             #[cfg(feature = "hnsw-index")]
             hnsw_cache: None,
@@ -919,6 +972,11 @@ impl EmbeddingStore {
     /// Count embedded nodes.
     pub fn count(&self) -> Result<usize> {
         Ok(self.lookup.len())
+    }
+
+    /// Count embedded files.
+    pub fn file_count(&self) -> Result<usize> {
+        Ok(self.file_lookup.len())
     }
 
     /// Remove a node's embedding.
@@ -961,9 +1019,13 @@ impl EmbeddingStore {
         Ok(removed)
     }
 
-    /// Persist in-memory state to disk.
+    /// Persist in-memory state to disk (nodes + files).
     pub fn save(&self) -> Result<()> {
-        save_embedding_data(&self.data, self.path.as_std_path())
+        save_embedding_data(&self.data, self.path.as_std_path())?;
+        if !self.file_data.entries.is_empty() {
+            save_embedding_data(&self.file_data, self.file_path.as_std_path())?;
+        }
+        Ok(())
     }
 
     /// Close the store (no-op — nothing to flush unless explicitly saved).
@@ -976,24 +1038,28 @@ impl EmbeddingStore {
     // -----------------------------------------------------------------------
 
     /// Insert or update a node's embedding in both the runtime lookup and the
-    /// underlying V2 data structures.
+    /// underlying V2 data structures.  Uses reverse maps for O(1) insert.
     fn insert_node(&mut self, qname: &str, vec: Vec<f32>, text_hash: [u8; 8], vector_idx: usize) {
-        // Update string table if needed.
-        let string_idx = if let Some(pos) = self.data.names.iter().position(|n| n == qname) {
-            pos as u32
-        } else {
-            let idx = self.data.names.len() as u32;
-            self.data.names.push(qname.to_string());
-            idx
+        // O(1) string table lookup via reverse map.
+        let string_idx = match self.name_to_idx.get(qname) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.data.names.len() as u32;
+                self.data.names.push(qname.to_string());
+                self.name_to_idx.insert(qname.to_string(), idx);
+                idx
+            }
         };
 
         // Update or append vector table entry.
         if vector_idx < self.data.vectors.len() {
             self.data.vectors[vector_idx] = vec;
         } else {
-            // vector_idx should equal self.data.vectors.len() for new insertions.
             self.data.vectors.push(vec);
         }
+
+        // Update hash_to_vec reverse map.
+        self.hash_to_vec.insert(text_hash, vector_idx as u32);
 
         // Update or append the entries list.
         let existing_entry = self
@@ -1055,8 +1121,108 @@ impl EmbeddingStore {
         }
 
         self.data = new_data;
-        // Rebuild lookup from fresh data.
+        // Rebuild all maps from fresh data.
         self.lookup = self.data.build_lookup();
+        self.name_to_idx = self.data.build_name_to_idx();
+        self.hash_to_vec = self.data.build_hash_to_vec();
+    }
+
+    // -----------------------------------------------------------------------
+    // File embedding helpers
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a file's embedding.  Uses reverse maps for O(1) insert.
+    fn insert_file(&mut self, file_path: &str, vec: Vec<f32>, hash: [u8; 8], vector_idx: usize) {
+        let string_idx = match self.file_name_to_idx.get(file_path) {
+            Some(&idx) => idx,
+            None => {
+                let idx = self.file_data.names.len() as u32;
+                self.file_data.names.push(file_path.to_string());
+                self.file_name_to_idx.insert(file_path.to_string(), idx);
+                idx
+            }
+        };
+
+        if vector_idx < self.file_data.vectors.len() {
+            self.file_data.vectors[vector_idx] = vec;
+        } else {
+            self.file_data.vectors.push(vec);
+        }
+
+        let existing = self.file_data.entries.iter_mut().find(|e| e.string_idx == string_idx);
+        if let Some(entry) = existing {
+            entry.vector_idx = vector_idx as u32;
+            entry.text_hash = hash;
+        } else {
+            self.file_data.entries.push(NodeEntry {
+                string_idx,
+                vector_idx: vector_idx as u32,
+                text_hash: hash,
+            });
+        }
+
+        self.file_hash_to_vec.insert(hash, vector_idx as u32);
+        self.file_lookup.insert(file_path.to_string(), (vector_idx, hash));
+    }
+
+    /// Remove file embeddings for files no longer in the graph.
+    fn gc_files(&mut self, store: &GraphStore) -> Result<usize> {
+        let live_files: HashSet<String> = store.get_all_files()?.into_iter().collect();
+        let stale: Vec<String> = self
+            .file_lookup
+            .keys()
+            .filter(|k| !live_files.contains(k.as_str()))
+            .cloned()
+            .collect();
+        let removed = stale.len();
+        if removed > 0 {
+            tracing::info!("File embedding GC: removing {} stale file vector(s)", removed);
+            for k in &stale {
+                self.file_lookup.remove(k);
+            }
+            self.rebuild_file_data_from_lookup();
+        }
+        Ok(removed)
+    }
+
+    /// Rebuild file_data from file_lookup (compact after GC).
+    fn rebuild_file_data_from_lookup(&mut self) {
+        let meta = self.file_data.meta.clone();
+        let mut new_data = EmbeddingDataV2 {
+            meta,
+            names: Vec::with_capacity(self.file_lookup.len()),
+            vectors: Vec::with_capacity(self.file_lookup.len()),
+            entries: Vec::with_capacity(self.file_lookup.len()),
+        };
+
+        let mut old_to_new: HashMap<usize, u32> = HashMap::new();
+        for (fp, (old_idx, hash)) in &self.file_lookup {
+            let new_idx = if let Some(&existing) = old_to_new.get(old_idx) {
+                existing
+            } else {
+                let idx = new_data.vectors.len() as u32;
+                if let Some(v) = self.file_data.vectors.get(*old_idx) {
+                    new_data.vectors.push(v.clone());
+                    old_to_new.insert(*old_idx, idx);
+                    idx
+                } else {
+                    continue;
+                }
+            };
+
+            let string_idx = new_data.names.len() as u32;
+            new_data.names.push(fp.clone());
+            new_data.entries.push(NodeEntry {
+                string_idx,
+                vector_idx: new_idx,
+                text_hash: *hash,
+            });
+        }
+
+        self.file_data = new_data;
+        self.file_lookup = self.file_data.build_lookup();
+        self.file_name_to_idx = self.file_data.build_name_to_idx();
+        self.file_hash_to_vec = self.file_data.build_hash_to_vec();
     }
 }
 
@@ -1145,14 +1311,37 @@ pub fn embed_all_nodes(
         return Ok(0);
     }
 
-    // GC: remove embeddings for nodes no longer in the graph.
-    emb_store.gc(store)?;
-
-    // Snapshot provider metadata strings before any mutable borrow of emb_store.
+    // Snapshot provider metadata.
     let (provider_name, provider_model, provider_dims) = {
         let p = emb_store.provider.as_ref().expect("checked above");
         (p.name().to_string(), p.model().to_string(), p.dimensions() as u32)
     };
+
+    // Hard invalidation: if provider/model/dims changed, the entire store is stale.
+    let provider_changed = !emb_store.lookup.is_empty()
+        && (emb_store.data.meta.provider != provider_name
+            || emb_store.data.meta.model != provider_model
+            || (emb_store.data.meta.dimensions != 0
+                && emb_store.data.meta.dimensions != provider_dims));
+    if provider_changed {
+        tracing::warn!(
+            "embeddings: provider changed ({}/{} → {}/{}); invalidating {} vectors",
+            emb_store.data.meta.provider,
+            emb_store.data.meta.model,
+            provider_name,
+            provider_model,
+            emb_store.lookup.len()
+        );
+        emb_store.data = EmbeddingDataV2::default();
+        emb_store.lookup.clear();
+        emb_store.name_to_idx.clear();
+        emb_store.hash_to_vec.clear();
+        #[cfg(feature = "hnsw-index")]
+        { emb_store.hnsw_cache = None; }
+    }
+
+    // GC: remove embeddings for nodes no longer in the graph.
+    emb_store.gc(store)?;
 
     // Update store-level metadata from the active provider.
     emb_store.data.meta.provider = provider_name;
@@ -1177,11 +1366,20 @@ pub fn embed_all_nodes(
             };
 
             if needs_embed {
-                hash_to_text
-                    .entry(hash)
-                    .or_insert_with(|| (text, Vec::new()))
-                    .1
-                    .push(node.qualified_name.clone());
+                // Cross-run dedup: skip embedding if we already have this text_hash.
+                if emb_store.hash_to_vec.contains_key(&hash) {
+                    // Reuse existing vector.
+                    hash_to_text.entry(hash)
+                        .or_insert_with(|| (text, Vec::new()))
+                        .1
+                        .push(node.qualified_name.clone());
+                } else {
+                    hash_to_text
+                        .entry(hash)
+                        .or_insert_with(|| (text, Vec::new()))
+                        .1
+                        .push(node.qualified_name.clone());
+                }
             }
         }
     }
@@ -1190,17 +1388,33 @@ pub fn embed_all_nodes(
         return Ok(0);
     }
 
-    // Flatten to (hash, text, qnames) preserving order.
-    let to_embed: Vec<([u8; 8], String, Vec<String>)> = hash_to_text
-        .into_iter()
-        .map(|(hash, (text, qnames))| (hash, text, qnames))
-        .collect();
+    // Partition into texts that need embedding vs those that can reuse existing vectors.
+    let mut need_embed: Vec<([u8; 8], String, Vec<String>)> = Vec::new();
+    let mut reuse: Vec<([u8; 8], Vec<String>)> = Vec::new();
+    for (hash, (text, qnames)) in hash_to_text {
+        if emb_store.hash_to_vec.contains_key(&hash) {
+            reuse.push((hash, qnames));
+        } else {
+            need_embed.push((hash, text, qnames));
+        }
+    }
 
-    // Embed all chunks first (immutable provider borrow), collect results, then mutate.
+    // Apply reused vectors (no embedding call needed).
+    let mut count = 0;
+    for (hash, qnames) in reuse {
+        let vector_idx = *emb_store.hash_to_vec.get(&hash).unwrap() as usize;
+        let vec = emb_store.data.vectors[vector_idx].clone();
+        for qn in &qnames {
+            emb_store.insert_node(qn, vec.clone(), hash, vector_idx);
+            count += 1;
+        }
+    }
+
+    // Embed new texts in batches.
     let mut all_results: Vec<([u8; 8], Vec<String>, Vec<f32>)> = Vec::new();
     {
         let provider = emb_store.provider.as_ref().expect("checked above");
-        for chunk in to_embed.chunks(100) {
+        for chunk in need_embed.chunks(100) {
             let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
             let vectors = provider.embed_batch(&texts)?;
             for ((hash, _, qnames), vec) in chunk.iter().zip(vectors) {
@@ -1209,9 +1423,7 @@ pub fn embed_all_nodes(
         }
     }
 
-    let mut count = 0;
     for (hash, qnames, vec) in all_results {
-        // Assign a new vector index for this unique text.
         let vector_idx = emb_store.data.vectors.len();
         emb_store.data.vectors.push(vec.clone());
 
@@ -1334,6 +1546,120 @@ pub fn node_to_text(node: &GraphNode) -> String {
         parts.push(&node.language);
     }
     parts.join(" ")
+}
+
+/// Convert a file and its child nodes to embeddable text.
+///
+/// Includes the file path, language, and up to 50 symbol names — gives the
+/// embedding model both location and content context.
+pub fn file_to_text(file_path: &str, nodes: &[GraphNode]) -> String {
+    let mut parts: Vec<String> = vec![file_path.to_string()];
+
+    // Add language from first node that has one.
+    if let Some(lang) = nodes.iter().find_map(|n| {
+        if !n.language.is_empty() { Some(&n.language) } else { None }
+    }) {
+        parts.push(lang.clone());
+    }
+
+    // Add child symbol names (skip File nodes, cap at 50).
+    let mut seen = HashSet::new();
+    for node in nodes {
+        if node.kind.as_str() != "File" && seen.insert(&node.name) {
+            parts.push(node.name.clone());
+            if seen.len() >= 50 {
+                break;
+            }
+        }
+    }
+
+    parts.join(" ")
+}
+
+/// Embed all graph files that don't already have up-to-date file-level embeddings.
+///
+/// Returns the number of newly embedded files.
+pub fn embed_all_files(
+    store: &GraphStore,
+    emb_store: &mut EmbeddingStore,
+) -> Result<usize> {
+    if emb_store.provider.is_none() {
+        return Ok(0);
+    }
+
+    // Snapshot provider metadata.
+    let (prov_name, prov_model, prov_dims) = {
+        let p = emb_store.provider.as_ref().expect("checked above");
+        (p.name().to_string(), p.model().to_string(), p.dimensions() as u32)
+    };
+
+    // Hard invalidation on provider change.
+    let provider_changed = !emb_store.file_lookup.is_empty()
+        && (emb_store.file_data.meta.provider != prov_name
+            || emb_store.file_data.meta.model != prov_model
+            || (emb_store.file_data.meta.dimensions != 0
+                && emb_store.file_data.meta.dimensions != prov_dims));
+    if provider_changed {
+        tracing::warn!(
+            "file embeddings: provider changed; invalidating {} file vectors",
+            emb_store.file_lookup.len()
+        );
+        emb_store.file_data = EmbeddingDataV2::default();
+        emb_store.file_lookup.clear();
+        emb_store.file_name_to_idx.clear();
+        emb_store.file_hash_to_vec.clear();
+    }
+
+    // GC stale file embeddings.
+    emb_store.gc_files(store)?;
+
+    emb_store.file_data.meta.provider = prov_name;
+    emb_store.file_data.meta.model = prov_model;
+    emb_store.file_data.meta.dimensions = prov_dims;
+    emb_store.file_data.meta.version = FORMAT_VERSION;
+
+    // Collect files needing (re)embedding.
+    let mut to_embed: Vec<([u8; 8], String, String)> = Vec::new(); // (hash, text, file_path)
+    for file in store.get_all_files()? {
+        let nodes = store.get_nodes_by_file(&file)?;
+        let text = file_to_text(&file, &nodes);
+        let hash = text_hash(&text);
+
+        let needs_embed = match emb_store.file_lookup.get(&file) {
+            Some((_, existing_hash)) => *existing_hash != hash,
+            None => true,
+        };
+        if needs_embed {
+            to_embed.push((hash, text, file));
+        }
+    }
+
+    if to_embed.is_empty() {
+        return Ok(0);
+    }
+
+    // Embed in batches (immutable provider borrow), then mutate.
+    let mut all_results: Vec<([u8; 8], String, Vec<f32>)> = Vec::new();
+    {
+        let provider = emb_store.provider.as_ref().expect("checked above");
+        for chunk in to_embed.chunks(100) {
+            let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
+            let vectors = provider.embed_batch(&texts)?;
+            for ((hash, _, fp), vec) in chunk.iter().zip(vectors) {
+                all_results.push((*hash, fp.clone(), vec));
+            }
+        }
+    }
+
+    let mut count = 0;
+    for (hash, fp, vec) in all_results {
+        let vector_idx = emb_store.file_data.vectors.len();
+        emb_store.insert_file(&fp, vec, hash, vector_idx);
+        count += 1;
+    }
+
+    emb_store.save()?;
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,5 +1938,113 @@ mod tests {
         let (idx2, _) = reloaded.lookup.get("mod::old").unwrap();
         // 0.5 and -0.5 are exact in f16.
         assert_eq!(&reloaded.data.vectors[*idx2], &[0.5f32, -0.5]);
+    }
+
+    #[test]
+    fn file_to_text_includes_path_and_symbols() {
+        let nodes = vec![
+            GraphNode {
+                name: "parse".to_string(),
+                qualified_name: "mod::parse".to_string(),
+                kind: NodeKind::Function,
+                file_path: "src/parser.rs".to_string(),
+                line_start: 1, line_end: 10,
+                language: "rust".to_string(),
+                is_test: false,
+                docstring: String::new(),
+                signature: String::new(),
+                body_hash: String::new(),
+                file_hash: String::new(),
+            },
+            GraphNode {
+                name: "Config".to_string(),
+                qualified_name: "mod::Config".to_string(),
+                kind: NodeKind::Class,
+                file_path: "src/parser.rs".to_string(),
+                line_start: 12, line_end: 30,
+                language: "rust".to_string(),
+                is_test: false,
+                docstring: String::new(),
+                signature: String::new(),
+                body_hash: String::new(),
+                file_hash: String::new(),
+            },
+        ];
+        let text = super::file_to_text("src/parser.rs", &nodes);
+        assert!(text.contains("src/parser.rs"));
+        assert!(text.contains("rust"));
+        assert!(text.contains("parse"));
+        assert!(text.contains("Config"));
+    }
+
+    #[test]
+    fn file_embeddings_save_reload_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.embeddings.bin.zst");
+        let mut store = EmbeddingStore::new(p(&path)).unwrap();
+
+        // Insert a file embedding directly.
+        let hash = [10u8; 8];
+        let vector_idx = store.file_data.vectors.len();
+        store.insert_file("src/main.rs", vec![0.5, -0.5, 1.0], hash, vector_idx);
+        store.save().unwrap();
+
+        // Reload and verify file embeddings persisted.
+        let reloaded = EmbeddingStore::new(p(&path)).unwrap();
+        assert_eq!(reloaded.file_count().unwrap(), 1);
+        let (idx, h) = reloaded.file_lookup.get("src/main.rs").unwrap();
+        assert_eq!(*h, hash);
+        // 0.5, -0.5, 1.0 are exact in f16.
+        assert_eq!(&reloaded.file_data.vectors[*idx], &[0.5f32, -0.5, 1.0]);
+    }
+
+    #[test]
+    fn file_to_text_skips_file_nodes_and_deduplicates() {
+        let file_node = GraphNode {
+            name: "src/lib.rs".to_string(),
+            qualified_name: "src/lib.rs".to_string(),
+            kind: NodeKind::File,
+            file_path: "src/lib.rs".to_string(),
+            line_start: 1, line_end: 100,
+            language: "rust".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: String::new(),
+            file_hash: String::new(),
+        };
+        let fn_node = GraphNode {
+            name: "foo".to_string(),
+            qualified_name: "mod::foo".to_string(),
+            kind: NodeKind::Function,
+            file_path: "src/lib.rs".to_string(),
+            line_start: 5, line_end: 10,
+            language: "rust".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: String::new(),
+            file_hash: String::new(),
+        };
+        // Duplicate name — should only appear once.
+        let fn_node2 = GraphNode {
+            name: "foo".to_string(),
+            qualified_name: "mod::foo2".to_string(),
+            kind: NodeKind::Function,
+            file_path: "src/lib.rs".to_string(),
+            line_start: 15, line_end: 20,
+            language: "rust".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: String::new(),
+            body_hash: String::new(),
+            file_hash: String::new(),
+        };
+        let text = super::file_to_text("src/lib.rs", &[file_node, fn_node, fn_node2]);
+        // File node name ("src/lib.rs") should NOT appear as a symbol
+        // (the path is already the first element).
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        // "src/lib.rs" "rust" "foo" — no duplicate "foo"
+        assert_eq!(parts.iter().filter(|&&p| p == "foo").count(), 1);
     }
 }
