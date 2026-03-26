@@ -1066,13 +1066,16 @@ impl ServerHandler for CodeReviewServer {
         )
         .with_instructions(
             "Persistent incremental knowledge graph for token-efficient code reviews.\n\n\
+             WHEN TO USE GRAPH TOOLS vs GREP:\n\
+             - Grep/Read: exact filename, symbol name, or string literal lookups\n\
+             - Graph tools: structural queries (who calls X?), semantic/conceptual search, cross-file tracing\n\n\
              RECOMMENDED WORKFLOW:\n\
-             1. semantic_search_nodes — find code by concept (use INSTEAD OF grep for discovery)\n\
-             2. trace_call_chain(from, to) — when you know two function names, trace the call path between them (use INSTEAD OF reading files one-by-one)\n\
-             3. query_graph(callers_of/callees_of) — explore who calls what (use INSTEAD OF grepping for function names)\n\
-             4. Use Read tool (not bash cat) and Grep tool (not bash grep) for examining file contents\n\n\
-             Always pass compact: true to reduce response size. \
-             Use these tools for discovery, then switch to Read/Grep for detailed analysis.",
+             1. hybrid_query — best first call for broad discovery (combines keyword + semantic + structural channels)\n\
+             2. open_node_context — after finding a function, get its source + callers + callees in one call (replaces search → query_graph → Read)\n\
+             3. trace_call_chain(from, to) — trace how function A reaches function B\n\
+             4. query_graph(callers_of/callees_of) — explore call relationships\n\
+             5. Switch to Read/Grep for detailed code analysis after discovery\n\n\
+             Always pass compact: true. Limit to 3-5 MCP calls for discovery, then Read/Grep for details.",
         )
     }
 }
