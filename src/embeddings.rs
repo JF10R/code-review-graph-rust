@@ -32,30 +32,195 @@ use crate::persistence;
 use crate::types::{GraphNode, node_to_dict};
 
 // ---------------------------------------------------------------------------
-// Serialisable data
+// Format version
 // ---------------------------------------------------------------------------
 
-/// All embedding state that gets serialised to disk.
+const FORMAT_VERSION: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// V2 serialisable data
+// ---------------------------------------------------------------------------
+
+/// Store-level metadata written once per file.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct StoreMetadata {
+    /// Format version (currently 2).
+    version: u32,
+    /// Embedding provider name (e.g. `"fastembed-jina-v2-code"`).
+    provider: String,
+    /// Model name (e.g. `"JinaEmbeddingsV2BaseCode"`).
+    model: String,
+    /// Vector dimensionality.
+    dimensions: u32,
+}
+
+impl Default for StoreMetadata {
+    fn default() -> Self {
+        Self {
+            version: FORMAT_VERSION,
+            provider: String::new(),
+            model: String::new(),
+            dimensions: 0,
+        }
+    }
+}
+
+/// Per-node entry: (string_table_index, vector_index, text_hash).
+///
+/// `string_idx` is an index into `EmbeddingDataV2::names`.
+/// `vector_idx` is an index into `EmbeddingDataV2::vectors`.
+/// `text_hash` is the first 8 raw bytes of SHA-256 of the node text.
+#[derive(Serialize, Deserialize, Clone)]
+struct NodeEntry {
+    string_idx: u32,
+    vector_idx: u32,
+    text_hash: [u8; 8],
+}
+
+/// V2 on-disk format: metadata header + string table + deduplicated vectors + entries.
 #[derive(Serialize, Deserialize, Default)]
-struct EmbeddingData {
-    /// qualified_name → (vector, text_hash, provider)
+struct EmbeddingDataV2 {
+    meta: StoreMetadata,
+    /// Deduplicated qualified names (string table).
+    names: Vec<String>,
+    /// Deduplicated embedding vectors.
+    vectors: Vec<Vec<f32>>,
+    /// Per-node entries referencing the string table and vector table.
+    entries: Vec<NodeEntry>,
+}
+
+impl EmbeddingDataV2 {
+    /// Build the runtime lookup: qualified_name → (vector_idx, text_hash).
+    fn build_lookup(&self) -> HashMap<String, (usize, [u8; 8])> {
+        let mut map = HashMap::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            if let Some(name) = self.names.get(entry.string_idx as usize) {
+                map.insert(
+                    name.clone(),
+                    (entry.vector_idx as usize, entry.text_hash),
+                );
+            }
+        }
+        map
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V1 serialisable data (for migration only)
+// ---------------------------------------------------------------------------
+
+/// V1 on-disk format: qualified_name → (vector, hex_hash, provider).
+#[derive(Serialize, Deserialize, Default)]
+struct EmbeddingDataV1 {
     vectors: HashMap<String, (Vec<f32>, String, String)>,
 }
 
 // ---------------------------------------------------------------------------
-// Persistence helpers (delegates to crate::persistence)
+// Persistence helpers
 // ---------------------------------------------------------------------------
 
-fn save_embedding_data(data: &EmbeddingData, path: &std::path::Path) -> Result<()> {
+fn save_embedding_data(data: &EmbeddingDataV2, path: &std::path::Path) -> Result<()> {
     persistence::save_blob(data, path, "embeddings")
 }
 
-fn load_embedding_data(path: &std::path::Path) -> Result<EmbeddingData> {
-    persistence::load_blob(path, "embeddings")
+fn load_embedding_data(path: &std::path::Path) -> Result<EmbeddingDataV2> {
+    // Try V2 first.
+    match persistence::load_blob::<EmbeddingDataV2>(path, "embeddings") {
+        Ok(d) if d.meta.version == FORMAT_VERSION => return Ok(d),
+        Ok(d) => {
+            tracing::warn!(
+                "embeddings: unrecognised format version {} in {:?}; starting empty",
+                d.meta.version,
+                path
+            );
+            return Ok(EmbeddingDataV2::default());
+        }
+        Err(_) => {}
+    }
+
+    // Try V1 migration.
+    match persistence::load_blob::<EmbeddingDataV1>(path, "embeddings") {
+        Ok(v1) => {
+            tracing::info!(
+                "embeddings: migrating v1 store ({} entries) to v2 format",
+                v1.vectors.len()
+            );
+            Ok(migrate_v1_to_v2(v1))
+        }
+        Err(e) => Err(e),
+    }
 }
 
-fn text_hash(text: &str) -> String {
-    sha256_bytes_pub(text.as_bytes())[..16].to_string()
+/// Convert a V1 store to V2 in-memory.
+fn migrate_v1_to_v2(v1: EmbeddingDataV1) -> EmbeddingDataV2 {
+    let mut data = EmbeddingDataV2::default();
+
+    // Detect provider from any entry (all share the same provider in V1).
+    if let Some((_, _, provider)) = v1.vectors.values().next() {
+        data.meta.provider = provider.clone();
+    }
+
+    // Build vector dedup table: vector content → vector_idx.
+    // V1 has no dedup, so we deduplicate by identity (exact f32 match).
+    // For migration we skip the expensive content dedup and just assign one entry per node.
+    let mut name_idx: HashMap<String, u32> = HashMap::new();
+
+    for (qn, (vec, hex_hash, _provider)) in v1.vectors {
+        // Convert hex_hash string to [u8; 8] best-effort.
+        let text_hash = hex_hash_to_bytes8(&hex_hash);
+
+        let string_idx = {
+            let next = data.names.len() as u32;
+            *name_idx.entry(qn.clone()).or_insert_with(|| {
+                data.names.push(qn);
+                next
+            })
+        };
+
+        let dims = vec.len() as u32;
+        if data.meta.dimensions == 0 {
+            data.meta.dimensions = dims;
+        }
+
+        let vector_idx = data.vectors.len() as u32;
+        data.vectors.push(vec);
+
+        data.entries.push(NodeEntry {
+            string_idx,
+            vector_idx,
+            text_hash,
+        });
+    }
+
+    data.meta.version = FORMAT_VERSION;
+    data
+}
+
+/// Parse the first 8 bytes from a lowercase hex string (best-effort).
+fn hex_hash_to_bytes8(hex: &str) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    let hex = hex.as_bytes();
+    for i in 0..8 {
+        let hi = hex.get(i * 2).copied().unwrap_or(b'0');
+        let lo = hex.get(i * 2 + 1).copied().unwrap_or(b'0');
+        out[i] = (hex_nibble(hi) << 4) | hex_nibble(lo);
+    }
+    out
+}
+
+fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Compute a text hash as the first 8 raw bytes of SHA-256.
+fn text_hash(text: &str) -> [u8; 8] {
+    let hex = sha256_bytes_pub(text.as_bytes());
+    hex_hash_to_bytes8(&hex)
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +232,10 @@ trait EmbeddingProvider: Send + Sync {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
     fn name(&self) -> &str;
+    /// Optional human-readable model identifier (defaults to `name()`).
+    fn model(&self) -> &str {
+        self.name()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +294,10 @@ impl EmbeddingProvider for OpenAiProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -212,6 +385,10 @@ impl EmbeddingProvider for VoyageProvider {
 
     fn name(&self) -> &str {
         "voyage"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -306,6 +483,10 @@ impl EmbeddingProvider for GeminiProvider {
     fn name(&self) -> &str {
         "gemini"
     }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +524,10 @@ impl FastEmbedProvider {
 impl EmbeddingProvider for FastEmbedProvider {
     fn name(&self) -> &str {
         "fastembed-jina-v2-code"
+    }
+
+    fn model(&self) -> &str {
+        "JinaEmbeddingsV2BaseCode"
     }
 
     fn dimensions(&self) -> usize {
@@ -603,9 +788,15 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
 // EmbeddingStore
 // ---------------------------------------------------------------------------
 
-/// Embedding storage backed by a postcard/zstd file.
+/// Runtime state for the embedding store.
+///
+/// The on-disk V2 format uses a string table + vector table for compactness.
+/// At runtime we keep a `HashMap<qname, (vector_idx, text_hash)>` for O(1)
+/// lookups without deserialising the full `EmbeddingDataV2` on every access.
 pub struct EmbeddingStore {
-    data: EmbeddingData,
+    data: EmbeddingDataV2,
+    /// Runtime lookup: qualified_name → (vector_idx, text_hash).
+    lookup: HashMap<String, (usize, [u8; 8])>,
     path: Utf8PathBuf,
     provider: Option<Box<dyn EmbeddingProvider>>,
     #[cfg(feature = "hnsw-index")]
@@ -626,16 +817,18 @@ impl EmbeddingStore {
                         store_path,
                         e
                     );
-                    EmbeddingData::default()
+                    EmbeddingDataV2::default()
                 }
             }
         } else {
-            EmbeddingData::default()
+            EmbeddingDataV2::default()
         };
 
+        let lookup = data.build_lookup();
         let provider = detect_provider();
         Ok(Self {
             data,
+            lookup,
             path: store_path.to_path_buf(),
             provider,
             #[cfg(feature = "hnsw-index")]
@@ -650,13 +843,15 @@ impl EmbeddingStore {
 
     /// Count embedded nodes.
     pub fn count(&self) -> Result<usize> {
-        Ok(self.data.vectors.len())
+        Ok(self.lookup.len())
     }
 
     /// Remove a node's embedding.
     #[allow(dead_code)]
     pub fn remove_node(&mut self, qualified_name: &str) -> Result<()> {
-        self.data.vectors.remove(qualified_name);
+        if self.lookup.remove(qualified_name).is_some() {
+            self.rebuild_data_from_lookup();
+        }
         Ok(())
     }
 
@@ -673,8 +868,7 @@ impl EmbeddingStore {
             .map(|n| n.qualified_name.clone())
             .collect();
         let stale_keys: Vec<String> = self
-            .data
-            .vectors
+            .lookup
             .keys()
             .filter(|k| !live_qns.contains(k.as_str()))
             .cloned()
@@ -683,8 +877,9 @@ impl EmbeddingStore {
         if removed > 0 {
             tracing::info!("Embedding GC: removing {} stale vector(s)", removed);
             for k in &stale_keys {
-                self.data.vectors.remove(k);
+                self.lookup.remove(k);
             }
+            self.rebuild_data_from_lookup();
             #[cfg(feature = "hnsw-index")]
             { self.hnsw_cache = None; }
         }
@@ -699,6 +894,94 @@ impl EmbeddingStore {
     /// Close the store (no-op — nothing to flush unless explicitly saved).
     pub fn close(self) -> Result<()> {
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a node's embedding in both the runtime lookup and the
+    /// underlying V2 data structures.
+    fn insert_node(&mut self, qname: &str, vec: Vec<f32>, text_hash: [u8; 8], vector_idx: usize) {
+        // Update string table if needed.
+        let string_idx = if let Some(pos) = self.data.names.iter().position(|n| n == qname) {
+            pos as u32
+        } else {
+            let idx = self.data.names.len() as u32;
+            self.data.names.push(qname.to_string());
+            idx
+        };
+
+        // Update or append vector table entry.
+        if vector_idx < self.data.vectors.len() {
+            self.data.vectors[vector_idx] = vec;
+        } else {
+            // vector_idx should equal self.data.vectors.len() for new insertions.
+            self.data.vectors.push(vec);
+        }
+
+        // Update or append the entries list.
+        let existing_entry = self
+            .data
+            .entries
+            .iter_mut()
+            .find(|e| e.string_idx == string_idx);
+        if let Some(entry) = existing_entry {
+            entry.vector_idx = vector_idx as u32;
+            entry.text_hash = text_hash;
+        } else {
+            self.data.entries.push(NodeEntry {
+                string_idx,
+                vector_idx: vector_idx as u32,
+                text_hash,
+            });
+        }
+
+        self.lookup.insert(qname.to_string(), (vector_idx, text_hash));
+    }
+
+    /// Rebuild `EmbeddingDataV2` entries/names/vectors from the runtime lookup.
+    ///
+    /// Used after GC or remove_node to compact the data.
+    fn rebuild_data_from_lookup(&mut self) {
+        let meta = self.data.meta.clone();
+        let mut new_data = EmbeddingDataV2 {
+            meta,
+            names: Vec::with_capacity(self.lookup.len()),
+            vectors: Vec::with_capacity(self.lookup.len()),
+            entries: Vec::with_capacity(self.lookup.len()),
+        };
+
+        // Deduplicate vectors by vector_idx from old data.
+        // Assign new compact indices.
+        let mut old_to_new_vec: HashMap<usize, u32> = HashMap::new();
+
+        for (qname, (old_vec_idx, hash)) in &self.lookup {
+            let new_vec_idx = if let Some(&existing) = old_to_new_vec.get(old_vec_idx) {
+                existing
+            } else {
+                let new_idx = new_data.vectors.len() as u32;
+                if let Some(v) = self.data.vectors.get(*old_vec_idx) {
+                    new_data.vectors.push(v.clone());
+                    old_to_new_vec.insert(*old_vec_idx, new_idx);
+                    new_idx
+                } else {
+                    continue;
+                }
+            };
+
+            let string_idx = new_data.names.len() as u32;
+            new_data.names.push(qname.clone());
+            new_data.entries.push(NodeEntry {
+                string_idx,
+                vector_idx: new_vec_idx,
+                text_hash: *hash,
+            });
+        }
+
+        self.data = new_data;
+        // Rebuild lookup from fresh data.
+        self.lookup = self.data.build_lookup();
     }
 }
 
@@ -719,9 +1002,8 @@ impl HnswIndex {
         let dims = emb_store
             .data
             .vectors
-            .values()
-            .next()
-            .map(|(v, _, _)| v.len())
+            .first()
+            .map(|v| v.len())
             .unwrap_or(768);
 
         let options = IndexOptions {
@@ -734,16 +1016,18 @@ impl HnswIndex {
         let index = Index::new(&options)
             .map_err(|e| CrgError::Other(format!("HNSW init: {e}")))?;
         index
-            .reserve(emb_store.data.vectors.len())
+            .reserve(emb_store.lookup.len())
             .map_err(|e| CrgError::Other(format!("HNSW reserve: {e}")))?;
 
         let mut key_to_name = HashMap::new();
-        for (i, (qn, (vec, _, _))) in emb_store.data.vectors.iter().enumerate() {
+        for (i, (qn, (vec_idx, _))) in emb_store.lookup.iter().enumerate() {
             let key = i as u64;
-            index
-                .add(key, vec)
-                .map_err(|e| CrgError::Other(format!("HNSW add: {e}")))?;
-            key_to_name.insert(key, qn.clone());
+            if let Some(vec) = emb_store.data.vectors.get(*vec_idx) {
+                index
+                    .add(key, vec)
+                    .map_err(|e| CrgError::Other(format!("HNSW add: {e}")))?;
+                key_to_name.insert(key, qn.clone());
+            }
         }
 
         Ok(Self { index, key_to_name })
@@ -789,38 +1073,75 @@ pub fn embed_all_nodes(
     // GC: remove embeddings for nodes no longer in the graph.
     emb_store.gc(store)?;
 
-    let provider = emb_store.provider.as_ref().expect("checked above");
+    // Snapshot provider metadata strings before any mutable borrow of emb_store.
+    let (provider_name, provider_model, provider_dims) = {
+        let p = emb_store.provider.as_ref().expect("checked above");
+        (p.name().to_string(), p.model().to_string(), p.dimensions() as u32)
+    };
 
-    // (qualified_name, text, hash) — hash computed once here, reused on insert
-    let mut to_embed: Vec<(String, String, String)> = vec![];
+    // Update store-level metadata from the active provider.
+    emb_store.data.meta.provider = provider_name;
+    emb_store.data.meta.model = provider_model;
+    emb_store.data.meta.dimensions = provider_dims;
+    emb_store.data.meta.version = FORMAT_VERSION;
+
+    // Collect nodes needing (re)embedding.
+    // Dedup by text content: nodes with identical text share one vector.
+    //
+    // `hash_to_text`: text_hash → (text, Vec<qname>) — one embedding per unique text
+    let mut hash_to_text: HashMap<[u8; 8], (String, Vec<String>)> = HashMap::new();
+
     for file in store.get_all_files()? {
         for node in store.get_nodes_by_file(&file)? {
             let text = node_to_text(&node);
             let hash = text_hash(&text);
-            if let Some((_, existing_hash, _)) = emb_store.data.vectors.get(&node.qualified_name) {
-                if *existing_hash == hash {
-                    continue;
-                }
+
+            let needs_embed = match emb_store.lookup.get(&node.qualified_name) {
+                Some((_, existing_hash)) => *existing_hash != hash,
+                None => true,
+            };
+
+            if needs_embed {
+                hash_to_text
+                    .entry(hash)
+                    .or_insert_with(|| (text, Vec::new()))
+                    .1
+                    .push(node.qualified_name.clone());
             }
-            to_embed.push((node.qualified_name.clone(), text, hash));
         }
     }
 
-    if to_embed.is_empty() {
+    if hash_to_text.is_empty() {
         return Ok(0);
     }
 
-    let provider_name = provider.name().to_string();
-    let mut count = 0;
+    // Flatten to (hash, text, qnames) preserving order.
+    let to_embed: Vec<([u8; 8], String, Vec<String>)> = hash_to_text
+        .into_iter()
+        .map(|(hash, (text, qnames))| (hash, text, qnames))
+        .collect();
 
-    for chunk in to_embed.chunks(100) {
-        let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
-        let vectors = provider.embed_batch(&texts)?;
-        for ((qn, _, hash), vec) in chunk.iter().zip(vectors) {
-            emb_store.data.vectors.insert(
-                qn.clone(),
-                (vec, hash.clone(), provider_name.clone()),
-            );
+    // Embed all chunks first (immutable provider borrow), collect results, then mutate.
+    let mut all_results: Vec<([u8; 8], Vec<String>, Vec<f32>)> = Vec::new();
+    {
+        let provider = emb_store.provider.as_ref().expect("checked above");
+        for chunk in to_embed.chunks(100) {
+            let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
+            let vectors = provider.embed_batch(&texts)?;
+            for ((hash, _, qnames), vec) in chunk.iter().zip(vectors) {
+                all_results.push((*hash, qnames.clone(), vec));
+            }
+        }
+    }
+
+    let mut count = 0;
+    for (hash, qnames, vec) in all_results {
+        // Assign a new vector index for this unique text.
+        let vector_idx = emb_store.data.vectors.len();
+        emb_store.data.vectors.push(vec.clone());
+
+        for qn in &qnames {
+            emb_store.insert_node(qn, vec.clone(), hash, vector_idx);
             count += 1;
         }
     }
@@ -878,10 +1199,13 @@ pub fn semantic_search(
 
     // Linear scan (also the only path without hnsw-index feature).
     let mut scored: Vec<(String, f64)> = emb_store
-        .data
-        .vectors
+        .lookup
         .iter()
-        .map(|(qn, (vec, _, _))| (qn.clone(), cosine_similarity(query_vec, vec)))
+        .filter_map(|(qn, (vec_idx, _))| {
+            emb_store.data.vectors.get(*vec_idx).map(|vec| {
+                (qn.clone(), cosine_similarity(query_vec, vec))
+            })
+        })
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
@@ -948,6 +1272,18 @@ mod tests {
 
     fn p(path: &std::path::Path) -> &Utf8Path {
         Utf8Path::from_path(path).expect("test path is valid UTF-8")
+    }
+
+    // Helper: insert a node entry directly into the store (bypasses provider).
+    fn insert_test_entry(
+        store: &mut EmbeddingStore,
+        qname: &str,
+        vec: Vec<f32>,
+        hash_hex: &str,
+    ) {
+        let hash = hex_hash_to_bytes8(hash_hex);
+        let vector_idx = store.data.vectors.len();
+        store.insert_node(qname, vec, hash, vector_idx);
     }
 
     #[test]
@@ -1041,17 +1377,86 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test.embeddings.bin.zst");
         let mut store = EmbeddingStore::new(p(&path)).unwrap();
-        store.data.vectors.insert(
-            "mod::foo".to_string(),
-            (vec![1.0, 2.0, 3.0], "hash1".to_string(), "test".to_string()),
-        );
+        insert_test_entry(&mut store, "mod::foo", vec![1.0, 2.0, 3.0], "hash1");
         store.save().unwrap();
 
         let reloaded = EmbeddingStore::new(p(&path)).unwrap();
         assert_eq!(reloaded.count().unwrap(), 1);
-        let (vec, hash, provider) = reloaded.data.vectors.get("mod::foo").unwrap();
-        assert_eq!(vec, &[1.0, 2.0, 3.0]);
-        assert_eq!(hash, "hash1");
-        assert_eq!(provider, "test");
+
+        // Verify the entry is accessible via the runtime lookup.
+        let (vec_idx, _hash) = reloaded.lookup.get("mod::foo").expect("entry missing");
+        let vec = &reloaded.data.vectors[*vec_idx];
+        assert_eq!(vec, &[1.0f32, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn text_hash_returns_8_bytes() {
+        let h = text_hash("hello world");
+        assert_eq!(h.len(), 8);
+        // Deterministic.
+        assert_eq!(h, text_hash("hello world"));
+        // Different inputs differ.
+        assert_ne!(h, text_hash("goodbye world"));
+    }
+
+    #[test]
+    fn store_metadata_persisted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("meta.embeddings.bin.zst");
+        let mut store = EmbeddingStore::new(p(&path)).unwrap();
+        store.data.meta.provider = "test-provider".to_string();
+        store.data.meta.model = "test-model".to_string();
+        store.data.meta.dimensions = 3;
+        store.save().unwrap();
+
+        let reloaded = EmbeddingStore::new(p(&path)).unwrap();
+        assert_eq!(reloaded.data.meta.provider, "test-provider");
+        assert_eq!(reloaded.data.meta.model, "test-model");
+        assert_eq!(reloaded.data.meta.dimensions, 3);
+        assert_eq!(reloaded.data.meta.version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn v1_migration_roundtrip() {
+        // Serialise a V1 store directly and verify it migrates on load.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("v1.embeddings.bin.zst");
+
+        let mut v1 = EmbeddingDataV1::default();
+        v1.vectors.insert(
+            "mod::bar".to_string(),
+            (vec![4.0, 5.0, 6.0], "aabbccdd00112233".to_string(), "legacy-provider".to_string()),
+        );
+        persistence::save_blob(&v1, path.as_path(), "embeddings").unwrap();
+
+        // Load should auto-migrate.
+        let store = EmbeddingStore::new(p(&path)).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert!(store.lookup.contains_key("mod::bar"));
+    }
+
+    #[test]
+    fn remove_node_decrements_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("rm.embeddings.bin.zst");
+        let mut store = EmbeddingStore::new(p(&path)).unwrap();
+        insert_test_entry(&mut store, "a::b", vec![1.0, 0.0], "deadbeef00000000");
+        insert_test_entry(&mut store, "a::c", vec![0.0, 1.0], "cafebabe00000000");
+        assert_eq!(store.count().unwrap(), 2);
+
+        store.remove_node("a::b").unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        assert!(!store.lookup.contains_key("a::b"));
+        assert!(store.lookup.contains_key("a::c"));
+    }
+
+    #[test]
+    fn hex_hash_to_bytes8_roundtrip() {
+        // Known SHA-256 prefix of "hello world" in hex.
+        let hex = "b94d27b9934d3e08";
+        let bytes = hex_hash_to_bytes8(hex);
+        // Re-encode manually and compare.
+        let re_hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(re_hex, hex);
     }
 }

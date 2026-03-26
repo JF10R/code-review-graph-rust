@@ -2,7 +2,7 @@
   {
     "id": "nextjs-001",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/90518",
     "pr_url": "https://github.com/vercel/next.js/pull/90556",
@@ -20,7 +20,7 @@
   {
     "id": "nextjs-002",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/90332",
     "pr_url": "https://github.com/vercel/next.js/pull/90384",
@@ -31,6 +31,8 @@
     ],
     "relevant_files": [
       "packages/next/src/lib/typescript/writeAppTypeDeclarations.ts",
+      "packages/next/src/server/lib/router-utils/next-typegen.ts",
+      "packages/next/src/server/lib/router-utils/route-types-utils.ts",
       "packages/next/src/build/index.ts",
       "packages/next/src/build/type-check.ts",
       "packages/next/src/lib/verify-typescript-setup.ts"
@@ -41,7 +43,7 @@
   {
     "id": "nextjs-003",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/90381",
     "pr_url": "https://github.com/vercel/next.js/pull/90700",
@@ -59,14 +61,15 @@
   {
     "id": "nextjs-004",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/90513",
     "pr_url": "https://github.com/vercel/next.js/pull/90533",
-    "query": "serverPatchReducer loses push/replace history intent on retry — back button broken after router.push",
+    "query": "serverPatchReducer loses push/replace history intent on retry \u00e2\u20ac\u201d back button broken after router.push",
     "category": "routing",
     "ground_truth_files": [
-      "packages/next/src/client/components/router-reducer/reducers/server-patch-reducer.ts"
+      "packages/next/src/client/components/router-reducer/reducers/server-patch-reducer.ts",
+      "packages/next/src/client/components/router-reducer/ppr-navigations.ts"
     ],
     "relevant_files": [
       "packages/next/src/client/components/router-reducer/reducers/server-patch-reducer.ts",
@@ -80,7 +83,7 @@
   {
     "id": "nextjs-005",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/85416",
     "pr_url": "https://github.com/vercel/next.js/pull/85418",
@@ -98,11 +101,11 @@
   {
     "id": "nextjs-006",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/89033",
     "pr_url": "https://github.com/vercel/next.js/pull/89040",
-    "query": "LRU cache memory leak — null route handler cache entries have size zero so they are never evicted causing unbounded memory growth",
+    "query": "LRU cache memory leak \u00e2\u20ac\u201d null route handler cache entries have size zero so they are never evicted causing unbounded memory growth",
     "category": "runtime",
     "ground_truth_files": [
       "packages/next/src/server/lib/lru-cache.ts"
@@ -118,7 +121,7 @@
   {
     "id": "nextjs-007",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/90281",
     "pr_url": "https://github.com/vercel/next.js/pull/90304",
@@ -136,7 +139,7 @@
   {
     "id": "nextjs-008",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/87090",
     "pr_url": "https://github.com/vercel/next.js/pull/90111",
@@ -154,7 +157,7 @@
   {
     "id": "nextjs-009",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "github issue",
     "issue_url": "https://github.com/vercel/next.js/issues/91662",
     "pr_url": "https://github.com/vercel/next.js/pull/91711",
@@ -172,14 +175,15 @@
   {
     "id": "nextjs-010",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "manual",
     "issue_url": null,
     "pr_url": "https://github.com/vercel/next.js/pull/91160",
-    "query": "Parallel routes with route groups cause 404 in webpack dev — what controls the sort order of appPaths for entries and route matcher resolution?",
+    "query": "Parallel routes with route groups cause 404 in webpack dev \u00e2\u20ac\u201d what controls the sort order of appPaths for entries and route matcher resolution?",
     "category": "routing",
     "ground_truth_files": [
-      "packages/next/src/build/entries.ts"
+      "packages/next/src/build/entries.ts",
+      "packages/next/src/shared/lib/router/utils/app-paths.ts"
     ],
     "relevant_files": [
       "packages/next/src/build/entries.ts",
@@ -193,7 +197,7 @@
   {
     "id": "nextjs-011",
     "repo": "vercel/next.js",
-    "repo_root": "D:\\GitHub\\bench-repos\\next.js",
+    "repo_root": "bench-repos/next.js",
     "source": "manual",
     "issue_url": null,
     "pr_url": "https://github.com/vercel/next.js/pull/91855",
@@ -212,7 +216,7 @@
   {
     "id": "fastapi-001",
     "repo": "fastapi/fastapi",
-    "repo_root": "D:\\GitHub\\bench-repos\\fastapi",
+    "repo_root": "bench-repos/fastapi",
     "source": "github issue",
     "issue_url": "https://github.com/fastapi/fastapi/issues/14454",
     "pr_url": "https://github.com/fastapi/fastapi/pull/14455",
@@ -232,7 +236,7 @@
   {
     "id": "fastapi-002",
     "repo": "fastapi/fastapi",
-    "repo_root": "D:\\GitHub\\bench-repos\\fastapi",
+    "repo_root": "bench-repos/fastapi",
     "source": "github issue",
     "issue_url": "https://github.com/fastapi/fastapi/issues/10997",
     "pr_url": "https://github.com/fastapi/fastapi/pull/14616",
@@ -250,7 +254,7 @@
   {
     "id": "fastapi-003",
     "repo": "fastapi/fastapi",
-    "repo_root": "D:\\GitHub\\bench-repos\\fastapi",
+    "repo_root": "bench-repos/fastapi",
     "source": "github issue",
     "issue_url": "https://github.com/fastapi/fastapi/issues/13533",
     "pr_url": "https://github.com/fastapi/fastapi/pull/13537",
@@ -268,7 +272,7 @@
   {
     "id": "httpx-001",
     "repo": "encode/httpx",
-    "repo_root": "D:\\GitHub\\bench-repos\\httpx",
+    "repo_root": "bench-repos/httpx",
     "source": "github pr",
     "issue_url": null,
     "pr_url": "https://github.com/encode/httpx/pull/3442",
@@ -286,7 +290,7 @@
   {
     "id": "httpx-002",
     "repo": "encode/httpx",
-    "repo_root": "D:\\GitHub\\bench-repos\\httpx",
+    "repo_root": "bench-repos/httpx",
     "source": "github pr",
     "issue_url": null,
     "pr_url": "https://github.com/encode/httpx/pull/3412",
@@ -304,11 +308,11 @@
   {
     "id": "httpx-003",
     "repo": "encode/httpx",
-    "repo_root": "D:\\GitHub\\bench-repos\\httpx",
+    "repo_root": "bench-repos/httpx",
     "source": "github pr",
     "issue_url": null,
     "pr_url": "https://github.com/encode/httpx/pull/3045",
-    "query": "RFC 2069 digest authentication fails — where is the qop field omitted for legacy digest auth compatibility?",
+    "query": "RFC 2069 digest authentication fails \u00e2\u20ac\u201d where is the qop field omitted for legacy digest auth compatibility?",
     "category": "api",
     "ground_truth_files": [
       "httpx/_auth.py"
@@ -322,26 +326,27 @@
   {
     "id": "vscode-001",
     "repo": "microsoft/vscode",
-    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
-    "source": "github issue",
-    "issue_url": "https://github.com/microsoft/vscode/issues/236578",
-    "query": "Settings editor shows wrong default value for enum settings after workspace configuration overrides the user default",
-    "category": "config",
+    "repo_root": "bench-repos/vscode",
+    "source": "github pr",
+    "issue_url": null,
+    "pr_url": "https://github.com/microsoft/vscode/pull/288003",
+    "query": "File watcher causes 100% CPU on Windows when a watched file or directory is deleted because the error callback fires continuously in an infinite loop",
+    "category": "runtime",
     "ground_truth_files": [
-      "src/vs/platform/configuration/common/configurationModels.ts"
+      "src/vs/platform/files/node/watcher/nodejs/nodejsWatcherLib.ts",
+      "src/vs/platform/files/node/watcher/parcel/parcelWatcher.ts"
     ],
     "relevant_files": [
-      "src/vs/platform/configuration/common/configurationModels.ts",
-      "src/vs/platform/configuration/common/configurationRegistry.ts",
-      "src/vs/workbench/services/configuration/common/configurationModels.ts"
+      "src/vs/platform/files/node/watcher/nodejs/nodejsWatcherLib.ts",
+      "src/vs/platform/files/node/watcher/parcel/parcelWatcher.ts"
     ],
-    "root_cause_description": "ConfigurationModel.merge did not correctly resolve enum default overrides when a workspace policy layer was present, causing the settings UI to display the raw policy value instead of the user-visible default.",
+    "root_cause_description": "When a watched path is deleted on Windows, both Parcel and NodeJS watchers continuously fire error callbacks. The code only checked cancellation token but not the failed state, causing an infinite error processing loop.",
     "difficulty": "medium"
   },
   {
     "id": "vscode-002",
     "repo": "microsoft/vscode",
-    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "repo_root": "bench-repos/vscode",
     "source": "github issue",
     "issue_url": "https://github.com/microsoft/vscode/issues/232014",
     "query": "Extension host crashes silently when extHostLanguageFeatures registers a document link provider that throws synchronously",
@@ -359,7 +364,7 @@
   {
     "id": "vscode-003",
     "repo": "microsoft/vscode",
-    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "repo_root": "bench-repos/vscode",
     "source": "github issue",
     "issue_url": "https://github.com/microsoft/vscode/issues/229761",
     "query": "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key",
@@ -376,7 +381,7 @@
   {
     "id": "vscode-004",
     "repo": "microsoft/vscode",
-    "repo_root": "D:\\GitHub\\bench-repos\\vscode",
+    "repo_root": "bench-repos/vscode",
     "source": "github issue",
     "issue_url": "https://github.com/microsoft/vscode/issues/227843",
     "query": "Debug hover does not evaluate expressions containing await when stopped at a breakpoint inside an async function",
@@ -395,25 +400,27 @@
   {
     "id": "kubernetes-001",
     "repo": "kubernetes/kubernetes",
-    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "repo_root": "bench-repos/kubernetes",
     "source": "github issue",
-    "issue_url": "https://github.com/kubernetes/kubernetes/issues/128855",
-    "query": "Scheduler skips nodes whose resource capacity exactly matches pod request due to off-by-one in NodeResourcesFit filter comparison",
+    "issue_url": "https://github.com/kubernetes/kubernetes/issues/125336",
+    "pr_url": "https://github.com/kubernetes/kubernetes/pull/125398",
+    "query": "Volume-binding scheduler prefilter assumes node metadata.name equals the kubernetes.io/hostname label, causing pods with local PVs to fail scheduling when node name is an FQDN but hostname label is unqualified",
     "category": "scheduler",
     "ground_truth_files": [
-      "pkg/scheduler/framework/plugins/noderesources/fit.go"
+      "pkg/scheduler/framework/plugins/volumebinding/volume_binding.go"
     ],
     "relevant_files": [
-      "pkg/scheduler/framework/plugins/noderesources/fit.go",
-      "pkg/scheduler/schedule_one.go"
+      "pkg/scheduler/framework/plugins/volumebinding/volume_binding.go",
+      "pkg/scheduler/framework/plugins/volumebinding/binder.go",
+      "pkg/volume/util/util.go"
     ],
-    "root_cause_description": "fitsRequest used strict less-than instead of less-than-or-equal when comparing available capacity to requested resources, causing nodes where capacity exactly equals the request to be incorrectly marked as insufficient.",
-    "difficulty": "simple"
+    "root_cause_description": "The volume-binding scheduler plugin's PreFilter returned hostname label values in PreFilterResult.NodeNames, but the scheduler framework interprets that field as node metadata.name. When hostname differs from node name (e.g., FQDN vs short name), the node was incorrectly excluded.",
+    "difficulty": "medium"
   },
   {
     "id": "kubernetes-002",
     "repo": "kubernetes/kubernetes",
-    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "repo_root": "bench-repos/kubernetes",
     "source": "github issue",
     "issue_url": "https://github.com/kubernetes/kubernetes/issues/126287",
     "query": "PodTopologySpread scoring produces uneven distribution when topology domains have zero running pods and minDomains is set",
@@ -432,7 +439,7 @@
   {
     "id": "kubernetes-003",
     "repo": "kubernetes/kubernetes",
-    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "repo_root": "bench-repos/kubernetes",
     "source": "github issue",
     "issue_url": "https://github.com/kubernetes/kubernetes/issues/124847",
     "query": "Deployment controller stalls when rolling update maxUnavailable is zero and pod readiness probe begins failing mid-rollout",
@@ -450,7 +457,7 @@
   {
     "id": "kubernetes-004",
     "repo": "kubernetes/kubernetes",
-    "repo_root": "D:\\GitHub\\bench-repos\\kubernetes",
+    "repo_root": "bench-repos/kubernetes",
     "source": "github issue",
     "issue_url": "https://github.com/kubernetes/kubernetes/issues/122718",
     "query": "kubelet volume manager deadlocks when reconciler detaches a volume while attach/detach controller holds the global volume lock",
@@ -468,7 +475,7 @@
   {
     "id": "rust-001",
     "repo": "rust-lang/rust",
-    "repo_root": "D:\\GitHub\\bench-repos\\rust",
+    "repo_root": "bench-repos/rust",
     "source": "github issue",
     "issue_url": "https://github.com/rust-lang/rust/issues/130528",
     "query": "Borrow checker emits confusing error message about lifetime mismatch when returning a reference from a closure that captures a local",
@@ -487,7 +494,7 @@
   {
     "id": "rust-002",
     "repo": "rust-lang/rust",
-    "repo_root": "D:\\GitHub\\bench-repos\\rust",
+    "repo_root": "bench-repos/rust",
     "source": "github issue",
     "issue_url": "https://github.com/rust-lang/rust/issues/127961",
     "query": "Type checker incorrectly accepts coercion from fn pointer with higher-ranked lifetime to fn pointer without lifetime bound",
@@ -499,14 +506,14 @@
       "compiler/rustc_hir_typeck/src/coercion.rs",
       "compiler/rustc_infer/src/infer/mod.rs",
       "compiler/rustc_trait_selection/src/traits/mod.rs"
-      ],
+    ],
     "root_cause_description": "coerce_from_fn_pointer did not instantiate higher-ranked lifetime binders before comparing fn pointer types, allowing the type checker to accept an unsound coercion that stripped the for<'a> lifetime bound from the source type.",
     "difficulty": "complex"
   },
   {
     "id": "rust-003",
     "repo": "rust-lang/rust",
-    "repo_root": "D:\\GitHub\\bench-repos\\rust",
+    "repo_root": "bench-repos/rust",
     "source": "github issue",
     "issue_url": "https://github.com/rust-lang/rust/issues/126452",
     "query": "MIR inliner panics with index out of bounds when inlining a function whose local declarations include compiler-generated temporaries from a match expression",
