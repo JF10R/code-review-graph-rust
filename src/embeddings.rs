@@ -289,10 +289,10 @@ fn migrate_v1_to_v2(v1: EmbeddingDataV1) -> EmbeddingDataV2 {
 fn hex_hash_to_bytes8(hex: &str) -> [u8; 8] {
     let mut out = [0u8; 8];
     let hex = hex.as_bytes();
-    for i in 0..8 {
+    for (i, byte) in out.iter_mut().enumerate() {
         let hi = hex.get(i * 2).copied().unwrap_or(b'0');
         let lo = hex.get(i * 2 + 1).copied().unwrap_or(b'0');
-        out[i] = (hex_nibble(hi) << 4) | hex_nibble(lo);
+        *byte = (hex_nibble(hi) << 4) | hex_nibble(lo);
     }
     out
 }

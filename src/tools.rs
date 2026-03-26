@@ -1487,11 +1487,11 @@ fn nodes_to_candidates(
 /// Channels used:
 /// 1. Keyword relaxed    — always run; results are also reused by path/config channels.
 /// 2. Keyword exact      — symbols + compound_terms, when fanout enabled.
-/// 2b. Error strings     — exact search for each quoted/backtick span, when fanout enabled.
+///    2b. Error strings     — exact search for each quoted/backtick span, when fanout enabled.
 /// 3. Path-boosted       — only when `parts.path_fragments` is non-empty.
 /// 4. Config-boosted     — only when domain_terms contains config/settings/options/env.
 /// 5. Semantic           — only when `emb_store` has node embeddings.
-/// 5b. File-semantic     — top files by embedding similarity, expanded to nodes.
+///    5b. File-semantic     — top files by embedding similarity, expanded to nodes.
 /// 6. Tantivy            — only when `kw_hits` is `Some`.
 #[allow(clippy::too_many_arguments)]
 fn fanout_retrieve(
@@ -1838,6 +1838,7 @@ fn aggregate_to_files(
 }
 
 /// Serialise file-level results into the MCP response JSON.
+#[allow(clippy::too_many_arguments)]
 fn file_results_to_json(
     results: Vec<FileResult>,
     query: &str,
@@ -1926,6 +1927,7 @@ fn file_results_to_json(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_query(
     query: &str,
     limit: usize,
