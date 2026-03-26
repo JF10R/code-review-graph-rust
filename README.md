@@ -117,24 +117,26 @@ Exclude files via `.code-review-graphignore` (gitignore syntax).
 
 ### Recommended CLAUDE.md snippet
 
-Add this to your project's `CLAUDE.md` to guide Claude Code (and sub-agents) toward graph queries instead of grep for code discovery:
+Add this to your project's `CLAUDE.md`:
 
 ```markdown
 ## Code Review Graph (MCP)
 
-Prefer these tools over grep/read for code discovery:
+**When to use graph tools vs Grep:**
+- **Grep/Read**: exact filename, symbol name, or string literal lookups
+- **Graph tools**: structural queries (who calls X?), semantic/conceptual search, cross-file tracing
 
 | Tool | When to use |
 |------|-------------|
-| `semantic_search_nodes` | Find code by concept — use INSTEAD OF grep |
+| `hybrid_query` | Best first call — combined keyword + semantic + structural search |
+| `open_node_context` | After finding a function — get source + callers + callees in one call |
 | `trace_call_chain(from, to)` | Trace how function A reaches function B |
 | `query_graph(callers_of)` | Who calls this function? |
-| `query_graph(callees_of)` | What does this function call? |
 | `get_review_context` | Token-efficient review bundle for changed files |
-| `hybrid_query` | Combined keyword + semantic search |
-| `hybrid_query(result_mode: "file")` | File-level results with supporting node evidence |
+| `get_impact_radius` | Blast radius analysis for a set of changed files |
+| `semantic_search_nodes` | Find code by concept when keyword search fails |
 
-Always pass `compact: true`. Discover with graph tools first, then `Read` only the files you need.
+Always pass `compact: true`. Use 3-5 MCP calls for discovery, then `Read`/`Grep` for details.
 ```
 
 ## CLI
@@ -160,9 +162,19 @@ cargo install ... --features tantivy-search  # Fuzzy full-text search
 cargo install ... --no-default-features      # Minimal binary (no embeddings)
 ```
 
-## Performance (v1.3.0)
+## Agent Benchmark Results
 
-v1.3.0 rewrites several hot paths identified through profiling:
+8-case agent-level benchmark across 6 repos (httpx, FastAPI, Next.js, VS Code, Kubernetes, Rust compiler). Agents investigate real GitHub issues with and without MCP tools. Full results in [`eval/BENCHMARK_MCP_V1.3_RESULTS.md`](eval/BENCHMARK_MCP_V1.3_RESULTS.md).
+
+| Repo size | MCP speedup | Cases |
+|-----------|-------------|-------|
+| >100K nodes (vscode, k8s, rust) | **2.9x faster** | Discovery-heavy investigations |
+| 6-90K nodes (fastapi, next.js) | **1.6x faster** | Cross-file tracing |
+| <2K nodes (httpx) | ~same | Grep is sufficient |
+
+**MCP is faster in 5/8 cases, averaging 1.8x speedup.** Value comes from structural queries (`query_graph`, `trace_call_chain`) on large repos where grep is slow. Tokens are similar or slightly higher; the win is wall-clock time.
+
+## Performance (v1.3.0)
 
 | Operation | Before | After |
 |-----------|--------|-------|

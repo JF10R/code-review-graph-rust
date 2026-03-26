@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.5.0
+
+### Storage & Embeddings
+
+- **f16 vector storage (V3 format)** — Embedding vectors stored as IEEE 754 half-precision on disk, ~50% smaller files. Auto-upgrades V1/V2 stores on save. Runtime stays f32.
+- **File-level embeddings** — Separate `file-embeddings.bin.zst` stores per-file vectors (path + language + symbol names). Enables file-semantic retrieval channel.
+- **Provider invalidation** — Hard gate: if embedding provider/model/dimensions change, the entire store is rebuilt instead of mixing incompatible vectors.
+- **O(1) insert** — Reverse maps (`name_to_idx`, `hash_to_vec`) replace O(n) linear scans during embedding updates.
+- **Cross-run dedup** — `hash_to_vec` reuses existing vectors for unchanged text across incremental updates.
+
+### Retrieval
+
+- **Budget mode** — `hybrid_query(budget: "fast")` (default): file-mode, top 3 results, no expansion, no heavy fanout. `budget: "thorough"` for full pipeline. Bounded server policy prevents agent over-exploration.
+- **`repo_profile` in every response** — `file_count`, `node_count`, `languages` included so agents can self-calibrate tool usage by repo size.
+- **File-semantic channel (5b)** — `semantic_search_files()` finds top files by embedding similarity, expands to node candidates.
+- **`exact_channels` split from fanout** — Compound terms and error strings active on production path; symbol-exact stays gated on heavy fanout (regression-safe).
+- **Query expansion** — `extract_quoted_spans()` pulls error strings from `"..."` and `` `...` `` spans. `extract_compound_terms()` detects 30+ technical phrases (race condition, memory leak, etc.).
+- **Smarter MCP guidance** — Server instructions updated: grep for exact lookups, graph tools for structural/semantic queries. Promotes `hybrid_query` and `open_node_context`.
+
+### Benchmarks
+
+- **8-case agent benchmark** across 6 repos (httpx, FastAPI, Next.js, VS Code, Kubernetes, Rust compiler). MCP **1.8x faster** on average (5/8 cases), with 2.9x speedup on repos >100K nodes. See `eval/BENCHMARK_MCP_V1.3_RESULTS.md`.
+- **Rust vs Python MCP comparison** — Rust MCP 9% cheaper on tokens, 2x faster wall-clock than Python MCP v1.8.4.
+
 ## v1.4.0
 
 ### Retrieval Quality
