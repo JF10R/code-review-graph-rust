@@ -35,7 +35,7 @@ use crate::types::{GraphNode, node_to_dict};
 // Format version
 // ---------------------------------------------------------------------------
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // V2 serialisable data
@@ -106,6 +106,58 @@ impl EmbeddingDataV2 {
 }
 
 // ---------------------------------------------------------------------------
+// V3 serialisable data (f16 vector storage — ~50% smaller on disk)
+// ---------------------------------------------------------------------------
+
+/// V3 store-level metadata (extends V2 with storage_dtype).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct StoreMetadataV3 {
+    version: u32,
+    provider: String,
+    model: String,
+    dimensions: u32,
+    /// Storage data type: `"f16"` for V3 format.
+    storage_dtype: String,
+}
+
+/// V3 on-disk format: f16 vectors for ~50% size reduction.
+///
+/// Vectors are stored as `u16` raw bits of IEEE 754 binary16 (half precision).
+/// Promoted to `f32` at load time for runtime computation.
+#[derive(Serialize, Deserialize)]
+struct EmbeddingDataV3 {
+    meta: StoreMetadataV3,
+    names: Vec<String>,
+    vectors_f16: Vec<Vec<u16>>,
+    entries: Vec<NodeEntry>,
+}
+
+/// Convert f32 vector to f16 raw bits for storage.
+fn f32_vec_to_f16(v: &[f32]) -> Vec<u16> {
+    v.iter().map(|&x| half::f16::from_f32(x).to_bits()).collect()
+}
+
+/// Convert f16 raw bits to f32 vector for runtime.
+fn f16_vec_to_f32(v: &[u16]) -> Vec<f32> {
+    v.iter().map(|&bits| half::f16::from_bits(bits).to_f32()).collect()
+}
+
+/// Convert V3 on-disk data (f16 vectors) to V2 runtime format (f32 vectors).
+fn v3_to_runtime(v3: EmbeddingDataV3) -> EmbeddingDataV2 {
+    EmbeddingDataV2 {
+        meta: StoreMetadata {
+            version: FORMAT_VERSION,
+            provider: v3.meta.provider,
+            model: v3.meta.model,
+            dimensions: v3.meta.dimensions,
+        },
+        names: v3.names,
+        vectors: v3.vectors_f16.iter().map(|v| f16_vec_to_f32(v)).collect(),
+        entries: v3.entries,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // V1 serialisable data (for migration only)
 // ---------------------------------------------------------------------------
 
@@ -120,13 +172,36 @@ struct EmbeddingDataV1 {
 // ---------------------------------------------------------------------------
 
 fn save_embedding_data(data: &EmbeddingDataV2, path: &std::path::Path) -> Result<()> {
-    persistence::save_blob(data, path, "embeddings")
+    let v3 = EmbeddingDataV3 {
+        meta: StoreMetadataV3 {
+            version: FORMAT_VERSION,
+            provider: data.meta.provider.clone(),
+            model: data.meta.model.clone(),
+            dimensions: data.meta.dimensions,
+            storage_dtype: "f16".to_string(),
+        },
+        names: data.names.clone(),
+        vectors_f16: data.vectors.iter().map(|v| f32_vec_to_f16(v)).collect(),
+        entries: data.entries.clone(),
+    };
+    persistence::save_blob(&v3, path, "embeddings")
 }
 
 fn load_embedding_data(path: &std::path::Path) -> Result<EmbeddingDataV2> {
-    // Try V2 first.
+    // Try V3 first (f16 vectors on disk).
+    if let Ok(v3) = persistence::load_blob::<EmbeddingDataV3>(path, "embeddings") {
+        if v3.meta.version == 3 {
+            tracing::info!(
+                "embeddings: loaded v3 store ({} entries, storage=f16)",
+                v3.entries.len(),
+            );
+            return Ok(v3_to_runtime(v3));
+        }
+    }
+
+    // Try V2 (f32 vectors on disk).
     match persistence::load_blob::<EmbeddingDataV2>(path, "embeddings") {
-        Ok(d) if d.meta.version == FORMAT_VERSION => return Ok(d),
+        Ok(d) if d.meta.version == 2 => return Ok(d),
         Ok(d) => {
             tracing::warn!(
                 "embeddings: unrecognised format version {} in {:?}; starting empty",
@@ -1458,5 +1533,84 @@ mod tests {
         // Re-encode manually and compare.
         let re_hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         assert_eq!(re_hex, hex);
+    }
+
+    #[test]
+    fn f16_roundtrip_preserves_cosine_similarity() {
+        // Realistic embedding-like vectors (values in [-1, 1]).
+        let a = vec![0.123f32, -0.456, 0.789, -0.012, 0.345, -0.678, 0.901, -0.234];
+        let b = vec![-0.567f32, 0.890, -0.123, 0.456, -0.789, 0.012, -0.345, 0.678];
+
+        let original_sim = cosine_similarity(&a, &b);
+
+        // Roundtrip through f16.
+        let a_rt = f16_vec_to_f32(&f32_vec_to_f16(&a));
+        let b_rt = f16_vec_to_f32(&f32_vec_to_f16(&b));
+        let roundtrip_sim = cosine_similarity(&a_rt, &b_rt);
+
+        // f16 has ~3 decimal digits of precision; cosine similarity preserved to <0.001.
+        assert!(
+            (original_sim - roundtrip_sim).abs() < 0.001,
+            "f16 roundtrip degraded cosine similarity: {original_sim} → {roundtrip_sim}"
+        );
+    }
+
+    #[test]
+    fn embedding_store_v3_save_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("v3.embeddings.bin.zst");
+        let mut store = EmbeddingStore::new(p(&path)).unwrap();
+
+        // Values that are exact in both f32 and f16.
+        insert_test_entry(&mut store, "mod::alpha", vec![1.0, 0.0, -1.0], "aabb0011");
+        insert_test_entry(&mut store, "mod::beta", vec![0.0, 1.0, 0.5], "ccdd2233");
+        store.save().unwrap();
+
+        let reloaded = EmbeddingStore::new(p(&path)).unwrap();
+        assert_eq!(reloaded.count().unwrap(), 2);
+        assert_eq!(reloaded.data.meta.version, FORMAT_VERSION);
+
+        let (idx_a, _) = reloaded.lookup.get("mod::alpha").unwrap();
+        assert_eq!(&reloaded.data.vectors[*idx_a], &[1.0f32, 0.0, -1.0]);
+
+        let (idx_b, _) = reloaded.lookup.get("mod::beta").unwrap();
+        assert_eq!(&reloaded.data.vectors[*idx_b], &[0.0f32, 1.0, 0.5]);
+    }
+
+    #[test]
+    fn v2_file_loads_and_upgrades_to_v3_on_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("upgrade.embeddings.bin.zst");
+
+        // Manually write a V2 file.
+        let mut v2 = EmbeddingDataV2::default();
+        v2.meta.version = 2;
+        v2.meta.provider = "test".to_string();
+        v2.meta.dimensions = 2;
+        v2.names.push("mod::old".to_string());
+        v2.vectors.push(vec![0.5, -0.5]);
+        v2.entries.push(NodeEntry {
+            string_idx: 0,
+            vector_idx: 0,
+            text_hash: [1, 2, 3, 4, 5, 6, 7, 8],
+        });
+        persistence::save_blob(&v2, path.as_path(), "embeddings").unwrap();
+
+        // Load should read as V2 (f32).
+        let store = EmbeddingStore::new(p(&path)).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        let (idx, _) = store.lookup.get("mod::old").unwrap();
+        assert_eq!(&store.data.vectors[*idx], &[0.5f32, -0.5]);
+
+        // Re-save upgrades to V3 on disk.
+        store.save().unwrap();
+
+        // Reload now loads V3 format.
+        let reloaded = EmbeddingStore::new(p(&path)).unwrap();
+        assert_eq!(reloaded.count().unwrap(), 1);
+        assert_eq!(reloaded.data.meta.version, FORMAT_VERSION);
+        let (idx2, _) = reloaded.lookup.get("mod::old").unwrap();
+        // 0.5 and -0.5 are exact in f16.
+        assert_eq!(&reloaded.data.vectors[*idx2], &[0.5f32, -0.5]);
     }
 }
