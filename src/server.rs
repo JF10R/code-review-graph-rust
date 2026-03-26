@@ -473,7 +473,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
                 let kw_hits = kw_hits!(&query, limit * 2);
                 let result = crate::tools::hybrid_query_with_store(
-                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(),
+                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None,
                 ).map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }

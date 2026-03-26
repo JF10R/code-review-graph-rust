@@ -16,7 +16,11 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use code_review_graph::embeddings::EmbeddingStore;
+use code_review_graph::graph::GraphStore;
+use code_review_graph::incremental;
 use code_review_graph::paths::normalize_path;
+use code_review_graph::tools::AblationConfig;
 
 // ---------------------------------------------------------------------------
 // Gold eval case schema
@@ -213,6 +217,156 @@ fn run_eval(result_mode: Option<&str>) {
 }
 
 // ---------------------------------------------------------------------------
+// Ablation runner (leave-one-out)
+// ---------------------------------------------------------------------------
+
+/// Result from a single ablation config run.
+struct AblationResult {
+    label: String,
+    hits: usize,
+    mrr: f64,
+    evaluated: usize,
+    /// Per-case hit rank (None = miss, Some(rank) = hit at rank).
+    per_case: Vec<(String, Option<usize>)>,
+}
+
+/// Run the 28-case gold eval with a specific ablation config using
+/// `hybrid_query_with_store` directly.
+fn run_eval_ablation(ablation: &AblationConfig) -> AblationResult {
+    let json_path = "eval/gold-eval-set.json";
+    let json = std::fs::read_to_string(json_path)
+        .unwrap_or_else(|e| panic!("Could not read {json_path}: {e}"));
+    let cases: Vec<EvalCase> =
+        serde_json::from_str(&json).expect("Could not parse eval/gold-eval-set.json");
+
+    let label = ablation.label();
+    let mut hits: usize = 0;
+    let mut mrr_sum: f64 = 0.0;
+    let mut skipped: usize = 0;
+    let mut per_case: Vec<(String, Option<usize>)> = Vec::new();
+
+    // Cache open stores per repo_root to avoid re-opening for every case.
+    let mut stores: HashMap<String, (GraphStore, EmbeddingStore)> = HashMap::new();
+
+    for case in &cases {
+        if !Path::new(&case.repo_root).exists() {
+            skipped += 1;
+            continue;
+        }
+
+        // Open or reuse stores for this repo.
+        if !stores.contains_key(&case.repo_root) {
+            let root = camino::Utf8Path::new(&case.repo_root);
+            let db_path = incremental::get_db_path(root);
+            let store = GraphStore::new(&db_path).expect("open graph store");
+            let emb_db_path = incremental::get_embeddings_db_path(root);
+            let emb_store = EmbeddingStore::new(&emb_db_path).expect("open embedding store");
+            stores.insert(case.repo_root.clone(), (store, emb_store));
+        }
+        let (store, emb_store) = stores.get_mut(&case.repo_root).unwrap();
+        let root = camino::Utf8Path::new(&case.repo_root);
+
+        let result = code_review_graph::tools::hybrid_query_with_store(
+            store,
+            emb_store,
+            root,
+            &case.query,
+            10,
+            true,            // compact
+            None,            // fusion
+            None,            // keyword_hits
+            None,            // route
+            None,            // debug
+            Some("file"),    // result_mode
+            Some(ablation),  // ablation config
+        );
+
+        match result {
+            Err(_) => {
+                per_case.push((case.id.clone(), None));
+            }
+            Ok(val) => {
+                let results: &[serde_json::Value] = val["results"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let rank = find_hit_rank(results, &case.ground_truth_files, 5);
+                if let Some(r) = rank {
+                    hits += 1;
+                    mrr_sum += 1.0 / r as f64;
+                }
+                per_case.push((case.id.clone(), rank));
+            }
+        }
+    }
+
+    let evaluated = cases.len() - skipped;
+    let mrr = if evaluated > 0 { mrr_sum / evaluated as f64 } else { 0.0 };
+
+    // Close all stores.
+    for (_, (store, emb_store)) in stores {
+        let _ = emb_store.close();
+        let _ = store.close();
+    }
+
+    AblationResult { label, hits, mrr, evaluated, per_case }
+}
+
+/// Print a comparison table across all ablation configs.
+fn print_ablation_comparison(results: &[AblationResult]) {
+    println!("\n{:=<80}", "");
+    println!("ABLATION STUDY — Leave-One-Out Analysis (file mode)");
+    println!("{:=<80}\n", "");
+
+    // Summary table.
+    println!("| {:<18} | {:>7} | {:>7} | {:>6} |", "Config", "Hit@5", "MRR", "Delta");
+    println!("|{:-<20}|{:-<9}|{:-<9}|{:-<8}|", "", "", "", "");
+
+    let baseline_hits = results[0].hits;
+    let _baseline_mrr = results[0].mrr;
+    for r in results {
+        let delta_hits = r.hits as i32 - baseline_hits as i32;
+        let delta_str = if r.label == "full" {
+            "—".to_string()
+        } else {
+            format!("{:+}", delta_hits)
+        };
+        let evaluated = r.evaluated;
+        println!(
+            "| {:<18} | {:>2}/{:<2} ({:>4.1}%) | {:>7.3} | {:>6} |",
+            r.label,
+            r.hits,
+            evaluated,
+            r.hits as f64 / evaluated as f64 * 100.0,
+            r.mrr,
+            delta_str,
+        );
+    }
+
+    // Per-case diff: show cases where removing a component changed the outcome.
+    println!("\n--- Per-case diffs (changes vs full) ---\n");
+    println!("| {:<16} | {:<18} | {} |", "Case", "Full", "Config → Changed");
+    println!("|{:-<18}|{:-<20}|{:-<50}|", "", "", "");
+
+    let full = &results[0];
+    for (idx, (case_id, full_rank)) in full.per_case.iter().enumerate() {
+        let mut diffs: Vec<String> = Vec::new();
+        for r in &results[1..] {
+            let ablated_rank = &r.per_case[idx].1;
+            if ablated_rank != full_rank {
+                let f = full_rank.map_or("MISS".to_string(), |r| format!("HIT@{r}"));
+                let a = ablated_rank.map_or("MISS".to_string(), |r| format!("HIT@{r}"));
+                diffs.push(format!("{}: {}→{}", r.label, f, a));
+            }
+        }
+        if !diffs.is_empty() {
+            let full_str = full_rank.map_or("MISS".to_string(), |r| format!("HIT@{r}"));
+            println!("| {:<16} | {:<18} | {} |", case_id, full_str, diffs.join(", "));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -286,4 +440,121 @@ fn eval_benchmark_ablation() {
     run_eval(None);
     println!("\n### File mode ###");
     run_eval(Some("file"));
+}
+
+/// Leave-one-out ablation study: run file mode with each component disabled
+/// individually. Produces a comparison table showing each component's
+/// marginal contribution to Hit@5 and MRR.
+///
+/// Run with:
+///   cargo test --release --ignored eval_ablation_leave_one_out -- --nocapture
+#[test]
+#[ignore]
+fn eval_ablation_leave_one_out() {
+    let components = ["fanout", "expansion", "priors", "scorer", "decomposition", "semantic"];
+
+    // Full baseline first.
+    println!("Running: full (baseline)");
+    let mut results = vec![run_eval_ablation(&AblationConfig::full())];
+
+    // Leave-one-out for each component.
+    for component in &components {
+        println!("Running: -{component}");
+        results.push(run_eval_ablation(&AblationConfig::without(component)));
+    }
+
+    print_ablation_comparison(&results);
+}
+
+/// Regression: vscode-003 must stay Hit@5 with the default config (fanout OFF).
+/// This query was a MISS under the old config D (fanout ON + decomposition ON).
+///
+/// Run with:
+///   cargo test --release --ignored eval_regression_vscode_003 -- --nocapture
+#[test]
+#[ignore]
+fn eval_regression_vscode_003() {
+    let result = code_review_graph::tools::hybrid_query(
+        "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key",
+        10,
+        Some("D:\\GitHub\\bench-repos\\vscode"),
+        true, None, None, None, Some("file"),
+    ).expect("hybrid_query should succeed");
+
+    let results = result["results"].as_array().expect("results array");
+    let rank = find_hit_rank(results, &["src/vs/platform/keybinding/common/keybindingResolver.ts".to_string()], 5);
+    assert!(rank.is_some(), "vscode-003 must be Hit@5; got MISS. Top 5: {:?}",
+        results.iter().take(5).map(|r| r["file_path"].as_str().unwrap_or("?")).collect::<Vec<_>>());
+    println!("vscode-003: HIT@{}", rank.unwrap());
+}
+
+/// Regression: kubernetes-004 must stay Hit@5 with the default config (fanout OFF).
+/// This query was a MISS under the old config D (fanout ON + decomposition ON).
+///
+/// Run with:
+///   cargo test --release --ignored eval_regression_kubernetes_004 -- --nocapture
+#[test]
+#[ignore]
+fn eval_regression_kubernetes_004() {
+    let result = code_review_graph::tools::hybrid_query(
+        "kubelet volume manager deadlocks when reconciler detaches a volume while attach/detach controller holds the global volume lock",
+        10,
+        Some("D:\\GitHub\\bench-repos\\kubernetes"),
+        true, None, None, None, Some("file"),
+    ).expect("hybrid_query should succeed");
+
+    let results = result["results"].as_array().expect("results array");
+    let rank = find_hit_rank(results, &["pkg/kubelet/volumemanager/volume_manager.go".to_string()], 5);
+    assert!(rank.is_some(), "kubernetes-004 must be Hit@5; got MISS. Top 5: {:?}",
+        results.iter().take(5).map(|r| r["file_path"].as_str().unwrap_or("?")).collect::<Vec<_>>());
+    println!("kubernetes-004: HIT@{}", rank.unwrap());
+}
+
+/// 2×2 interaction test: fanout × decomposition with everything else fixed.
+/// Tests whether the gains from removing fanout and decomposition are
+/// independent or overlapping.
+///
+/// Run with:
+///   cargo test --release --ignored eval_ablation_interaction -- --nocapture
+#[test]
+#[ignore]
+fn eval_ablation_interaction() {
+    // A: minimal — no fanout, no decomposition (semantic + kw_relaxed + scorer + priors + expansion)
+    let a = AblationConfig { fanout: false, decomposition: false, ..AblationConfig::full() };
+    // B: + decomposition only
+    let b = AblationConfig { fanout: false, decomposition: true, ..AblationConfig::full() };
+    // C: + fanout only
+    let c = AblationConfig { fanout: true, decomposition: false, ..AblationConfig::full() };
+    // D: full (both enabled) — current production
+    let d = AblationConfig::full();
+
+    let configs: Vec<(&str, AblationConfig)> = vec![
+        ("A: minimal", a),
+        ("B: +decomp", b),
+        ("C: +fanout", c),
+        ("D: full", d),
+    ];
+
+    let mut results = Vec::new();
+    for (label, cfg) in &configs {
+        println!("Running: {label}");
+        let mut r = run_eval_ablation(cfg);
+        r.label = label.to_string();
+        results.push(r);
+    }
+
+    print_ablation_comparison(&results);
+
+    // Print the 2×2 matrix for quick reading.
+    println!("\n--- 2x2 Interaction Matrix (Hit@5 / MRR) ---\n");
+    println!("                    | decomp OFF          | decomp ON           |");
+    println!("|--------------------|---------------------|---------------------|");
+    println!(
+        "| fanout OFF          | A: {:>2}/28 / {:.3}     | B: {:>2}/28 / {:.3}     |",
+        results[0].hits, results[0].mrr, results[1].hits, results[1].mrr,
+    );
+    println!(
+        "| fanout ON           | C: {:>2}/28 / {:.3}     | D: {:>2}/28 / {:.3}     |",
+        results[2].hits, results[2].mrr, results[3].hits, results[3].mrr,
+    );
 }

@@ -28,6 +28,80 @@ use crate::types::{edge_to_dict, node_to_dict, EdgeKind, NodeKind};
 const RRF_K: f64 = 60.0;
 
 // ---------------------------------------------------------------------------
+// Ablation configuration for leave-one-out experiments
+// ---------------------------------------------------------------------------
+
+/// Controls which components of the file-mode pipeline are active.
+/// Used for ablation studies to isolate each component's contribution.
+#[derive(Debug, Clone)]
+pub struct AblationConfig {
+    /// Multi-channel fanout (channels 2-6). When false, only KeywordRelaxed is used.
+    pub fanout: bool,
+    /// Graph expansion (1-hop CALLS/CONTAINS from top candidates).
+    pub expansion: bool,
+    /// Conditional priors (test/compiled/multi-source/symbol-path/exact-symbol).
+    pub priors: bool,
+    /// Capped top-k scorer (top*1.5 + 0.3*rest). When false, uses simple sum.
+    pub scorer: bool,
+    /// Query decomposition. When false, all tokens go to domain_terms bucket.
+    pub decomposition: bool,
+    /// Semantic retrieval channel. When false, skips channel 5.
+    pub semantic: bool,
+}
+
+impl AblationConfig {
+    /// Production default. Fanout disabled — ablation study (2×2 interaction
+    /// test) showed fanout × decomposition is a negative interaction that loses
+    /// 2 Hit@5 with no MRR benefit. Config B (fanout OFF, decomposition ON)
+    /// strictly dominates config D (both ON): same MRR, +2 Hit@5, less complexity.
+    pub fn full() -> Self {
+        Self { fanout: false, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
+    }
+
+    /// All components enabled, including fanout. Use for tests that exercise
+    /// specific channels, or for future recalibration experiments.
+    pub fn all_enabled() -> Self {
+        Self { fanout: true, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
+    }
+
+    /// All components enabled except the named one.
+    pub fn without(component: &str) -> Self {
+        let mut cfg = Self::full();
+        match component {
+            "fanout" => cfg.fanout = false,
+            "expansion" => cfg.expansion = false,
+            "priors" => cfg.priors = false,
+            "scorer" => cfg.scorer = false,
+            "decomposition" => cfg.decomposition = false,
+            "semantic" => cfg.semantic = false,
+            _ => {}
+        }
+        cfg
+    }
+
+    /// Human-readable label for this configuration.
+    pub fn label(&self) -> String {
+        let disabled: Vec<&str> = [
+            (!self.fanout, "fanout"),
+            (!self.expansion, "expansion"),
+            (!self.priors, "priors"),
+            (!self.scorer, "scorer"),
+            (!self.decomposition, "decomposition"),
+            (!self.semantic, "semantic"),
+        ]
+        .iter()
+        .filter(|(off, _)| *off)
+        .map(|(_, name)| *name)
+        .collect();
+        if disabled.is_empty() {
+            "full".to_string()
+        } else {
+            format!("-{}", disabled.join(",-"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File-mode fanout+rerank: types
 // ---------------------------------------------------------------------------
 
@@ -190,6 +264,25 @@ fn decompose_query(query: &str) -> QueryParts {
         domain_terms,
         raw: query.to_string(),
         mentions_tests,
+    }
+}
+
+/// Passthrough decomposition: all tokens go to `domain_terms`, no classification.
+/// Used in ablation to isolate the contribution of query decomposition.
+fn decompose_query_passthrough(query: &str) -> QueryParts {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.'))
+        .filter(|t| !t.is_empty())
+        .filter(|t| !FILE_MODE_STOP_WORDS.contains(&t.to_lowercase().as_str()))
+        .map(|t| t.to_lowercase())
+        .collect();
+    QueryParts {
+        symbols: Vec::new(),
+        path_fragments: Vec::new(),
+        domain_terms: terms,
+        raw: query.to_string(),
+        mentions_tests: false,
     }
 }
 
@@ -1263,6 +1356,7 @@ fn fanout_retrieve(
     parts: &QueryParts,
     limit: usize,
     kw_hits: Option<Vec<crate::types::GraphNode>>,
+    ablation: &AblationConfig,
 ) -> Result<HashMap<String, NodeCandidate>> {
     let pool_limit = limit * 5;
     let mut pool: HashMap<String, NodeCandidate> = HashMap::new();
@@ -1271,15 +1365,15 @@ fn fanout_retrieve(
     let relaxed_hits = store.search_nodes_relaxed(&parts.raw, pool_limit)?;
     nodes_to_candidates(&relaxed_hits, CandidateSource::KeywordRelaxed, &mut pool);
 
-    // Channel 2: keyword exact — only when there are symbol tokens.
-    if !parts.symbols.is_empty() {
+    // Channel 2: keyword exact — only when there are symbol tokens and fanout is enabled.
+    if ablation.fanout && !parts.symbols.is_empty() {
         let exact_query = parts.symbols.join(" ");
         let exact_hits = store.search_nodes(&exact_query, pool_limit)?;
         nodes_to_candidates(&exact_hits, CandidateSource::KeywordExact, &mut pool);
     }
 
     // Channel 3: path-boosted — reweight relaxed results for nodes with path-like qualified names.
-    if !parts.path_fragments.is_empty() {
+    if ablation.fanout && !parts.path_fragments.is_empty() {
         let mut path_boosted: Vec<crate::types::GraphNode> = relaxed_hits
             .iter()
             .filter(|n| n.qualified_name.contains('/') || n.qualified_name.contains('.'))
@@ -1299,7 +1393,7 @@ fn fanout_retrieve(
     // Channel 4: config-boosted — reweight relaxed results for Type-kind nodes.
     let config_trigger_terms = ["config", "settings", "options", "env"];
     let triggers_config = parts.domain_terms.iter().any(|t| config_trigger_terms.contains(&t.as_str()));
-    if triggers_config {
+    if ablation.fanout && triggers_config {
         let mut config_boosted: Vec<crate::types::GraphNode> = relaxed_hits
             .iter()
             .filter(|n| matches!(n.kind, NodeKind::Type))
@@ -1315,9 +1409,9 @@ fn fanout_retrieve(
         nodes_to_candidates(&config_boosted, CandidateSource::ConfigBoosted, &mut pool);
     }
 
-    // Channel 5: semantic — only when embeddings are available.
+    // Channel 5: semantic — only when embeddings are available and semantic is enabled.
     let embeddings_available = emb_store.available() && emb_store.count().unwrap_or(0) > 0;
-    if embeddings_available {
+    if ablation.semantic && embeddings_available {
         let sem_hits = crate::embeddings::semantic_search(&parts.raw, store, emb_store, pool_limit, true, root)?;
         let sem_nodes: Vec<crate::types::GraphNode> = sem_hits
             .iter()
@@ -1330,9 +1424,11 @@ fn fanout_retrieve(
         nodes_to_candidates(&sem_nodes, CandidateSource::Semantic, &mut pool);
     }
 
-    // Channel 6: Tantivy — only when pre-computed hits are provided.
-    if let Some(tantivy_nodes) = kw_hits {
-        nodes_to_candidates(&tantivy_nodes, CandidateSource::Tantivy, &mut pool);
+    // Channel 6: Tantivy — only when pre-computed hits are provided and fanout is enabled.
+    if ablation.fanout {
+        if let Some(tantivy_nodes) = kw_hits {
+            nodes_to_candidates(&tantivy_nodes, CandidateSource::Tantivy, &mut pool);
+        }
     }
 
     Ok(pool)
@@ -1440,6 +1536,7 @@ fn aggregate_to_files(
     candidates: HashMap<String, NodeCandidate>,
     parts: &QueryParts,
     limit: usize,
+    ablation: &AblationConfig,
 ) -> Vec<FileResult> {
     // Group by file_path.
     let mut file_map: HashMap<String, Vec<NodeCandidate>> = HashMap::new();
@@ -1456,17 +1553,20 @@ fn aggregate_to_files(
             // Capped top-k base score: top node * 1.5 + 0.3 * sum of next 2.
             // Heavier top-node weighting prevents many weak-match files from beating
             // a file with one strong KeywordExact hit.
-            let base = {
+            // When scorer is ablated, use simple sum of all node scores.
+            let base = if ablation.scorer {
                 let top = nodes[0].score;
                 let rest: f64 = nodes[1..nodes.len().min(3)]
                     .iter()
                     .map(|n| n.score)
                     .sum::<f64>();
                 top * 1.5 + 0.3 * rest
+            } else {
+                nodes.iter().map(|n| n.score).sum::<f64>()
             };
 
             // KeywordExact boost: the query contained the precise symbol name; reward specificity.
-            let exact_symbol_boost = if nodes[0].sources.contains(&CandidateSource::KeywordExact) {
+            let exact_symbol_boost = if ablation.priors && nodes[0].sources.contains(&CandidateSource::KeywordExact) {
                 1.5
             } else {
                 1.0
@@ -1479,10 +1579,10 @@ fn aggregate_to_files(
                 .collect();
             let n_unique_sources = file_sources.len();
 
-            // Conditional priors.
+            // Conditional priors (all neutralized when priors ablation is off).
 
             // Test demotion: 0.5x when ALL nodes are Test-kind AND query doesn't mention tests.
-            let test_prior = if !parts.mentions_tests
+            let test_prior = if ablation.priors && !parts.mentions_tests
                 && nodes.iter().all(|n| matches!(n.kind, NodeKind::Test) || n.is_test)
             {
                 0.5
@@ -1491,7 +1591,7 @@ fn aggregate_to_files(
             };
 
             // Compiled/generated demotion.
-            let compiled_prior = if ["/compiled/", "/node_modules/", "/.next/", "/dist/", "/vendor/"]
+            let compiled_prior = if ablation.priors && ["/compiled/", "/node_modules/", "/.next/", "/dist/", "/vendor/"]
                 .iter()
                 .any(|seg| file_path.contains(seg))
             {
@@ -1501,11 +1601,15 @@ fn aggregate_to_files(
             };
 
             // Multi-source boost.
-            let multi_source = 1.0 + 0.15 * (n_unique_sources.saturating_sub(1)) as f64;
+            let multi_source = if ablation.priors {
+                1.0 + 0.15 * (n_unique_sources.saturating_sub(1)) as f64
+            } else {
+                1.0
+            };
 
             // Symbol-in-path boost: 1.3x if any query symbol appears as a substring of the path.
             let file_path_lower = file_path.to_lowercase();
-            let symbol_path = if parts.symbols.iter().any(|sym| {
+            let symbol_path = if ablation.priors && parts.symbols.iter().any(|sym| {
                 file_path_lower.contains(&sym.to_lowercase())
             }) {
                 1.3
@@ -1673,7 +1777,7 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode, None)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
@@ -1692,6 +1796,7 @@ pub fn hybrid_query_with_store(
     route: Option<&str>,
     debug: Option<bool>,
     result_mode: Option<&str>,
+    ablation: Option<&AblationConfig>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -1713,9 +1818,12 @@ pub fn hybrid_query_with_store(
 
     // --- File mode: fanout+rerank early return ---
     if result_mode_str == "file" {
-        let parts = decompose_query(query);
-        let mut candidates = fanout_retrieve(store, emb_store, root, &parts, limit, keyword_hits)?;
-        expand_candidates(store, &mut candidates, limit)?;
+        let abl = ablation.cloned().unwrap_or_else(AblationConfig::full);
+        let parts = if abl.decomposition { decompose_query(query) } else { decompose_query_passthrough(query) };
+        let mut candidates = fanout_retrieve(store, emb_store, root, &parts, limit, keyword_hits, &abl)?;
+        if abl.expansion {
+            expand_candidates(store, &mut candidates, limit)?;
+        }
         let total_candidates = candidates.len();
         let files_scored = {
             let mut files: HashSet<&str> = HashSet::new();
@@ -1724,7 +1832,7 @@ pub fn hybrid_query_with_store(
             }
             files.len()
         };
-        let file_results = aggregate_to_files(candidates, &parts, limit);
+        let file_results = aggregate_to_files(candidates, &parts, limit, &abl);
         return Ok(file_results_to_json(
             file_results, query, &parts, debug, route, fusion, total_candidates, files_scored,
         ));
@@ -3129,7 +3237,7 @@ mod tests {
         let parts = decompose_query("processRequest fails");
         assert!(!parts.symbols.is_empty(), "processRequest should be detected as symbol");
 
-        let pool = fanout_retrieve(&store, &mut emb_store, &root, &parts, 10, None).unwrap();
+        let pool = fanout_retrieve(&store, &mut emb_store, &root, &parts, 10, None, &AblationConfig::all_enabled()).unwrap();
 
         // The candidate pool must be non-empty (keyword relaxed at minimum).
         assert!(!pool.is_empty(), "fanout pool should not be empty");
@@ -3161,7 +3269,7 @@ mod tests {
         }
 
         let parts = decompose_query("something");
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         assert_eq!(results[0].file_path, "src/a.ts", "strong file should rank first");
@@ -3185,7 +3293,7 @@ mod tests {
         ));
 
         let parts = decompose_query("foo implementation detail");
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         let test_file_rank = results.iter().position(|r| r.file_path.contains("test")).unwrap();
@@ -3232,7 +3340,7 @@ mod tests {
             "cache_reducer should be detected as symbol token"
         );
 
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         // After symbol-path boost the cache_reducer file should rank first.
@@ -3274,7 +3382,7 @@ mod tests {
         }
 
         let parts = decompose_query("coerce_from_fn_pointer");
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         assert_eq!(
@@ -3314,7 +3422,7 @@ mod tests {
         }
 
         let parts = decompose_query("something");
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         assert_eq!(
@@ -3445,7 +3553,7 @@ mod tests {
             "serverPatchReducer should be detected as a symbol"
         );
 
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
         assert!(!results.is_empty(), "should have at least one file result");
 
         let top = &results[0];
@@ -3478,7 +3586,7 @@ mod tests {
         );
 
         let parts = decompose_query("foo");
-        let results = aggregate_to_files(candidates, &parts, 10);
+        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
         assert!(!results.is_empty(), "should have at least one file result");
 
         let top = &results[0];
