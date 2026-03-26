@@ -18,7 +18,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::embeddings::{embed_all_files, embed_all_nodes, semantic_search, EmbeddingStore};
+use crate::embeddings::{embed_all_files, embed_all_nodes, semantic_search, semantic_search_files, EmbeddingStore};
 use crate::error::{CrgError, Result};
 use crate::graph::GraphStore;
 use crate::incremental;
@@ -39,6 +39,9 @@ pub struct AblationConfig {
     pub fanout: bool,
     /// Graph expansion (1-hop CALLS/CONTAINS from top candidates).
     pub expansion: bool,
+    /// Cheap exact channels (symbols, compound_terms, error_strings).
+    /// Independent of fanout — safe to enable on production path.
+    pub exact_channels: bool,
     /// Conditional priors (test/compiled/multi-source/symbol-path/exact-symbol).
     pub priors: bool,
     /// Capped top-k scorer (top*1.5 + 0.3*rest). When false, uses simple sum.
@@ -50,18 +53,17 @@ pub struct AblationConfig {
 }
 
 impl AblationConfig {
-    /// Production default. Fanout disabled — ablation study (2×2 interaction
-    /// test) showed fanout × decomposition is a negative interaction that loses
-    /// 2 Hit@5 with no MRR benefit. Config B (fanout OFF, decomposition ON)
-    /// strictly dominates config D (both ON): same MRR, +2 Hit@5, less complexity.
+    /// Production default. Heavy fanout disabled — ablation study showed
+    /// fanout × decomposition is a negative interaction. But cheap exact
+    /// channels (symbols, compound_terms, error_strings) are always on.
     pub fn full() -> Self {
-        Self { fanout: false, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
+        Self { fanout: false, exact_channels: true, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
     }
 
     /// All components enabled, including fanout. Use for tests that exercise
     /// specific channels, or for future recalibration experiments.
     pub fn all_enabled() -> Self {
-        Self { fanout: true, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
+        Self { fanout: true, exact_channels: true, expansion: true, priors: true, scorer: true, decomposition: true, semantic: true }
     }
 
     /// All components enabled except the named one. Derives from
@@ -70,6 +72,7 @@ impl AblationConfig {
         let mut cfg = Self::all_enabled();
         match component {
             "fanout" => cfg.fanout = false,
+            "exact_channels" => cfg.exact_channels = false,
             "expansion" => cfg.expansion = false,
             "priors" => cfg.priors = false,
             "scorer" => cfg.scorer = false,
@@ -84,6 +87,7 @@ impl AblationConfig {
     pub fn label(&self) -> String {
         let disabled: Vec<&str> = [
             (!self.fanout, "fanout"),
+            (!self.exact_channels, "exact_channels"),
             (!self.expansion, "expansion"),
             (!self.priors, "priors"),
             (!self.scorer, "scorer"),
@@ -132,6 +136,7 @@ enum CandidateSource {
     PathBoosted,
     ConfigBoosted,
     Semantic,
+    FileSemantic,
     Tantivy,
     Expansion,
 }
@@ -144,6 +149,7 @@ impl CandidateSource {
             Self::PathBoosted   => "path_boosted",
             Self::ConfigBoosted => "config_boosted",
             Self::Semantic      => "semantic",
+            Self::FileSemantic  => "file_semantic",
             Self::Tantivy       => "tantivy",
             Self::Expansion     => "expansion",
         }
@@ -1478,7 +1484,8 @@ fn nodes_to_candidates(
 /// 2b. Error strings     — exact search for each quoted/backtick span, when fanout enabled.
 /// 3. Path-boosted       — only when `parts.path_fragments` is non-empty.
 /// 4. Config-boosted     — only when domain_terms contains config/settings/options/env.
-/// 5. Semantic           — only when `emb_store` has embeddings.
+/// 5. Semantic           — only when `emb_store` has node embeddings.
+/// 5b. File-semantic     — top files by embedding similarity, expanded to nodes.
 /// 6. Tantivy            — only when `kw_hits` is `Some`.
 #[allow(clippy::too_many_arguments)]
 fn fanout_retrieve(
@@ -1497,19 +1504,22 @@ fn fanout_retrieve(
     let relaxed_hits = store.search_nodes_relaxed(&parts.raw, pool_limit)?;
     nodes_to_candidates(&relaxed_hits, CandidateSource::KeywordRelaxed, &mut pool);
 
-    // Channel 2: keyword exact — symbols + compound_terms when fanout is enabled.
-    if ablation.fanout && (!parts.symbols.is_empty() || !parts.compound_terms.is_empty()) {
-        let mut exact_terms: Vec<&str> = parts.symbols.iter().map(|s| s.as_str()).collect();
-        for ct in &parts.compound_terms {
-            exact_terms.push(ct.as_str());
-        }
-        let exact_query = exact_terms.join(" ");
+    // Channel 2: keyword exact — symbols only with full fanout (known regression risk).
+    if ablation.fanout && !parts.symbols.is_empty() {
+        let exact_query = parts.symbols.join(" ");
         let exact_hits = store.search_nodes(&exact_query, pool_limit)?;
         nodes_to_candidates(&exact_hits, CandidateSource::KeywordExact, &mut pool);
     }
 
-    // Channel 2b: error strings — exact search per quoted/backtick span.
-    if ablation.fanout && !parts.error_strings.is_empty() {
+    // Channel 2a: compound terms — always-on (cheap, no regression risk).
+    if ablation.exact_channels && !parts.compound_terms.is_empty() {
+        let compound_query = parts.compound_terms.join(" ");
+        let compound_hits = store.search_nodes(&compound_query, pool_limit)?;
+        nodes_to_candidates(&compound_hits, CandidateSource::KeywordExact, &mut pool);
+    }
+
+    // Channel 2b: error strings — exact search per quoted/backtick span (cheap, always-on).
+    if ablation.exact_channels && !parts.error_strings.is_empty() {
         for err_str in &parts.error_strings {
             let err_hits = store.search_nodes(err_str, pool_limit)?;
             nodes_to_candidates(&err_hits, CandidateSource::KeywordExact, &mut pool);
@@ -1566,6 +1576,17 @@ fn fanout_retrieve(
             })
             .collect();
         nodes_to_candidates(&sem_nodes, CandidateSource::Semantic, &mut pool);
+    }
+
+    // Channel 5b: file-semantic — find top files by embedding similarity, then expand to nodes.
+    let file_embeddings_available = emb_store.available() && emb_store.file_count().unwrap_or(0) > 0;
+    if ablation.semantic && file_embeddings_available {
+        let top_files = semantic_search_files(&parts.raw, emb_store, limit)?;
+        for (file_path, _score) in &top_files {
+            if let Ok(nodes) = store.get_nodes_by_file(file_path) {
+                nodes_to_candidates(&nodes, CandidateSource::FileSemantic, &mut pool);
+            }
+        }
     }
 
     // Channel 6: Tantivy — only when pre-computed hits are provided and fanout is enabled.

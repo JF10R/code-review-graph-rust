@@ -1662,6 +1662,38 @@ pub fn embed_all_files(
     Ok(count)
 }
 
+/// Semantic search over file-level embeddings.
+///
+/// Returns top `limit` file paths ranked by cosine similarity to the query,
+/// along with their scores. Used by fanout channel 5b to seed file-first
+/// candidate generation.
+pub fn semantic_search_files(
+    query: &str,
+    emb_store: &mut EmbeddingStore,
+    limit: usize,
+) -> Result<Vec<(String, f64)>> {
+    if emb_store.provider.is_none() || emb_store.file_lookup.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let provider = emb_store.provider.as_ref().expect("checked above");
+    let query_vecs = provider.embed_batch(&[query.to_string()])?;
+    let query_vec = &query_vecs[0];
+
+    let mut scored: Vec<(String, f64)> = emb_store
+        .file_lookup
+        .iter()
+        .filter_map(|(fp, (vec_idx, _))| {
+            emb_store.file_data.vectors.get(*vec_idx).map(|vec| {
+                (fp.clone(), cosine_similarity(query_vec, vec))
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
