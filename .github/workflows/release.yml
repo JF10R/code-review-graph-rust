@@ -14,15 +14,23 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: code-review-graph-linux-amd64
+            features: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             asset: code-review-graph-macos-amd64
+            features: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: code-review-graph-macos-arm64
+            features: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: code-review-graph-windows-amd64.exe
+            features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: code-review-graph-windows-amd64-gpu.exe
+            features: "gpu-directml"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +38,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+          else
+            cargo build --locked --release --target ${{ matrix.target }}
+          fi
       - name: Rename binary
         shell: bash
         run: |
