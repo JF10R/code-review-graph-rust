@@ -118,6 +118,10 @@ struct QueryParts {
     raw: String,
     /// True if any token matches test/spec/fixture/mock/assert (case-insensitive).
     mentions_tests: bool,
+    /// Exact text extracted from quoted or backtick-delimited spans in the query.
+    error_strings: Vec<String>,
+    /// Multi-word technical phrases kept together (e.g., "race condition").
+    compound_terms: Vec<String>,
 }
 
 /// Which evidence channel produced a candidate node.
@@ -204,18 +208,131 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     ".vue", ".svelte", ".toml", ".yaml", ".yml", ".json",
 ];
 
+/// Multi-word technical phrases that carry meaning as a unit.
+const COMPOUND_TECH_TERMS: &[&str] = &[
+    "race condition",
+    "memory leak",
+    "stack overflow",
+    "null pointer",
+    "off by one",
+    "content length",
+    "status code",
+    "error message",
+    "return type",
+    "dead lock",
+    "deadlock",
+    "buffer overflow",
+    "integer overflow",
+    "use after free",
+    "double free",
+    "type error",
+    "syntax error",
+    "import cycle",
+    "circular dependency",
+    "infinite loop",
+    "out of bounds",
+    "index out of bounds",
+    "key error",
+    "value error",
+    "name error",
+    "attribute error",
+    "connection refused",
+    "timeout error",
+    "parse error",
+    "compile error",
+    "link error",
+];
+
 /// Decompose a natural-language query into typed token buckets.
 ///
 /// Tokens are classified as symbols, path fragments, or domain terms.
 /// No camelCase sub-word splitting — symbols stay intact so that exact
 /// searches match nodes named "serverPatchReducer" precisely.
+/// Extract text spans delimited by double-quotes or backticks from a query string.
+/// Returns each matched span's inner content (trimmed), skipping empty spans.
+fn extract_quoted_spans(query: &str) -> Vec<String> {
+    let mut results: Vec<String> = Vec::new();
+    let chars: Vec<char> = query.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        let delim = chars[i];
+        if delim == '"' || delim == '`' {
+            let start = i + 1;
+            let mut j = start;
+            while j < n && chars[j] != delim {
+                j += 1;
+            }
+            if j > start && j < n {
+                let span: String = chars[start..j].iter().collect();
+                let trimmed = span.trim().to_string();
+                if !trimmed.is_empty() {
+                    results.push(trimmed);
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    results
+}
+
+/// Scan the lowercased token sequence for known compound technical terms.
+/// Returns each matched phrase (lowercased, space-separated) without duplicates.
+fn extract_compound_terms(tokens: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+
+    for phrase in COMPOUND_TECH_TERMS {
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        if words.len() == 1 {
+            if tokens.iter().any(|t| t.as_str() == words[0]) && !found.contains(&phrase.to_string()) {
+                found.push(phrase.to_string());
+            }
+            continue;
+        }
+        let wlen = words.len();
+        if tokens.len() >= wlen {
+            for window in tokens.windows(wlen) {
+                let matches = window.iter().zip(words.iter()).all(|(tok, pw)| tok.as_str() == *pw);
+                if matches {
+                    let phrase_str = phrase.to_string();
+                    if !found.contains(&phrase_str) {
+                        found.push(phrase_str);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    found
+}
+
 fn decompose_query(query: &str) -> QueryParts {
+    // Phase 1: extract quoted/backtick spans before tokenising.
+    let error_strings = extract_quoted_spans(query);
+
+    // Strip the quoted spans so their words do not also land in other buckets.
+    let query_stripped = {
+        let mut s = query.to_string();
+        for span in &error_strings {
+            s = s.replace(&format!("\"{}\"", span), " ");
+            s = s.replace(&format!("`{}`", span), " ");
+        }
+        s
+    };
+
     let mut symbols: Vec<String> = Vec::new();
     let mut path_fragments: Vec<String> = Vec::new();
     let mut domain_terms: Vec<String> = Vec::new();
     let mut mentions_tests = false;
+    // Collect lowercase plain tokens for compound-term scanning.
+    let mut plain_tokens: Vec<String> = Vec::new();
 
-    for raw_token in query.split_whitespace() {
+    for raw_token in query_stripped.split_whitespace() {
         // Strip leading/trailing punctuation for classification purposes,
         // but keep the original token for the buckets.
         let token = raw_token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '/' && c != '.');
@@ -248,6 +365,7 @@ fn decompose_query(query: &str) -> QueryParts {
         let all_caps = has_upper && !has_lower && token.len() >= 2;
         if has_underscore || (has_upper && has_lower) || all_caps {
             symbols.push(token.to_string());
+            plain_tokens.push(lower);
             continue;
         }
 
@@ -256,8 +374,12 @@ fn decompose_query(query: &str) -> QueryParts {
             continue;
         }
 
+        plain_tokens.push(lower.clone());
         domain_terms.push(lower);
     }
+
+    // Phase 2: compound term extraction from the plain token sequence.
+    let compound_terms = extract_compound_terms(&plain_tokens);
 
     QueryParts {
         symbols,
@@ -265,6 +387,8 @@ fn decompose_query(query: &str) -> QueryParts {
         domain_terms,
         raw: query.to_string(),
         mentions_tests,
+        error_strings,
+        compound_terms,
     }
 }
 
@@ -284,6 +408,8 @@ fn decompose_query_passthrough(query: &str) -> QueryParts {
         domain_terms: terms,
         raw: query.to_string(),
         mentions_tests: false,
+        error_strings: Vec::new(),
+        compound_terms: Vec::new(),
     }
 }
 
@@ -1347,12 +1473,13 @@ fn nodes_to_candidates(
 /// `NodeCandidate`s keyed by `qualified_name`.
 ///
 /// Channels used:
-/// 1. Keyword relaxed — always run; results are also reused by path/config channels.
-/// 2. Keyword exact  — only when `parts.symbols` is non-empty.
-/// 3. Path-boosted   — only when `parts.path_fragments` is non-empty.
-/// 4. Config-boosted — only when domain_terms contains config/settings/options/env.
-/// 5. Semantic       — only when `emb_store` has embeddings.
-/// 6. Tantivy        — only when `kw_hits` is `Some`.
+/// 1. Keyword relaxed    — always run; results are also reused by path/config channels.
+/// 2. Keyword exact      — symbols + compound_terms, when fanout enabled.
+/// 2b. Error strings     — exact search for each quoted/backtick span, when fanout enabled.
+/// 3. Path-boosted       — only when `parts.path_fragments` is non-empty.
+/// 4. Config-boosted     — only when domain_terms contains config/settings/options/env.
+/// 5. Semantic           — only when `emb_store` has embeddings.
+/// 6. Tantivy            — only when `kw_hits` is `Some`.
 #[allow(clippy::too_many_arguments)]
 fn fanout_retrieve(
     store: &GraphStore,
@@ -1370,11 +1497,23 @@ fn fanout_retrieve(
     let relaxed_hits = store.search_nodes_relaxed(&parts.raw, pool_limit)?;
     nodes_to_candidates(&relaxed_hits, CandidateSource::KeywordRelaxed, &mut pool);
 
-    // Channel 2: keyword exact — only when there are symbol tokens and fanout is enabled.
-    if ablation.fanout && !parts.symbols.is_empty() {
-        let exact_query = parts.symbols.join(" ");
+    // Channel 2: keyword exact — symbols + compound_terms when fanout is enabled.
+    if ablation.fanout && (!parts.symbols.is_empty() || !parts.compound_terms.is_empty()) {
+        let mut exact_terms: Vec<&str> = parts.symbols.iter().map(|s| s.as_str()).collect();
+        for ct in &parts.compound_terms {
+            exact_terms.push(ct.as_str());
+        }
+        let exact_query = exact_terms.join(" ");
         let exact_hits = store.search_nodes(&exact_query, pool_limit)?;
         nodes_to_candidates(&exact_hits, CandidateSource::KeywordExact, &mut pool);
+    }
+
+    // Channel 2b: error strings — exact search per quoted/backtick span.
+    if ablation.fanout && !parts.error_strings.is_empty() {
+        for err_str in &parts.error_strings {
+            let err_hits = store.search_nodes(err_str, pool_limit)?;
+            nodes_to_candidates(&err_hits, CandidateSource::KeywordExact, &mut pool);
+        }
     }
 
     // Channel 3: path-boosted — reweight relaxed results for nodes with path-like qualified names.
@@ -1741,6 +1880,8 @@ fn file_results_to_json(
                 "path_fragments": parts.path_fragments,
                 "domain_terms": parts.domain_terms,
                 "mentions_tests": parts.mentions_tests,
+                "error_strings": parts.error_strings,
+                "compound_terms": parts.compound_terms,
             },
         });
 
@@ -3163,6 +3304,97 @@ mod tests {
             !parts.domain_terms.contains(&"the".to_string()),
             "stop word 'the' should be filtered"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // decompose_query -- error_strings and compound_terms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decompose_extracts_double_quoted_error_string() {
+        let parts = decompose_query(
+            "getting \"SyntaxError: unexpected end of JSON\" on parse",
+        );
+        assert!(
+            parts.error_strings.contains(&"SyntaxError: unexpected end of JSON".to_string()),
+            "double-quoted span should be in error_strings; got {:?}",
+            parts.error_strings
+        );
+        // Words from inside the quotes must not pollute domain_terms.
+        assert!(
+            !parts.domain_terms.contains(&"unexpected".to_string()),
+            "quoted words should not spill into domain_terms; got {:?}",
+            parts.domain_terms
+        );
+    }
+
+    #[test]
+    fn decompose_extracts_backtick_error_string() {
+        let parts = decompose_query("calling `readFile` throws unexpectedly");
+        assert!(
+            parts.error_strings.contains(&"readFile".to_string()),
+            "backtick span should be in error_strings; got {:?}",
+            parts.error_strings
+        );
+    }
+
+    #[test]
+    fn decompose_detects_race_condition_compound_term() {
+        let parts = decompose_query("there is a race condition in the scheduler");
+        assert!(
+            parts.compound_terms.contains(&"race condition".to_string()),
+            "race condition should be in compound_terms; got {:?}",
+            parts.compound_terms
+        );
+    }
+
+    #[test]
+    fn decompose_detects_memory_leak_compound_term() {
+        let parts = decompose_query("suspect memory leak in connection pool");
+        assert!(
+            parts.compound_terms.contains(&"memory leak".to_string()),
+            "memory leak should be in compound_terms; got {:?}",
+            parts.compound_terms
+        );
+    }
+
+    #[test]
+    fn decompose_mixed_symbols_error_string_and_compound_term() {
+        let parts = decompose_query(
+            "parseResponse throws \"invalid JSON\" causing race condition in apiClient",
+        );
+        assert!(
+            parts.symbols.contains(&"parseResponse".to_string()),
+            "parseResponse should be a symbol"
+        );
+        assert!(
+            parts.symbols.contains(&"apiClient".to_string()),
+            "apiClient should be a symbol"
+        );
+        assert!(
+            parts.error_strings.contains(&"invalid JSON".to_string()),
+            "quoted span should be in error_strings; got {:?}",
+            parts.error_strings
+        );
+        assert!(
+            parts.compound_terms.contains(&"race condition".to_string()),
+            "race condition should be in compound_terms; got {:?}",
+            parts.compound_terms
+        );
+        assert!(
+            !parts.domain_terms.contains(&"invalid".to_string()),
+            "quoted words must not spill into domain_terms; got {:?}",
+            parts.domain_terms
+        );
+    }
+
+    #[test]
+    fn decompose_passthrough_has_empty_new_fields() {
+        let parts = decompose_query_passthrough(
+            "parseResponse \"invalid JSON\" race condition",
+        );
+        assert!(parts.error_strings.is_empty(), "passthrough error_strings should be empty");
+        assert!(parts.compound_terms.is_empty(), "passthrough compound_terms should be empty");
     }
 
     // -----------------------------------------------------------------------
