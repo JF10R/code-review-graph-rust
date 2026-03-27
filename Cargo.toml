@@ -26,10 +26,10 @@ tantivy-search = ["dep:tantivy"]
 
 [dependencies]
 # Fast local embeddings via fastembed (default — free, no API key needed)
-fastembed = { version = "4", optional = true }
+fastembed = { version = "5", optional = true }
 
 # GPU acceleration via DirectML (Windows, any GPU)
-ort = { version = "=2.0.0-rc.9", optional = true, features = ["directml"] }
+ort = { version = "2.0.0-rc", optional = true, features = ["directml"] }
 
 # HNSW vector index (optional accelerated search)
 usearch = { version = "2", optional = true }

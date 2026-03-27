@@ -318,7 +318,7 @@ fn text_hash(text: &str) -> [u8; 8] {
 
 #[allow(dead_code)]
 trait EmbeddingProvider: Send + Sync {
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
     fn name(&self) -> &str;
     /// Optional human-readable model identifier (defaults to `name()`).
@@ -348,7 +348,7 @@ impl OpenAiProvider {
 }
 
 impl EmbeddingProvider for OpenAiProvider {
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let body = serde_json::json!({
             "input": texts,
             "model": self.model,
@@ -439,7 +439,7 @@ impl VoyageProvider {
 }
 
 impl EmbeddingProvider for VoyageProvider {
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let body = serde_json::json!({
             "input": texts,
             "model": self.model,
@@ -502,7 +502,7 @@ impl GeminiProvider {
 }
 
 impl EmbeddingProvider for GeminiProvider {
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents?key={}",
             self.model, self.api_key
@@ -623,7 +623,7 @@ impl EmbeddingProvider for FastEmbedProvider {
         768
     }
 
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let embeddings = self
             .model
             .embed(texts.to_vec(), None)
@@ -699,7 +699,7 @@ mod candle_impl {
     }
 
     impl EmbeddingProvider for CandleProvider {
-        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             let mut all_embeddings = Vec::with_capacity(texts.len());
 
             for chunk in texts.chunks(32) {
@@ -1413,7 +1413,7 @@ pub fn embed_all_nodes(
     // Embed new texts in batches.
     let mut all_results: Vec<([u8; 8], Vec<String>, Vec<f32>)> = Vec::new();
     {
-        let provider = emb_store.provider.as_ref().expect("checked above");
+        let provider = emb_store.provider.as_mut().expect("checked above");
         for chunk in need_embed.chunks(100) {
             let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
             let vectors = provider.embed_batch(&texts)?;
@@ -1456,7 +1456,7 @@ pub fn semantic_search(
         return Ok(nodes.iter().map(|n| node_to_dict(n, compact)).collect());
     }
 
-    let provider = emb_store.provider.as_ref().expect("provider checked above");
+    let provider = emb_store.provider.as_mut().expect("provider checked above");
 
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
     let query_vec = &query_vecs[0];
@@ -1638,10 +1638,10 @@ pub fn embed_all_files(
         return Ok(0);
     }
 
-    // Embed in batches (immutable provider borrow), then mutate.
+    // Embed in batches, then mutate store.
     let mut all_results: Vec<([u8; 8], String, Vec<f32>)> = Vec::new();
     {
-        let provider = emb_store.provider.as_ref().expect("checked above");
+        let provider = emb_store.provider.as_mut().expect("checked above");
         for chunk in to_embed.chunks(100) {
             let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
             let vectors = provider.embed_batch(&texts)?;
@@ -1676,7 +1676,7 @@ pub fn semantic_search_files(
         return Ok(Vec::new());
     }
 
-    let provider = emb_store.provider.as_ref().expect("checked above");
+    let provider = emb_store.provider.as_mut().expect("checked above");
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
     let query_vec = &query_vecs[0];
 
