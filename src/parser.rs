@@ -441,7 +441,7 @@ fn get_bases(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
                 }
             }
         }
-        "java" | "csharp" | "kotlin" => {
+        "java" | "kotlin" => {
             for child in node.children(&mut cur) {
                 if matches!(
                     child.kind(),
@@ -454,6 +454,18 @@ fn get_bases(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
                         | "delegation_specifier"
                 ) {
                     bases.push(node_text(&child, source).to_owned());
+                }
+            }
+        }
+        "csharp" => {
+            for child in node.children(&mut cur) {
+                if child.kind() == "base_list" {
+                    let mut c2 = child.walk();
+                    for sub in child.children(&mut c2) {
+                        if matches!(sub.kind(), "identifier" | "generic_name" | "qualified_name") {
+                            bases.push(node_text(&sub, source).to_owned());
+                        }
+                    }
                 }
             }
         }
@@ -1182,6 +1194,38 @@ fn resolve_call_targets_pass(nodes: &[NodeInfo], edges: Vec<EdgeInfo>) -> Vec<Ed
         .collect()
 }
 
+/// Post-pass: reclassify `Inherits` edges as `Implements` when the target is
+/// a known Type node (i.e. an interface).  This works cross-language because
+/// interfaces are tagged `@definition.type` in the `.scm` query files.
+fn reclassify_inheritance_pass(nodes: &[NodeInfo], edges: Vec<EdgeInfo>) -> Vec<EdgeInfo> {
+    let type_names: HashSet<&str> = nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Type)
+        .map(|n| n.name.as_str())
+        .collect();
+
+    edges
+        .into_iter()
+        .map(|e| {
+            if e.kind == EdgeKind::Inherits {
+                // Extract the bare name from the target (last segment after :: or .)
+                let bare = e
+                    .target_qualified
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&e.target_qualified);
+                if type_names.contains(bare) {
+                    return EdgeInfo {
+                        kind: EdgeKind::Implements,
+                        ..e
+                    };
+                }
+            }
+            e
+        })
+        .collect()
+}
+
 fn emit_tested_by_edges(nodes: &[NodeInfo], edges: &[EdgeInfo]) -> Vec<EdgeInfo> {
     let test_qnames: HashSet<&str> = nodes
         .iter()
@@ -1640,6 +1684,7 @@ impl CodeParser {
         extract_from_tree(&root, &ctx, &mut nodes, &mut edges, None, None, 0);
 
         edges = resolve_call_targets_pass(&nodes, edges);
+        edges = reclassify_inheritance_pass(&nodes, edges);
         edges.extend(framework_edges_pass(&nodes, &tree.root_node(), source, language, file_path));
 
         if test_file {
@@ -1729,6 +1774,7 @@ impl CodeParser {
         edges.extend(script_edges);
 
         edges = resolve_call_targets_pass(&nodes, edges);
+        edges = reclassify_inheritance_pass(&nodes, edges);
 
         // Framework-aware edge inference for the Vue script block.
         edges.extend(framework_edges_pass(&nodes, &root, &script_bytes, script_lang, file_path));
@@ -2416,5 +2462,39 @@ export interface ExperimentalConfig {
             .filter(|e| e.kind == EdgeKind::Contains && e.source_qualified.contains("ExperimentalConfig"))
             .collect();
         assert!(contains_edges.len() >= 2, "expected Contains edges from interface to properties");
+    }
+
+    #[test]
+    fn csharp_inheritance_base_list() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class Animal {
+    public virtual void Speak() { }
+}
+public class Dog : Animal {
+    public override void Speak() { }
+}
+"#;
+        let (_, edges) = parse("Animals.cs", src);
+        let inherits: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Inherits).collect();
+        assert!(!inherits.is_empty(), "expected INHERITS edge from Dog to Animal");
+        assert!(inherits.iter().any(|e| e.target_qualified.contains("Animal")),
+            "expected inheritance target to contain 'Animal'");
+    }
+
+    #[test]
+    fn csharp_multiple_bases() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class Base { }
+public class Derived : Base {
+    public void DoStuff() { }
+}
+"#;
+        let (_, edges) = parse("Multi.cs", src);
+        let inherits: Vec<_> = edges.iter()
+            .filter(|e| e.kind == EdgeKind::Inherits || e.kind == EdgeKind::Implements)
+            .collect();
+        assert!(!inherits.is_empty(), "expected inheritance/implements edges");
     }
 }
