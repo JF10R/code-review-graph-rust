@@ -590,10 +590,21 @@ fn extract_imports(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
                 }
             }
         }
-        "java" | "csharp" => {
+        "java" => {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() >= 2 {
                 imports.push(parts.last().unwrap().trim_end_matches(';').to_owned());
+            }
+        }
+        "csharp" => {
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                match child.kind() {
+                    "qualified_name" | "identifier" => {
+                        imports.push(node_text(&child, source).to_owned());
+                    }
+                    _ => {}
+                }
             }
         }
         "ruby" => {
@@ -2416,5 +2427,41 @@ export interface ExperimentalConfig {
             .filter(|e| e.kind == EdgeKind::Contains && e.source_qualified.contains("ExperimentalConfig"))
             .collect();
         assert!(contains_edges.len() >= 2, "expected Contains edges from interface to properties");
+    }
+
+    #[test]
+    fn csharp_using_directive() {
+        if !grammar_available("cs") { return; }
+        let src = "using System.Collections.Generic;\n";
+        let (_, edges) = parse("Program.cs", src);
+        let imports: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ImportsFrom).collect();
+        assert!(!imports.is_empty(), "expected IMPORTS_FROM edge");
+        assert!(imports.iter().any(|e| e.target_qualified == "System.Collections.Generic"),
+            "expected import target 'System.Collections.Generic', got: {:?}",
+            imports.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn csharp_using_static() {
+        if !grammar_available("cs") { return; }
+        let src = "using static System.Math;\n";
+        let (_, edges) = parse("Program.cs", src);
+        let imports: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ImportsFrom).collect();
+        assert!(!imports.is_empty(), "expected IMPORTS_FROM edge for using static");
+        assert!(imports.iter().any(|e| e.target_qualified == "System.Math"),
+            "expected import target 'System.Math', got: {:?}",
+            imports.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn csharp_global_using() {
+        if !grammar_available("cs") { return; }
+        let src = "global using System;\n";
+        let (_, edges) = parse("GlobalUsings.cs", src);
+        let imports: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ImportsFrom).collect();
+        assert!(!imports.is_empty(), "expected IMPORTS_FROM edge for global using");
+        assert!(imports.iter().any(|e| e.target_qualified == "System"),
+            "expected import target 'System', got: {:?}",
+            imports.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
     }
 }
