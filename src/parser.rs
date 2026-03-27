@@ -810,10 +810,12 @@ fn get_call_name(node: &Node, source: &[u8]) -> Option<String> {
 // Qualified name
 // ---------------------------------------------------------------------------
 
-fn qualify(name: &str, file_path: &str, enclosing_class: Option<&str>) -> String {
-    match enclosing_class {
-        Some(cls) => format!("{file_path}::{cls}.{name}"),
-        None => format!("{file_path}::{name}"),
+fn qualify(name: &str, file_path: &str, enclosing_class: Option<&str>, namespace: Option<&str>) -> String {
+    match (namespace, enclosing_class) {
+        (Some(ns), Some(cls)) => format!("{file_path}::{ns}.{cls}.{name}"),
+        (Some(ns), None) => format!("{file_path}::{ns}.{name}"),
+        (None, Some(cls)) => format!("{file_path}::{cls}.{name}"),
+        (None, None) => format!("{file_path}::{name}"),
     }
 }
 
@@ -828,11 +830,11 @@ fn resolve_call_target(
     defined_names: &HashSet<String>,
 ) -> String {
     if defined_names.contains(call_name) {
-        return qualify(call_name, file_path, None);
+        return qualify(call_name, file_path, None, None);
     }
     if let Some(module) = import_map.get(call_name) {
         // Best-effort: qualify against the module path
-        return qualify(call_name, module, None);
+        return qualify(call_name, module, None, None);
     }
     call_name.to_owned()
 }
@@ -893,6 +895,40 @@ fn collect_file_scope(
         }
     }
 
+    // For C#, also scan one level into namespace declarations to find
+    // classes/functions that are not direct children of the root.
+    if language == "csharp" {
+        let mut ns_cur = root.walk();
+        for ns_child in root.children(&mut ns_cur) {
+            if matches!(ns_child.kind(), "namespace_declaration" | "file_scoped_namespace_declaration") {
+                let mut c2 = ns_child.walk();
+                for inner in ns_child.children(&mut c2) {
+                    if inner.kind() == "declaration_list" {
+                        let mut c3 = inner.walk();
+                        for decl in inner.children(&mut c3) {
+                            let nt = decl.kind();
+                            if lt.is_func(nt) || lt.is_class(nt) || lt.is_type(nt) {
+                                if let Some(name) = get_name(&decl, language, "class", source) {
+                                    defined_names.insert(name);
+                                }
+                            }
+                            if lt.is_import(nt) {
+                                collect_import_names(&decl, language, source, &mut import_map);
+                            }
+                        }
+                    }
+                    // file_scoped_namespace_declaration has classes as direct children
+                    let nt = inner.kind();
+                    if lt.is_func(nt) || lt.is_class(nt) || lt.is_type(nt) {
+                        if let Some(name) = get_name(&inner, language, "class", source) {
+                            defined_names.insert(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     (import_map, defined_names)
 }
 
@@ -920,6 +956,7 @@ fn extract_from_tree(
     edges: &mut Vec<EdgeInfo>,
     enclosing_class: Option<&str>,
     enclosing_func: Option<&str>,
+    enclosing_namespace: Option<&str>,
     depth: usize,
 ) {
     if depth > MAX_AST_DEPTH {
@@ -928,16 +965,56 @@ fn extract_from_tree(
 
     let WalkCtx { source, language, file_path, import_map, defined_names, lt } = ctx;
 
+    // Track the active namespace. For file-scoped namespace declarations
+    // (C# `namespace X.Y;`), the classes are siblings rather than children,
+    // so we set the namespace here and let subsequent iterations pick it up.
+    let mut active_ns: Option<String> = enclosing_namespace.map(|s| s.to_owned());
+
     let mut cur = root.walk();
     for child in root.children(&mut cur) {
         let node_type = child.kind();
+
+        // --- C# Namespaces ---
+        if *language == "csharp"
+            && matches!(node_type, "namespace_declaration" | "file_scoped_namespace_declaration")
+        {
+            let ns_name = {
+                let mut c2 = child.walk();
+                let found = child
+                    .children(&mut c2)
+                    .find(|c| matches!(c.kind(), "qualified_name" | "identifier"))
+                    .map(|c| node_text(&c, source).to_owned());
+                found
+            };
+            if let Some(ref ns) = ns_name {
+                let full_ns = match active_ns.as_deref() {
+                    Some(outer) => format!("{outer}.{ns}"),
+                    None => ns.clone(),
+                };
+                if node_type == "file_scoped_namespace_declaration" {
+                    // File-scoped: classes are siblings, not children.
+                    // Set the namespace for subsequent loop iterations.
+                    active_ns = Some(full_ns);
+                } else {
+                    // Block-scoped: classes are children of this node.
+                    // Recurse into the namespace with the full namespace set.
+                    extract_from_tree(
+                        &child, ctx, nodes, edges, enclosing_class, enclosing_func,
+                        Some(&full_ns), depth + 1,
+                    );
+                }
+                continue;
+            }
+        }
+
+        let enc_ns = active_ns.as_deref();
 
         // --- Classes ---
         if lt.is_class(node_type) {
             if let Some(name) = get_name(&child, language, "class", source) {
                 let line_start = child.start_position().row + 1;
                 let line_end = child.end_position().row + 1;
-                let qualified = qualify(&name, file_path, enclosing_class);
+                let qualified = qualify(&name, file_path, enclosing_class, enc_ns);
 
                 nodes.push(NodeInfo {
                     name: name.clone(),
@@ -972,7 +1049,7 @@ fn extract_from_tree(
                     });
                 }
 
-                extract_from_tree(&child, ctx, nodes, edges, Some(&name), None, depth + 1);
+                extract_from_tree(&child, ctx, nodes, edges, Some(&name), None, enc_ns, depth + 1);
                 continue;
             }
         }
@@ -982,7 +1059,7 @@ fn extract_from_tree(
             if let Some(name) = get_name(&child, language, "type", source) {
                 let line_start = child.start_position().row + 1;
                 let line_end = child.end_position().row + 1;
-                let qualified = qualify(&name, file_path, enclosing_class);
+                let qualified = qualify(&name, file_path, enclosing_class, enc_ns);
 
                 nodes.push(NodeInfo {
                     name: name.clone(),
@@ -999,7 +1076,7 @@ fn extract_from_tree(
                 });
 
                 let container = match enclosing_class {
-                    Some(cls) => qualify(cls, file_path, None),
+                    Some(cls) => qualify(cls, file_path, None, enc_ns),
                     None => file_path.to_string(),
                 };
                 edges.push(EdgeInfo {
@@ -1069,7 +1146,7 @@ fn extract_from_tree(
                 };
                 let is_test = has_test_attr || is_test_function(&name, file_path);
                 let kind = if is_test { NodeKind::Test } else { NodeKind::Function };
-                let qualified = qualify(&name, file_path, enclosing_class);
+                let qualified = qualify(&name, file_path, enclosing_class, enc_ns);
                 let line_start = child.start_position().row + 1;
                 let line_end = child.end_position().row + 1;
                 let sig = get_signature(&child, language, source);
@@ -1090,7 +1167,7 @@ fn extract_from_tree(
                 });
 
                 let container = match enclosing_class {
-                    Some(cls) => qualify(cls, file_path, None),
+                    Some(cls) => qualify(cls, file_path, None, enc_ns),
                     None => file_path.to_string(),
                 };
                 edges.push(EdgeInfo {
@@ -1101,7 +1178,7 @@ fn extract_from_tree(
                     line: line_start,
                 });
 
-                extract_from_tree(&child, ctx, nodes, edges, enclosing_class, Some(&name), depth + 1);
+                extract_from_tree(&child, ctx, nodes, edges, enclosing_class, Some(&name), enc_ns, depth + 1);
                 continue;
             }
         }
@@ -1139,7 +1216,7 @@ fn extract_from_tree(
                         Some(d) => format!("{call_name}:{d}"),
                         None => call_name.clone(),
                     };
-                    let qualified = qualify(&synthetic_name, file_path, enclosing_class);
+                    let qualified = qualify(&synthetic_name, file_path, enclosing_class, enc_ns);
                     let line_start = child.start_position().row + 1;
                     let line_end = child.end_position().row + 1;
 
@@ -1158,7 +1235,7 @@ fn extract_from_tree(
                     });
 
                     let container = match enclosing_func {
-                        Some(f) => qualify(f, file_path, enclosing_class),
+                        Some(f) => qualify(f, file_path, enclosing_class, enc_ns),
                         None => file_path.to_string(),
                     };
                     edges.push(EdgeInfo {
@@ -1169,12 +1246,12 @@ fn extract_from_tree(
                         line: line_start,
                     });
 
-                    extract_from_tree(&child, ctx, nodes, edges, enclosing_class, Some(&synthetic_name), depth + 1);
+                    extract_from_tree(&child, ctx, nodes, edges, enclosing_class, Some(&synthetic_name), enc_ns, depth + 1);
                     continue;
                 }
 
                 if let Some(func) = enclosing_func {
-                    let caller = qualify(func, file_path, enclosing_class);
+                    let caller = qualify(func, file_path, enclosing_class, enc_ns);
                     let target =
                         resolve_call_target(&call_name, file_path, import_map, defined_names);
                     edges.push(EdgeInfo {
@@ -1189,7 +1266,7 @@ fn extract_from_tree(
         }
 
         // Recurse into all other nodes
-        extract_from_tree(&child, ctx, nodes, edges, enclosing_class, enclosing_func, depth + 1);
+        extract_from_tree(&child, ctx, nodes, edges, enclosing_class, enclosing_func, enc_ns, depth + 1);
     }
 }
 
@@ -1729,7 +1806,7 @@ impl CodeParser {
             defined_names: &defined_names,
             lt,
         };
-        extract_from_tree(&root, &ctx, &mut nodes, &mut edges, None, None, 0);
+        extract_from_tree(&root, &ctx, &mut nodes, &mut edges, None, None, None, 0);
 
         edges = resolve_call_targets_pass(&nodes, edges);
         edges = reclassify_inheritance_pass(&nodes, edges);
@@ -1802,7 +1879,7 @@ impl CodeParser {
 
         let mut script_nodes: Vec<NodeInfo> = Vec::new();
         let mut script_edges: Vec<EdgeInfo> = Vec::new();
-        extract_from_tree(&root, &ctx, &mut script_nodes, &mut script_edges, None, None, 0);
+        extract_from_tree(&root, &ctx, &mut script_nodes, &mut script_edges, None, None, None, 0);
 
         // Adjust line numbers by the script block's offset within the .vue file.
         // Language is already set to script_lang by extract_from_tree via ctx.language.
@@ -2726,5 +2803,63 @@ public class Service {
         assert!(!func_nodes.is_empty(), "expected function nodes");
         let test_nodes: Vec<_> = nodes.iter().filter(|n| n.is_test).collect();
         assert!(test_nodes.is_empty(), "non-test methods should not be marked as tests");
+    }
+
+    #[test]
+    // -----------------------------------------------------------------------
+    // C#: namespace-aware qualified names
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn csharp_namespace_qualified_name() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+namespace MyApp.Models {
+    public class User {
+        public void Save() { }
+    }
+}
+"#;
+        let (nodes, _) = parse("User.cs", src);
+        let class_node = nodes.iter().find(|n| n.name == "User").expect("expected User class");
+        assert!(class_node.qualified_name.contains("MyApp.Models"),
+            "qualified name '{}' should contain namespace 'MyApp.Models'",
+            class_node.qualified_name);
+        let method_node = nodes.iter().find(|n| n.name == "Save").expect("expected Save method");
+        assert!(method_node.qualified_name.contains("MyApp.Models"),
+            "method qualified name '{}' should contain namespace",
+            method_node.qualified_name);
+    }
+
+    #[test]
+    fn csharp_file_scoped_namespace() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+namespace MyApp.Services;
+
+public class UserService {
+    public void Process() { }
+}
+"#;
+        let (nodes, _) = parse("UserService.cs", src);
+        let class_node = nodes.iter().find(|n| n.name == "UserService").expect("expected UserService class");
+        assert!(class_node.qualified_name.contains("MyApp.Services"),
+            "qualified name '{}' should contain namespace 'MyApp.Services'",
+            class_node.qualified_name);
+    }
+
+    #[test]
+    fn csharp_no_namespace_unchanged() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class TopLevel {
+    public void Run() { }
+}
+"#;
+        let (nodes, _) = parse("TopLevel.cs", src);
+        let class_node = nodes.iter().find(|n| n.name == "TopLevel").expect("expected TopLevel class");
+        // Without namespace, format should be file_path::TopLevel
+        assert_eq!(class_node.qualified_name, "TopLevel.cs::TopLevel",
+            "without namespace, qualified name should be simple");
     }
 }
