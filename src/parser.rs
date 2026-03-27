@@ -275,6 +275,39 @@ fn rust_fn_has_test_attr(parent: &Node, fn_node: &Node, source: &[u8]) -> bool {
     false
 }
 
+/// C# test framework attribute names that mark a method as a test.
+const CSHARP_TEST_ATTRS: &[&str] = &[
+    "Test", "Fact", "Theory", "TestMethod", "TestCase",
+];
+
+/// Returns `true` when a C# method node has a test framework attribute
+/// (`[Test]`, `[Fact]`, `[Theory]`, `[TestMethod]`, `[TestCase]`).
+///
+/// In tree-sitter-c-sharp, `attribute_list` nodes are direct children of
+/// `method_declaration`, containing `attribute` nodes with identifier names.
+fn csharp_fn_has_test_attr(node: &Node, source: &[u8]) -> bool {
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        if child.kind() == "attribute_list" {
+            let mut c2 = child.walk();
+            for attr in child.children(&mut c2) {
+                if attr.kind() == "attribute" {
+                    let mut c3 = attr.walk();
+                    for name_child in attr.children(&mut c3) {
+                        if name_child.kind() == "identifier" {
+                            let name = node_text(&name_child, source);
+                            if CSHARP_TEST_ATTRS.contains(&name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // SHA-256 body hash
 // ---------------------------------------------------------------------------
@@ -1005,8 +1038,11 @@ fn extract_from_tree(
         // --- Functions ---
         if lt.is_func(node_type) {
             if let Some(name) = get_name(&child, language, "function", source) {
-                let has_test_attr = *language == "rust"
-                    && rust_fn_has_test_attr(root, &child, source);
+                let has_test_attr = match *language {
+                    "rust" => rust_fn_has_test_attr(root, &child, source),
+                    "csharp" => csharp_fn_has_test_attr(&child, source),
+                    _ => false,
+                };
                 let is_test = has_test_attr || is_test_function(&name, file_path);
                 let kind = if is_test { NodeKind::Test } else { NodeKind::Function };
                 let qualified = qualify(&name, file_path, enclosing_class);
@@ -2416,5 +2452,68 @@ export interface ExperimentalConfig {
             .filter(|e| e.kind == EdgeKind::Contains && e.source_qualified.contains("ExperimentalConfig"))
             .collect();
         assert!(contains_edges.len() >= 2, "expected Contains edges from interface to properties");
+    }
+
+    #[test]
+    fn csharp_test_attribute_nunit() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+using NUnit.Framework;
+
+[TestFixture]
+public class MyTests {
+    [Test]
+    public void Should_Work() {
+        Assert.Pass();
+    }
+}
+"#;
+        let (nodes, _) = parse("tests/MyTests.cs", src);
+        let test_nodes: Vec<_> = nodes.iter().filter(|n| n.is_test).collect();
+        assert!(!test_nodes.is_empty(), "expected test node for [Test] attributed method");
+        assert!(test_nodes.iter().any(|n| n.name == "Should_Work"),
+            "expected Should_Work to be detected as test");
+    }
+
+    #[test]
+    fn csharp_fact_attribute_xunit() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+using Xunit;
+
+public class CalculatorTests {
+    [Fact]
+    public void Add_Returns_Sum() {
+        Assert.Equal(4, 2 + 2);
+    }
+
+    [Theory]
+    public void Add_Multiple(int a, int b) {
+        Assert.True(a + b > 0);
+    }
+}
+"#;
+        let (nodes, _) = parse("tests/CalculatorTests.cs", src);
+        let test_nodes: Vec<_> = nodes.iter().filter(|n| n.is_test).collect();
+        assert!(test_nodes.len() >= 2, "expected at least 2 test nodes for [Fact] and [Theory]");
+        assert!(test_nodes.iter().any(|n| n.name == "Add_Returns_Sum"), "expected Fact test");
+        assert!(test_nodes.iter().any(|n| n.name == "Add_Multiple"), "expected Theory test");
+    }
+
+    #[test]
+    fn csharp_non_test_method() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class Service {
+    public void Process() {
+        // no test attribute
+    }
+}
+"#;
+        let (nodes, _) = parse("Service.cs", src);
+        let func_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+        assert!(!func_nodes.is_empty(), "expected function nodes");
+        let test_nodes: Vec<_> = nodes.iter().filter(|n| n.is_test).collect();
+        assert!(test_nodes.is_empty(), "non-test methods should not be marked as tests");
     }
 }
