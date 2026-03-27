@@ -725,6 +725,7 @@ fn get_call_name(node: &Node, source: &[u8]) -> Option<String> {
     let member_types = &[
         "attribute",
         "member_expression",
+        "member_access_expression",
         "field_expression",
         "selector_expression",
     ];
@@ -953,16 +954,16 @@ fn extract_from_tree(
                     line: line_start,
                 });
 
-                // For interface declarations, index direct property signatures.
+                // For interface declarations, index direct members (property signatures, methods).
                 if node_type == "interface_declaration" {
-                    // Tree: interface_declaration -> interface_body -> property_signature
-                    // (interface_body is the direct child containing the members)
+                    // Body container varies by language: interface_body (TS), object_type (TS),
+                    // declaration_list (C#)
                     let mut outer_cur = child.walk();
                     for body_child in child.children(&mut outer_cur) {
-                        if body_child.kind() == "interface_body" || body_child.kind() == "object_type" {
+                        if body_child.kind() == "interface_body" || body_child.kind() == "object_type" || body_child.kind() == "declaration_list" {
                             let mut body_cur = body_child.walk();
                             for member in body_child.children(&mut body_cur) {
-                                if member.kind() == "property_signature" {
+                                if member.kind() == "property_signature" || member.kind() == "method_declaration" {
                                     let prop_name = get_name(&member, language, "type", source)
                                         .unwrap_or_default();
                                     if prop_name.is_empty() {
@@ -2416,5 +2417,88 @@ export interface ExperimentalConfig {
             .filter(|e| e.kind == EdgeKind::Contains && e.source_qualified.contains("ExperimentalConfig"))
             .collect();
         assert!(contains_edges.len() >= 2, "expected Contains edges from interface to properties");
+    }
+
+    #[test]
+    fn csharp_basic_class_and_method() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class MyService {
+    public void DoWork() {
+        Console.WriteLine("hello");
+    }
+    public int Calculate(int x) {
+        return x * 2;
+    }
+}
+"#;
+        let (nodes, edges) = parse("Service.cs", src);
+        let class_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Class).collect();
+        assert!(class_nodes.iter().any(|n| n.name == "MyService"), "expected MyService class");
+        let func_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+        assert!(func_nodes.iter().any(|n| n.name == "DoWork"), "expected DoWork method");
+        assert!(func_nodes.iter().any(|n| n.name == "Calculate"), "expected Calculate method");
+        let contains: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Contains).collect();
+        assert!(!contains.is_empty(), "expected CONTAINS edges");
+    }
+
+    #[test]
+    fn csharp_interface_is_type_node() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public interface IRepository {
+    void Save();
+    int Count();
+}
+"#;
+        let (nodes, _) = parse("IRepository.cs", src);
+        let type_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
+        assert!(type_nodes.iter().any(|n| n.name == "IRepository"), "expected IRepository as Type node, not Class");
+        // Should NOT be a Class node
+        let class_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Class && n.name == "IRepository").collect();
+        assert!(class_nodes.is_empty(), "IRepository should not be a Class node");
+    }
+
+    #[test]
+    fn csharp_record_declaration() {
+        if !grammar_available("cs") { return; }
+        let src = "public record Person(string Name, int Age);\n";
+        let (nodes, _) = parse("Person.cs", src);
+        let class_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Class).collect();
+        assert!(class_nodes.iter().any(|n| n.name == "Person"), "expected Person record as Class node");
+    }
+
+    #[test]
+    fn csharp_member_access_call() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class Foo {
+    public void Bar() {
+        Console.WriteLine("test");
+        var result = list.Where(x => x > 0).Select(x => x * 2);
+    }
+}
+"#;
+        let (_, edges) = parse("Foo.cs", src);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert!(!calls.is_empty(), "expected CALLS edges for member access expressions");
+        // Should have calls for WriteLine, Where, Select
+        let call_targets: Vec<&str> = calls.iter().map(|e| e.target_qualified.as_str()).collect();
+        assert!(call_targets.iter().any(|t| t.contains("WriteLine")), "expected WriteLine call");
+    }
+
+    #[test]
+    fn csharp_property_indexed() {
+        if !grammar_available("cs") { return; }
+        let src = r#"
+public class Config {
+    public string Name { get; set; }
+    public int Value { get; set; }
+}
+"#;
+        let (nodes, _) = parse("Config.cs", src);
+        let func_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+        assert!(func_nodes.iter().any(|n| n.name == "Name"), "expected Name property as Function node");
+        assert!(func_nodes.iter().any(|n| n.name == "Value"), "expected Value property as Function node");
     }
 }
