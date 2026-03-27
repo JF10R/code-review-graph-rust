@@ -170,6 +170,8 @@ struct NodeCandidate {
     is_test: bool,
     score: f64,
     sources: HashSet<CandidateSource>,
+    line_start: usize,
+    line_end: usize,
 }
 
 /// A file-level result with aggregated score and top supporting nodes.
@@ -1394,43 +1396,93 @@ pub fn get_docs_section(section_name: &str, repo_root: Option<&str>) -> Result<V
 pub(crate) enum QueryRoute {
     ExactSymbol,  // camelCase, PascalCase, snake_case identifiers
     FilePath,     // contains / or file extensions
+    ExactText,    // quoted strings, error snippets, literal spans
     Causal,       // "why", "how does", "where does" patterns
     ConfigLookup, // config-related terms
     General,      // default fallback
 }
 
+/// Lightweight signals extracted during classification.
+/// These describe surface-form properties of the query (not retrieval strategy).
+#[derive(Debug, Default)]
+pub(crate) struct QuerySignals {
+    pub has_quoted_span: bool,
+    pub has_error_text: bool,
+    pub has_path_hint: bool,
+    pub has_identifier_hint: bool,
+}
+
 pub(crate) struct Classification {
     pub route: QueryRoute,
     pub confidence: f64, // 0.0 to 1.0
+    pub signals: QuerySignals,
 }
+
+/// Common error type prefixes that signal a pasted error message.
+const ERROR_PREFIXES: &[&str] = &[
+    "typeerror:", "syntaxerror:", "valueerror:", "referenceerror:",
+    "rangeerror:", "nameerror:", "attributeerror:", "keyerror:",
+    "indexerror:", "importerror:", "runtimeerror:", "oserror:",
+    "ioerror:", "connectionerror:", "timeouterror:", "overflowerror:",
+    "zerodivisionerror:", "filenotfounderror:", "permissionerror:",
+    "error:", "exception:", "panic:", "fatal:", "failed:",
+    "error[e", // Rust compiler errors like error[E0308]
+];
+
+/// Stack-trace indicators that suggest a pasted error/trace.
+const TRACE_INDICATORS: &[&str] = &[
+    "traceback", "at line ", "  at ", "caused by:", "note: ",
+    "assertion failed", "thread '", "stack trace:",
+];
 
 pub(crate) fn classify_query(query: &str) -> Classification {
     let trimmed = query.trim();
     let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let lower = trimmed.to_lowercase();
 
-    // Single token that looks like an identifier (camelCase, PascalCase, snake_case)
+    // Build signals incrementally.
+    let mut signals = QuerySignals::default();
+
+    // Detect quoted spans (reuse existing extract_quoted_spans).
+    let quoted_spans = extract_quoted_spans(trimmed);
+    signals.has_quoted_span = !quoted_spans.is_empty();
+
+    // Detect error text patterns.
+    signals.has_error_text = ERROR_PREFIXES.iter().any(|p| lower.starts_with(p))
+        || TRACE_INDICATORS.iter().any(|t| lower.contains(t));
+
+    // Detect path hints (file extensions or slashes).
+    signals.has_path_hint = SOURCE_EXTENSIONS.iter().any(|ext| trimmed.contains(ext))
+        || trimmed.contains('/');
+
+    // Detect identifier hints (camelCase, PascalCase, snake_case single tokens).
     if words.len() == 1 {
         let word = words[0];
-        let has_uppercase = word.chars().any(|c| c.is_uppercase());
-        let has_lowercase = word.chars().any(|c| c.is_lowercase());
+        let has_upper = word.chars().any(|c| c.is_uppercase());
+        let has_lower = word.chars().any(|c| c.is_lowercase());
         let has_underscore = word.contains('_');
-        if (has_uppercase && has_lowercase) || has_underscore {
-            return Classification { route: QueryRoute::ExactSymbol, confidence: 0.9 };
-        }
+        signals.has_identifier_hint = (has_upper && has_lower) || has_underscore;
     }
 
-    // Contains file path indicators
-    if trimmed.contains('/')
-        || trimmed.contains(".ts")
-        || trimmed.contains(".js")
-        || trimmed.contains(".tsx")
-        || trimmed.contains(".rs")
-    {
-        return Classification { route: QueryRoute::FilePath, confidence: 0.85 };
+    // --- Routing decisions (priority order) ---
+
+    // 1. Single identifier token → ExactSymbol
+    if signals.has_identifier_hint {
+        return Classification { route: QueryRoute::ExactSymbol, confidence: 0.9, signals };
     }
 
-    // Causal/architectural patterns
-    let lower = trimmed.to_lowercase();
+    // 2. Quoted spans or error text → ExactText
+    if signals.has_quoted_span || signals.has_error_text {
+        let confidence = if signals.has_quoted_span { 0.85 } else { 0.8 };
+        return Classification { route: QueryRoute::ExactText, confidence, signals };
+    }
+
+    // 3. File path indicators → FilePath
+    if signals.has_path_hint {
+        return Classification { route: QueryRoute::FilePath, confidence: 0.85, signals };
+    }
+
+    // 4. Causal/architectural patterns
     if lower.starts_with("why ")
         || lower.starts_with("how does ")
         || lower.starts_with("where does ")
@@ -1438,21 +1490,21 @@ pub(crate) fn classify_query(query: &str) -> Classification {
         || lower.contains("included in")
         || lower.contains("loaded by")
     {
-        return Classification { route: QueryRoute::Causal, confidence: 0.8 };
+        return Classification { route: QueryRoute::Causal, confidence: 0.8, signals };
     }
 
-    // Config-related terms
+    // 5. Config-related terms
     let config_terms = ["config", "option", "setting", "experimental", "flag", "enable", "disable"];
     let config_matches = config_terms.iter().filter(|t| lower.contains(*t)).count();
     if config_matches >= 2 {
-        return Classification { route: QueryRoute::ConfigLookup, confidence: 0.75 };
+        return Classification { route: QueryRoute::ConfigLookup, confidence: 0.75, signals };
     }
     if config_matches == 1 && words.len() <= 4 {
-        return Classification { route: QueryRoute::ConfigLookup, confidence: 0.6 };
+        return Classification { route: QueryRoute::ConfigLookup, confidence: 0.6, signals };
     }
 
-    // Default: general hybrid
-    Classification { route: QueryRoute::General, confidence: 0.5 }
+    // 6. Default: general hybrid
+    Classification { route: QueryRoute::General, confidence: 0.5, signals }
 }
 
 // ---------------------------------------------------------------------------
@@ -1475,6 +1527,8 @@ fn nodes_to_candidates(
             is_test: node.is_test,
             score: 0.0,
             sources: HashSet::new(),
+            line_start: node.line_start,
+            line_end: node.line_end,
         });
         entry.score += rrf_score;
         entry.sources.insert(source);
@@ -1654,6 +1708,8 @@ fn expand_candidates(
                 is_test: node.is_test,
                 score,
                 sources: HashSet::from([CandidateSource::Expansion]),
+                line_start: node.line_start,
+                line_end: node.line_end,
             },
         );
         added += 1;
@@ -1813,8 +1869,8 @@ fn aggregate_to_files(
                         name: short_name,
                         qualified_name: n.qualified_name.clone(),
                         kind: n.kind.as_str().to_string(),
-                        line_start: 0, // populated below from the store if needed; see note
-                        line_end: 0,
+                        line_start: n.line_start,
+                        line_end: n.line_end,
                         score: n.score,
                         sources: n.sources.iter().map(|s| s.as_str().to_string()).collect(),
                         matched_terms,
@@ -1839,6 +1895,10 @@ fn aggregate_to_files(
 
 /// Serialise file-level results into the MCP response JSON.
 #[allow(clippy::too_many_arguments)]
+/// Maximum lines of source preview per file result.
+const PREVIEW_LINES: usize = 5;
+
+#[allow(clippy::too_many_arguments)]
 fn file_results_to_json(
     results: Vec<FileResult>,
     query: &str,
@@ -1848,6 +1908,8 @@ fn file_results_to_json(
     fusion: Option<&str>,
     total_candidates: usize,
     files_scored: usize,
+    include_preview: bool,
+    root: &Utf8Path,
 ) -> Value {
     let result_arr: Vec<Value> = results
         .iter()
@@ -1869,12 +1931,44 @@ fn file_results_to_json(
                     "is_test": n.is_test,
                 })
             }).collect();
-            json!({
+            let mut entry = json!({
                 "file_path": r.file_path,
                 "score": r.score,
                 "sources": sources,
                 "top_nodes": top_nodes,
-            })
+            });
+
+            // Attach source preview from the top-scoring node in this file.
+            // file_path is already absolute (from the graph); root is available as fallback.
+            if include_preview {
+                if let Some(top_node) = r.top_nodes.first() {
+                    let abs_path = if r.file_path.starts_with('/') || r.file_path.contains(':') {
+                        r.file_path.clone()
+                    } else {
+                        root.join(&r.file_path).to_string()
+                    };
+                    if let Ok(content) = std::fs::read_to_string(&abs_path) {
+                        let lines: Vec<&str> = content.lines().collect();
+                        let start = top_node.line_start.saturating_sub(1);
+                        let end = top_node.line_end.min(lines.len());
+                        let available = end.saturating_sub(start);
+                        let take = available.min(PREVIEW_LINES);
+                        let truncated = available > PREVIEW_LINES;
+                        let preview: String = lines[start..start + take]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, line)| format!("{:>4} | {}", start + i + 1, line))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if let Some(obj) = entry.as_object_mut() {
+                            obj.insert("source_preview".to_string(), json!(preview));
+                            obj.insert("preview_truncated".to_string(), json!(truncated));
+                        }
+                    }
+                }
+            }
+
+            entry
         })
         .collect();
 
@@ -2034,13 +2128,40 @@ pub fn hybrid_query_with_store(
         };
         let file_results = aggregate_to_files(candidates, &parts, effective_limit, &abl);
         let results_capped = is_fast && limit > effective_limit;
+
+        // Classify query for metadata and preview decisions (does not affect retrieval).
+        let classification = classify_query(query);
+        let should_preview = is_fast
+            && effective_limit <= 3
+            && matches!(classification.route, QueryRoute::ExactSymbol | QueryRoute::FilePath | QueryRoute::ExactText);
+
         let mut response = file_results_to_json(
             file_results, query, &parts, debug, route, fusion, total_candidates, files_scored,
+            should_preview, root,
         );
-        // Inject budget metadata and repo profile.
+        // Inject budget metadata, repo profile, and classification info.
         if let Some(obj) = response.as_object_mut() {
             obj.insert("repo_profile".to_string(), repo_profile);
             obj.insert("budget".to_string(), json!(budget_str));
+            obj.insert("route".to_string(), json!(format!("{:?}", classification.route)));
+            obj.insert("confidence".to_string(), json!(classification.confidence));
+            obj.insert("match_type".to_string(), json!(match classification.route {
+                QueryRoute::ExactSymbol => "exact_symbol_match",
+                QueryRoute::FilePath => "filepath_match",
+                QueryRoute::ExactText => "exact_text_match",
+                QueryRoute::ConfigLookup => "config_match",
+                QueryRoute::Causal => "causal_query",
+                QueryRoute::General => "general",
+            }));
+            obj.insert("query_signals".to_string(), json!({
+                "has_quoted_span": classification.signals.has_quoted_span,
+                "has_error_text": classification.signals.has_error_text,
+                "has_path_hint": classification.signals.has_path_hint,
+                "has_identifier_hint": classification.signals.has_identifier_hint,
+            }));
+            if should_preview {
+                obj.insert("preview_included".to_string(), json!(true));
+            }
             if results_capped {
                 obj.insert("results_capped".to_string(), json!(true));
             }
@@ -2071,6 +2192,7 @@ pub fn hybrid_query_with_store(
                 _ => QueryRoute::General, // "legacy"
             },
             confidence: 1.0,
+            signals: QuerySignals::default(),
         }
     };
 
@@ -2147,6 +2269,20 @@ pub fn hybrid_query_with_store(
             scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             scores.truncate(limit);
             (Some("keyword_config_boosted"), scores)
+        }
+
+        QueryRoute::ExactText => {
+            // Keyword-only: literal text search for quoted/error spans
+            let mut scores: Vec<(String, f64)> = keyword_hits
+                .iter()
+                .enumerate()
+                .map(|(rank, node)| {
+                    let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                    (node.qualified_name.clone(), score)
+                })
+                .collect();
+            scores.truncate(limit);
+            (Some("keyword_exact_text"), scores)
         }
 
         QueryRoute::Causal | QueryRoute::General => (None, vec![]),
@@ -3309,6 +3445,65 @@ mod tests {
         assert!(c.confidence < 0.6 || matches!(c.route, QueryRoute::General));
     }
 
+    #[test]
+    fn classify_quoted_span_as_exact_text() {
+        let c = classify_query("\"SyntaxError: unexpected end of JSON\"");
+        assert!(matches!(c.route, QueryRoute::ExactText), "quoted span should be ExactText, got {:?}", c.route);
+        assert!(c.signals.has_quoted_span);
+        assert!(c.confidence >= 0.8);
+    }
+
+    #[test]
+    fn classify_error_prefix_as_exact_text() {
+        let c = classify_query("TypeError: Cannot read properties of undefined");
+        assert!(matches!(c.route, QueryRoute::ExactText), "error prefix should be ExactText, got {:?}", c.route);
+        assert!(c.signals.has_error_text);
+    }
+
+    #[test]
+    fn classify_rust_error_code_as_exact_text() {
+        let c = classify_query("error[E0308]: mismatched types");
+        assert!(matches!(c.route, QueryRoute::ExactText), "Rust error should be ExactText, got {:?}", c.route);
+        assert!(c.signals.has_error_text);
+    }
+
+    #[test]
+    fn classify_panic_as_exact_text() {
+        let c = classify_query("panic: index out of bounds: the len is 5 but the index is 7");
+        assert!(matches!(c.route, QueryRoute::ExactText), "panic should be ExactText, got {:?}", c.route);
+        assert!(c.signals.has_error_text);
+    }
+
+    #[test]
+    fn classify_traceback_as_exact_text() {
+        let c = classify_query("Traceback (most recent call last)");
+        assert!(matches!(c.route, QueryRoute::ExactText), "traceback should be ExactText, got {:?}", c.route);
+        assert!(c.signals.has_error_text);
+    }
+
+    #[test]
+    fn classify_backtick_span_as_exact_text() {
+        let c = classify_query("`invalid JSON` handling");
+        assert!(matches!(c.route, QueryRoute::ExactText), "backtick span should be ExactText, got {:?}", c.route);
+        assert!(c.signals.has_quoted_span);
+    }
+
+    #[test]
+    fn classify_signals_populated_on_identifier() {
+        let c = classify_query("turbopackUseBuiltinSass");
+        assert!(c.signals.has_identifier_hint);
+        assert!(!c.signals.has_quoted_span);
+        assert!(!c.signals.has_error_text);
+        assert!(!c.signals.has_path_hint);
+    }
+
+    #[test]
+    fn classify_signals_populated_on_path() {
+        let c = classify_query("src/tools.rs");
+        assert!(c.signals.has_path_hint);
+        assert!(!c.signals.has_identifier_hint);
+    }
+
     // -----------------------------------------------------------------------
     // decompose_query
     // -----------------------------------------------------------------------
@@ -3478,6 +3673,8 @@ mod tests {
             is_test: matches!(kind, NodeKind::Test),
             score,
             sources,
+            line_start: 1,
+            line_end: 1,
         }
     }
 
@@ -3794,7 +3991,7 @@ mod tests {
         // method field must be one of the existing node-mode methods.
         let method = val["method"].as_str().unwrap_or("");
         assert!(
-            ["keyword_only", "hybrid_rrf", "hybrid_cc", "keyword_path_boosted", "keyword_config_boosted"]
+            ["keyword_only", "hybrid_rrf", "hybrid_cc", "keyword_path_boosted", "keyword_config_boosted", "keyword_exact_text"]
                 .contains(&method),
             "node mode method should be a known node-mode method; got {method}"
         );
@@ -3830,6 +4027,118 @@ mod tests {
         assert!(debug.get("query_parts").is_some(), "_debug must contain query_parts");
         assert!(debug.get("total_candidates").is_some(), "_debug must contain total_candidates");
         assert!(debug.get("files_scored").is_some(), "_debug must contain files_scored");
+    }
+
+    #[test]
+    fn file_mode_fast_exact_symbol_includes_preview() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("handler.py"),
+            b"def handleRequest(req):\n    validate(req)\n    process(req)\n    return respond(req)\n\ndef validate(req):\n    pass\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        // budget="fast" (default when omitted), single identifier → ExactSymbol → should include preview
+        let result = hybrid_query(
+            "handleRequest",
+            5,
+            Some(&path),
+            true,  // compact
+            None,  // fusion
+            None,  // route
+            None,  // debug
+            None,  // result_mode (fast mode forces file)
+            None,  // budget (defaults to "fast")
+        );
+        assert!(result.is_ok(), "fast exact query should succeed: {:?}", result);
+        let val = result.unwrap();
+        assert_eq!(val["status"], "ok");
+        // Metadata fields
+        assert_eq!(val["match_type"], "exact_symbol_match");
+        assert!(val["confidence"].as_f64().unwrap() >= 0.8);
+        assert_eq!(val["preview_included"], true);
+        assert!(val["query_signals"]["has_identifier_hint"].as_bool().unwrap());
+        // Check preview on first result
+        let results = val["results"].as_array().unwrap();
+        if !results.is_empty() {
+            let first = &results[0];
+            let preview = first["source_preview"].as_str()
+                .expect("first result should have source_preview");
+            assert!(preview.contains("handleRequest"), "preview should contain the function: {preview}");
+            assert!(first.get("preview_truncated").is_some(), "preview_truncated must be present");
+        }
+    }
+
+    #[test]
+    fn file_mode_fast_quoted_span_includes_preview() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("errors.py"),
+            b"def handle_error(msg):\n    if 'invalid JSON' in msg:\n        raise ValueError(msg)\n    return msg\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        let result = hybrid_query(
+            "\"invalid JSON\"",
+            5,
+            Some(&path),
+            true, None, None, None, None, None,
+        );
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["match_type"], "exact_text_match");
+        assert!(val["query_signals"]["has_quoted_span"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn file_mode_thorough_does_not_include_preview() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("handler.py"),
+            b"def handleRequest(req): return req\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        // budget="thorough" → should NOT include preview
+        let result = hybrid_query(
+            "handleRequest",
+            5,
+            Some(&path),
+            true, None, None, None, Some("file"), Some("thorough"),
+        );
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert!(val.get("preview_included").is_none(), "thorough mode should not include preview");
+        let results = val["results"].as_array().unwrap();
+        if !results.is_empty() {
+            assert!(results[0].get("source_preview").is_none(), "thorough results should not have source_preview");
+        }
+    }
+
+    #[test]
+    fn file_mode_causal_does_not_include_preview() {
+        let (dir, path) = make_git_repo();
+        fs::write(
+            dir.path().join("cache.py"),
+            b"def invalidate_cache(key): pass\n",
+        )
+        .unwrap();
+        build_or_update_graph(true, Some(&path), "HEAD").unwrap();
+
+        // Causal query → should NOT include preview even in fast mode
+        let result = hybrid_query(
+            "why does cache invalidation fail",
+            5,
+            Some(&path),
+            true, None, None, None, None, None,
+        );
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_ne!(val.get("match_type").and_then(|v| v.as_str()), Some("exact_symbol_match"));
+        assert!(val.get("preview_included").is_none(), "causal query should not include preview");
     }
 
     // -----------------------------------------------------------------------
@@ -3887,6 +4196,8 @@ mod tests {
                 is_test: true,
                 score: 0.05,
                 sources,
+                line_start: 1,
+                line_end: 5,
             },
         );
 
@@ -3963,6 +4274,8 @@ mod tests {
                 is_test: false,
                 score: 1.0,
                 sources,
+                line_start: 1,
+                line_end: 1,
             },
         );
 
@@ -4023,6 +4336,8 @@ mod tests {
                 is_test: false,
                 score: 1.0,
                 sources,
+                line_start: 1,
+                line_end: 1,
             },
         );
 
