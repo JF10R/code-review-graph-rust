@@ -15,9 +15,11 @@
 use rmcp::{
     ServerHandler,
     handler::server::router::tool::ToolRouter,
+    handler::server::tool::ToolCallContext,
     handler::server::wrapper::Parameters,
-    model::{ServerCapabilities, ServerInfo},
-    schemars, serve_server, tool, tool_handler, tool_router,
+    model::{CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
+    schemars, serve_server, tool, tool_router,
+    service::{RequestContext, RoleServer},
     transport,
 };
 use serde::Deserialize;
@@ -648,28 +650,38 @@ pub struct CodeReviewServer {
     tool_router: ToolRouter<Self>,
     /// Channel to the worker thread. None only in unit-test / CLI shim contexts.
     worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>,
+    /// When false (default), list_tools returns only core 3 tools.
+    /// When true (--tools all), list_tools returns all 13 tools.
+    expose_all_tools: bool,
 }
 
 impl std::fmt::Debug for CodeReviewServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodeReviewServer")
             .field("repo_root", &self.repo_root)
+            .field("expose_all_tools", &self.expose_all_tools)
             .finish_non_exhaustive()
     }
 }
 
 impl CodeReviewServer {
-    fn new_inner(repo_root: Option<String>, worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>) -> Self {
+    fn new_inner(
+        repo_root: Option<String>,
+        worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>,
+        expose_all_tools: bool,
+    ) -> Self {
         Self {
             repo_root: repo_root.map(Arc::new),
             tool_router: Self::tool_router(),
             worker_tx,
+            expose_all_tools,
         }
     }
 
     /// CLI / test constructor — no worker thread, falls back to spawn_blocking.
+    /// Defaults to expose_all_tools=true for backward compat with non-MCP callers.
     pub fn new(repo_root: Option<String>) -> Self {
-        Self::new_inner(repo_root, None)
+        Self::new_inner(repo_root, None, true)
     }
 
     /// Resolve the effective repo root: prefer the per-call value, fall back to
@@ -1061,7 +1073,8 @@ impl CodeReviewServer {
 // ServerHandler implementation (wired to the tool router)
 // ---------------------------------------------------------------------------
 
-#[tool_handler(router = self.tool_router)]
+const CORE_TOOLS: &[&str] = &["hybrid_query", "open_node_context", "query_graph"];
+
 impl ServerHandler for CodeReviewServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -1075,13 +1088,40 @@ impl ServerHandler for CodeReviewServer {
              - Grep/Read: exact filename, symbol name, or string literal lookups\n\
              - Graph tools: structural queries (who calls X?), semantic/conceptual search, cross-file tracing\n\n\
              RECOMMENDED WORKFLOW:\n\
-             1. hybrid_query — best first call for broad discovery (combines keyword + semantic + structural channels)\n\
-             2. open_node_context — after finding a function, get its source + callers + callees in one call (replaces search → query_graph → Read)\n\
-             3. trace_call_chain(from, to) — trace how function A reaches function B\n\
-             4. query_graph(callers_of/callees_of) — explore call relationships\n\
-             5. Switch to Read/Grep for detailed code analysis after discovery\n\n\
-             Always pass compact: true. Limit to 3-5 MCP calls for discovery, then Read/Grep for details.",
+             1. hybrid_query -- best first call for broad discovery\n\
+             2. open_node_context -- after finding a function, get source + callers + callees in one call\n\
+             3. query_graph(callers_of/callees_of) -- follow specific structural edges\n\
+             Then switch to Read/Grep for detailed code analysis.",
         )
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        let all = self.tool_router.list_all();
+        let tools = if self.expose_all_tools {
+            all
+        } else {
+            all.into_iter()
+                .filter(|t| CORE_TOOLS.contains(&t.name.as_ref()))
+                .collect()
+        };
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_router.get(name).cloned()
     }
 }
 
@@ -1238,7 +1278,7 @@ fn run_watcher_notifier(
 }
 
 /// Run the MCP server over stdio. Blocks until the client disconnects.
-pub async fn run_server(repo_root: Option<String>) -> crate::error::Result<()> {
+pub async fn run_server(repo_root: Option<String>, tool_mode: &str) -> crate::error::Result<()> {
     // Resolve the repository root once.
     let root = resolve_root(repo_root.as_deref());
 
@@ -1265,7 +1305,7 @@ pub async fn run_server(repo_root: Option<String>) -> crate::error::Result<()> {
         None
     };
 
-    let server = CodeReviewServer::new_inner(repo_root, worker_tx);
+    let server = CodeReviewServer::new_inner(repo_root, worker_tx, tool_mode == "all");
     let (stdin, stdout) = transport::io::stdio();
     serve_server(server, (stdin, stdout))
         .await
