@@ -1,5 +1,6 @@
 ---
 source: tests/integration.rs
+assertion_line: 673
 expression: result
 ---
 {
@@ -9,31 +10,28 @@ expression: result
   ],
   "changed_nodes": [
     {
-      "file_path": "[path]",
+      "file": "[path]",
       "kind": "File",
-      "line_end": 7,
-      "line_start": 1,
+      "lines": "1-7",
       "name": "[path]",
-      "qualified_name": "[path]",
-      "signature": ""
+      "qn": "[path]",
+      "sig": ""
     },
     {
-      "file_path": "[path]",
+      "file": "[path]",
       "kind": "Function",
-      "line_end": 3,
-      "line_start": 2,
+      "lines": "2-3",
       "name": "add",
-      "qualified_name": "[path]",
-      "signature": "(a, b)"
+      "qn": "[path]",
+      "sig": "(a, b)"
     },
     {
-      "file_path": "[path]",
+      "file": "[path]",
       "kind": "Function",
-      "line_end": 6,
-      "line_start": 5,
+      "lines": "5-6",
       "name": "subtract",
-      "qualified_name": "[path]",
-      "signature": "(a, b)"
+      "qn": "[path]",
+      "sig": "(a, b)"
     }
   ],
   "edges": [

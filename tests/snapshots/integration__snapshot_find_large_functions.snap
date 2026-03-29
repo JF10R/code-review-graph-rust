@@ -1,97 +1,90 @@
 ---
 source: tests/integration.rs
+assertion_line: 650
 expression: result
 ---
 {
   "min_lines": 1,
   "results": [
     {
-      "file_path": "[path]",
+      "file": "service.ts",
       "kind": "File",
       "line_count": 9,
-      "line_end": 9,
-      "line_start": 1,
+      "lines": "1-9",
       "name": "[path]",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "service.ts",
-      "signature": ""
+      "sig": ""
     },
     {
-      "file_path": "[path]",
+      "file": "main.py",
       "kind": "File",
       "line_count": 8,
-      "line_end": 8,
-      "line_start": 1,
+      "lines": "1-8",
       "name": "[path]",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "main.py",
-      "signature": ""
+      "sig": ""
     },
     {
-      "file_path": "[path]",
+      "file": "utils.py",
       "kind": "File",
       "line_count": 7,
-      "line_end": 7,
-      "line_start": 1,
+      "lines": "1-7",
       "name": "[path]",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "utils.py",
-      "signature": ""
+      "sig": ""
     },
     {
-      "file_path": "[path]",
+      "file": "utils.py",
       "kind": "Function",
       "line_count": 2,
-      "line_end": 3,
-      "line_start": 2,
+      "lines": "2-3",
       "name": "add",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "utils.py",
-      "signature": "(a, b)"
+      "sig": "(a, b)"
     },
     {
-      "file_path": "[path]",
+      "file": "service.ts",
       "kind": "Function",
       "line_count": 3,
-      "line_end": 8,
-      "line_start": 6,
+      "lines": "6-8",
       "name": "farewell",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "service.ts",
-      "signature": "(name: string) -> : string"
+      "sig": "(name: string) -> : string"
     },
     {
-      "file_path": "[path]",
+      "file": "service.ts",
       "kind": "Function",
       "line_count": 3,
-      "line_end": 4,
-      "line_start": 2,
+      "lines": "2-4",
       "name": "greet",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "service.ts",
-      "signature": "(name: string) -> : string"
+      "sig": "(name: string) -> : string"
     },
     {
-      "file_path": "[path]",
+      "file": "main.py",
       "kind": "Function",
       "line_count": 4,
-      "line_end": 7,
-      "line_start": 4,
+      "lines": "4-7",
       "name": "run",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "main.py",
-      "signature": "()"
+      "sig": "()"
     },
     {
-      "file_path": "[path]",
+      "file": "utils.py",
       "kind": "Function",
       "line_count": 2,
-      "line_end": 6,
-      "line_start": 5,
+      "lines": "5-6",
       "name": "subtract",
-      "qualified_name": "[path]",
+      "qn": "[path]",
       "relative_path": "utils.py",
-      "signature": "(a, b)"
+      "sig": "(a, b)"
     }
   ],
   "status": "ok",
