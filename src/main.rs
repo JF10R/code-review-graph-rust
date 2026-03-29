@@ -64,6 +64,9 @@ enum Commands {
     Serve {
         #[arg(long)]
         repo: Option<String>,
+        /// Which tools to expose in tools/list: "core" (3 tools, default) or "all" (13 tools)
+        #[arg(long, default_value = "core")]
+        tools: String,
     },
     /// Register MCP server with Claude Code (creates .mcp.json)
     Install {
@@ -114,8 +117,8 @@ async fn main() -> anyhow::Result<()> {
             print_banner();
             Ok(())
         }
-        Some(Commands::Serve { repo }) => {
-            code_review_graph::server::run_server(repo).await?;
+        Some(Commands::Serve { repo, tools }) => {
+            code_review_graph::server::run_server(repo, &tools).await?;
             Ok(())
         }
         Some(cmd) => {
