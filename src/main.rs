@@ -65,7 +65,7 @@ enum Commands {
         #[arg(long)]
         repo: Option<String>,
         /// Which tools to expose in tools/list: "core" (3 tools, default) or "all" (13 tools)
-        #[arg(long, default_value = "core")]
+        #[arg(long, default_value = "core", value_parser = ["core", "all"])]
         tools: String,
     },
     /// Register MCP server with Claude Code (creates .mcp.json)

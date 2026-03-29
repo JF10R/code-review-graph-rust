@@ -650,8 +650,10 @@ pub struct CodeReviewServer {
     tool_router: ToolRouter<Self>,
     /// Channel to the worker thread. None only in unit-test / CLI shim contexts.
     worker_tx: Option<std::sync::mpsc::Sender<WorkerCommand>>,
-    /// When false (default), list_tools returns only core 3 tools.
-    /// When true (--tools all), list_tools returns all 13 tools.
+    /// Controls which tools are exposed via `list_tools`.
+    /// When `false`, only the core 3 tools are listed (default for MCP `serve`).
+    /// When `true`, all available tools are listed (`--tools all`, or via
+    /// `CodeReviewServer::new()` for library/test backward compatibility).
     expose_all_tools: bool,
 }
 
@@ -1278,6 +1280,9 @@ fn run_watcher_notifier(
 }
 
 /// Run the MCP server over stdio. Blocks until the client disconnects.
+///
+/// `tool_mode` controls which tools are exposed in `tools/list`:
+/// `"core"` (default) shows 3 tools; `"all"` shows all 13.
 pub async fn run_server(repo_root: Option<String>, tool_mode: &str) -> crate::error::Result<()> {
     // Resolve the repository root once.
     let root = resolve_root(repo_root.as_deref());
