@@ -221,19 +221,22 @@ pub struct ImpactResult {
 
 /// Convert a GraphNode to a JSON-serializable map.
 ///
-/// When `compact` is true, only the 7 most useful fields are included,
-/// reducing response size by ~40%. When false, the full 11-field output
-/// is returned unchanged.
-pub fn node_to_dict(node: &GraphNode, compact: bool) -> serde_json::Value {
+/// When `compact` is true, a compressed 6-field format is returned with
+/// repo-relative paths, merged line range, and shortened keys. When false,
+/// the full 11-field output is returned unchanged.
+pub fn node_to_dict(node: &GraphNode, compact: bool, root: &camino::Utf8Path) -> serde_json::Value {
     if compact {
+        let rel_path = camino::Utf8Path::new(&node.file_path)
+            .strip_prefix(root)
+            .map(|p| p.as_str().to_owned())
+            .unwrap_or_else(|_| node.file_path.clone());
         serde_json::json!({
             "name": node.name,
-            "qualified_name": node.qualified_name,
+            "qn": node.qualified_name,
             "kind": node.kind.as_str(),
-            "file_path": node.file_path,
-            "line_start": node.line_start,
-            "line_end": node.line_end,
-            "signature": node.signature,
+            "file": rel_path,
+            "lines": format!("{}-{}", node.line_start, node.line_end),
+            "sig": node.signature,
         })
     } else {
         serde_json::json!({

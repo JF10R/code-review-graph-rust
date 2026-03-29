@@ -1,5 +1,6 @@
 ---
 source: tests/integration.rs
+assertion_line: 633
 expression: result
 ---
 {
@@ -34,7 +35,9 @@ expression: result
       "signature": "(a, b)"
     }
   ],
+  "results_truncated": false,
   "status": "ok",
   "summary": "[summary]",
-  "target": "[path]"
+  "target": "[path]",
+  "total_results": 2
 }

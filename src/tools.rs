@@ -427,14 +427,23 @@ fn decompose_query_passthrough(query: &str) -> QueryParts {
     }
 }
 
+/// Strip `root` prefix from an absolute path, returning a repo-relative string.
+/// Falls back to the original path if stripping fails (e.g. path is already relative).
+fn to_rel_path(abs: &str, root: &Utf8Path) -> String {
+    Utf8Path::new(abs)
+        .strip_prefix(root)
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|_| abs.to_owned())
+}
+
 /// Build a node dict.
-fn node_dict(node: &crate::types::GraphNode, compact: bool, _root: &Utf8Path) -> Value {
-    node_to_dict(node, compact)
+fn node_dict(node: &crate::types::GraphNode, compact: bool, root: &Utf8Path) -> Value {
+    node_to_dict(node, compact, root)
 }
 
 /// Batch node dict (paths already normalized at source; no prefix stripping needed).
 fn node_dict_batch(node: &crate::types::GraphNode, compact: bool, _prefix: &Option<()>) -> Value {
-    node_to_dict(node, compact)
+    node_to_dict(node, compact, Utf8Path::new(""))
 }
 
 /// Common JS/TS builtin method names filtered from callers_of results.
@@ -982,14 +991,25 @@ pub fn query_graph_with_store(
         }
     }
 
+    // Cap results to avoid overwhelming agents on large repos.
+    const MAX_QUERY_RESULTS: usize = 25;
+    let total_results = results.len();
+    let results_truncated = total_results > MAX_QUERY_RESULTS;
+    if results_truncated {
+        results.truncate(MAX_QUERY_RESULTS);
+        edges_out.truncate(MAX_QUERY_RESULTS);
+    }
+
     Ok(json!({
         "status": "ok",
         "pattern": qp.as_str(),
         "target": target_name,
         "description": description,
-        "summary": format!("Found {} result(s) for {}('{}')", results.len(), qp.as_str(), target_name),
+        "summary": format!("Found {} result(s) for {}('{}')", total_results, qp.as_str(), target_name),
         "results": results,
         "edges": edges_out,
+        "total_results": total_results,
+        "results_truncated": results_truncated,
     }))
 }
 
@@ -1893,11 +1913,10 @@ fn aggregate_to_files(
     results
 }
 
-/// Serialise file-level results into the MCP response JSON.
-#[allow(clippy::too_many_arguments)]
 /// Maximum lines of source preview per file result.
 const PREVIEW_LINES: usize = 5;
 
+/// Serialise file-level results into the MCP response JSON.
 #[allow(clippy::too_many_arguments)]
 fn file_results_to_json(
     results: Vec<FileResult>,
@@ -1910,33 +1929,50 @@ fn file_results_to_json(
     files_scored: usize,
     include_preview: bool,
     root: &Utf8Path,
+    compact: bool,
 ) -> Value {
     let result_arr: Vec<Value> = results
         .iter()
         .map(|r| {
-            let mut sources: Vec<&str> = r.sources.iter().map(|s| s.as_str()).collect();
-            sources.sort();
             let top_nodes: Vec<Value> = r.top_nodes.iter().map(|n| {
-                let mut srcs: Vec<&str> = n.sources.iter().map(|s| s.as_str()).collect();
-                srcs.sort();
-                json!({
-                    "name": n.name,
-                    "qualified_name": n.qualified_name,
-                    "kind": n.kind,
-                    "line_start": n.line_start,
-                    "line_end": n.line_end,
-                    "score": n.score,
-                    "sources": srcs,
-                    "matched_terms": n.matched_terms,
-                    "is_test": n.is_test,
-                })
+                if compact {
+                    json!({
+                        "name": n.name,
+                        "kind": n.kind,
+                        "lines": format!("{}-{}", n.line_start, n.line_end),
+                    })
+                } else {
+                    let mut srcs: Vec<&str> = n.sources.iter().map(|s| s.as_str()).collect();
+                    srcs.sort();
+                    json!({
+                        "name": n.name,
+                        "qualified_name": n.qualified_name,
+                        "kind": n.kind,
+                        "line_start": n.line_start,
+                        "line_end": n.line_end,
+                        "score": n.score,
+                        "sources": srcs,
+                        "matched_terms": n.matched_terms,
+                        "is_test": n.is_test,
+                    })
+                }
             }).collect();
-            let mut entry = json!({
-                "file_path": r.file_path,
-                "score": r.score,
-                "sources": sources,
-                "top_nodes": top_nodes,
-            });
+
+            let mut entry = if compact {
+                json!({
+                    "file": to_rel_path(&r.file_path, root),
+                    "nodes": top_nodes,
+                })
+            } else {
+                let mut sources: Vec<&str> = r.sources.iter().map(|s| s.as_str()).collect();
+                sources.sort();
+                json!({
+                    "file_path": r.file_path,
+                    "score": r.score,
+                    "sources": sources,
+                    "top_nodes": top_nodes,
+                })
+            };
 
             // Attach source preview from the top-scoring node in this file.
             // file_path is already absolute (from the graph); root is available as fallback.
@@ -1971,6 +2007,14 @@ fn file_results_to_json(
             entry
         })
         .collect();
+
+    if compact {
+        return json!({
+            "status": "ok",
+            "query": query,
+            "results": result_arr,
+        });
+    }
 
     let mut response = json!({
         "status": "ok",
@@ -2078,22 +2122,40 @@ pub fn hybrid_query_with_store(
         }));
     }
 
-    // Budget: "fast" (default) or "thorough".
-    let budget_str = budget.unwrap_or("fast");
-    let is_fast = budget_str != "thorough";
+    // Budget: "auto" (default), "fast", or "thorough".
+    // "auto" adapts limits and ablation to repo size (node count).
+    let budget_str = budget.unwrap_or("auto");
+    let is_thorough = budget_str == "thorough";
+    let is_auto = budget_str == "auto";
 
-    // In fast mode: force file-mode, cap limit, use restricted ablation.
-    let effective_limit = if is_fast { limit.min(3) } else { limit };
-    let effective_mode = if is_fast { "file" } else { result_mode.unwrap_or("node") };
-
-    // Build repo profile (always included in response).
-    let repo_profile = match store.get_stats() {
-        Ok(stats) => json!({
+    // Build repo profile and extract node count for auto-budget sizing.
+    let (repo_profile, node_count) = match store.get_stats() {
+        Ok(stats) => (json!({
             "file_count": stats.files_count,
             "node_count": stats.total_nodes,
             "languages": stats.languages,
-        }),
-        Err(_) => json!({}),
+        }), stats.total_nodes),
+        Err(_) => (json!({}), 0),
+    };
+
+    // Determine effective limit and mode based on budget + repo size.
+    let (effective_limit, effective_mode, auto_skip_preview, auto_skip_expansion) = if is_thorough {
+        (limit, result_mode.unwrap_or("node"), false, false)
+    } else if is_auto {
+        // Adaptive tiers based on repo size.
+        if node_count > 50_000 {
+            // Large repo: tight cap, no preview, no expansion.
+            (limit.min(3), "file", true, true)
+        } else if node_count > 5_000 {
+            // Medium repo: moderate cap, preview on, no expansion.
+            (limit.min(3), "file", false, false)
+        } else {
+            // Small repo: relaxed cap, full features.
+            (limit.min(5), "file", false, false)
+        }
+    } else {
+        // Explicit "fast": original behavior.
+        (limit.min(3), "file", false, false)
     };
 
     // Validate result_mode early so we can return a clear error before doing any work.
@@ -2108,10 +2170,12 @@ pub fn hybrid_query_with_store(
     if effective_mode == "file" {
         let abl = if let Some(a) = ablation {
             a.clone()
-        } else if is_fast {
-            AblationConfig::fast()
-        } else {
+        } else if is_thorough {
             AblationConfig::full()
+        } else {
+            let mut cfg = AblationConfig::fast();
+            if auto_skip_expansion { cfg.expansion = false; }
+            cfg
         };
         let parts = if abl.decomposition { decompose_query(query) } else { decompose_query_passthrough(query) };
         let mut candidates = fanout_retrieve(store, emb_store, root, &parts, effective_limit, keyword_hits, &abl)?;
@@ -2127,21 +2191,21 @@ pub fn hybrid_query_with_store(
             files.len()
         };
         let file_results = aggregate_to_files(candidates, &parts, effective_limit, &abl);
-        let results_capped = is_fast && limit > effective_limit;
+        let results_capped = !is_thorough && limit > effective_limit;
 
         // Classify query for metadata and preview decisions (does not affect retrieval).
         let classification = classify_query(query);
-        let should_preview = is_fast
-            && effective_limit <= 3
+        let should_preview = !is_thorough
+            && !auto_skip_preview
+            && effective_limit <= 5
             && matches!(classification.route, QueryRoute::ExactSymbol | QueryRoute::FilePath | QueryRoute::ExactText);
 
         let mut response = file_results_to_json(
             file_results, query, &parts, debug, route, fusion, total_candidates, files_scored,
-            should_preview, root,
+            should_preview, root, compact,
         );
         // Inject budget metadata, repo profile, and classification info.
         if let Some(obj) = response.as_object_mut() {
-            obj.insert("repo_profile".to_string(), repo_profile);
             obj.insert("budget".to_string(), json!(budget_str));
             obj.insert("route".to_string(), json!(format!("{:?}", classification.route)));
             obj.insert("confidence".to_string(), json!(classification.confidence));
@@ -2153,12 +2217,16 @@ pub fn hybrid_query_with_store(
                 QueryRoute::Causal => "causal_query",
                 QueryRoute::General => "general",
             }));
-            obj.insert("query_signals".to_string(), json!({
-                "has_quoted_span": classification.signals.has_quoted_span,
-                "has_error_text": classification.signals.has_error_text,
-                "has_path_hint": classification.signals.has_path_hint,
-                "has_identifier_hint": classification.signals.has_identifier_hint,
-            }));
+            // On large repos with auto budget, strip verbose metadata to save tokens.
+            if !(is_auto && node_count > 50_000) {
+                obj.insert("repo_profile".to_string(), repo_profile);
+                obj.insert("query_signals".to_string(), json!({
+                    "has_quoted_span": classification.signals.has_quoted_span,
+                    "has_error_text": classification.signals.has_error_text,
+                    "has_path_hint": classification.signals.has_path_hint,
+                    "has_identifier_hint": classification.signals.has_identifier_hint,
+                }));
+            }
             if should_preview {
                 obj.insert("preview_included".to_string(), json!(true));
             }
@@ -2409,6 +2477,16 @@ pub fn hybrid_query_with_store(
 // Tool 12: open_node_context
 // ---------------------------------------------------------------------------
 
+/// Build a minimal 3-field caller/callee reference for compact mode.
+/// Agents need to know WHO calls and WHERE; name + file + line is sufficient.
+fn compact_ref(node: &crate::types::GraphNode, root: &Utf8Path) -> Value {
+    json!({
+        "name": node.name,
+        "file": to_rel_path(&node.file_path, root),
+        "line": node.line_start,
+    })
+}
+
 /// Get complete context for a node — source preview, callers, callees, tests,
 /// and file siblings — in a single store-borrowed call.
 pub fn open_node_context(
@@ -2447,6 +2525,7 @@ pub fn open_node_context_with_store(
     };
 
     let qn = &node.qualified_name;
+    let is_container = matches!(node.kind, NodeKind::Class | NodeKind::Type);
 
     // Single pass over incoming edges splits callers (Calls) from tests (TestedBy),
     // avoiding a second get_edges_by_target call.
@@ -2459,44 +2538,133 @@ pub fn open_node_context_with_store(
             _ => {}
         }
     }
-    let callers_count = caller_edges.len();
-    let callers: Vec<Value> = caller_edges.iter()
-        .take(5)
-        .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
-        .map(|n| node_to_dict(&n, compact))
-        .collect();
 
     let all_callees_edges: Vec<_> = store.get_edges_by_source(qn)?
         .into_iter()
         .filter(|e| e.kind == EdgeKind::Calls)
         .collect();
-    let callees_count = all_callees_edges.len();
-    let callees: Vec<Value> = all_callees_edges.iter()
-        .take(5)
-        .filter_map(|e| store.get_node(&e.target_qualified).ok().flatten())
-        .map(|n| node_to_dict(&n, compact))
-        .collect();
+
+    // For Class/Type nodes with no direct callers/callees, auto-expand into
+    // the top methods' callers/callees so agents get structural info in one call.
+    let expanded_from_methods = is_container
+        && caller_edges.is_empty()
+        && all_callees_edges.is_empty();
+
+    let (callers_count, callers, callees_count, callees, method_names) = if expanded_from_methods {
+        // Find child methods via CONTAINS edges.
+        let methods: Vec<_> = store.get_edges_by_source(qn)?
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Contains)
+            .filter_map(|e| store.get_node(&e.target_qualified).ok().flatten())
+            .filter(|n| matches!(n.kind, NodeKind::Function | NodeKind::Test))
+            .take(5)
+            .collect();
+
+        let method_names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
+
+        // Aggregate callers across methods (deduplicated).
+        let mut seen_callers: HashSet<String> = HashSet::new();
+        let mut agg_caller_edges = Vec::new();
+        for m in &methods {
+            for e in store.get_edges_by_target(&m.qualified_name)? {
+                if e.kind == EdgeKind::Calls && seen_callers.insert(e.source_qualified.clone()) {
+                    agg_caller_edges.push(e);
+                }
+            }
+        }
+        let agg_callers_count = agg_caller_edges.len();
+        let agg_callers: Vec<Value> = agg_caller_edges.iter()
+            .take(5)
+            .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
+            .map(|n| if compact { compact_ref(&n, root) } else { node_to_dict(&n, false, root) })
+            .collect();
+
+        // Aggregate callees across methods (deduplicated).
+        let mut seen_callees: HashSet<String> = HashSet::new();
+        let mut agg_callee_edges = Vec::new();
+        for m in &methods {
+            for e in store.get_edges_by_source(&m.qualified_name)? {
+                if e.kind == EdgeKind::Calls && seen_callees.insert(e.target_qualified.clone()) {
+                    agg_callee_edges.push(e);
+                }
+            }
+        }
+        let agg_callees_count = agg_callee_edges.len();
+        let agg_callees: Vec<Value> = agg_callee_edges.iter()
+            .take(5)
+            .filter_map(|e| store.get_node(&e.target_qualified).ok().flatten())
+            .map(|n| if compact { compact_ref(&n, root) } else { node_to_dict(&n, false, root) })
+            .collect();
+
+        // Also collect tests for methods.
+        for m in &methods {
+            for e in store.get_edges_by_target(&m.qualified_name)? {
+                if e.kind == EdgeKind::TestedBy {
+                    test_edges.push(e);
+                }
+            }
+        }
+
+        (agg_callers_count, agg_callers, agg_callees_count, agg_callees, method_names)
+    } else {
+        let callers_count = caller_edges.len();
+        let callers: Vec<Value> = caller_edges.iter()
+            .take(5)
+            .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
+            .map(|n| if compact { compact_ref(&n, root) } else { node_to_dict(&n, false, root) })
+            .collect();
+
+        let callees_count = all_callees_edges.len();
+        let callees: Vec<Value> = all_callees_edges.iter()
+            .take(5)
+            .filter_map(|e| store.get_node(&e.target_qualified).ok().flatten())
+            .map(|n| if compact { compact_ref(&n, root) } else { node_to_dict(&n, false, root) })
+            .collect();
+
+        (callers_count, callers, callees_count, callees, Vec::new())
+    };
 
     let tests_count = test_edges.len();
-    let tests: Vec<Value> = test_edges.iter()
-        .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
-        .map(|n| node_to_dict(&n, compact))
-        .collect();
 
     let node_kind = node.kind;
     let node_line = node.line_start;
     let node_qn = node.qualified_name.clone();
-    let mut siblings: Vec<_> = store.get_nodes_by_file(&node.file_path)?
-        .into_iter()
-        .filter(|n| n.qualified_name != node_qn)
-        .collect();
-    siblings.sort_by_key(|n| {
-        let kind_score: u8 = if n.kind == node_kind { 0 } else { 1 };
-        let line_dist = (n.line_start as i64 - node_line as i64).unsigned_abs() as usize;
-        (kind_score, line_dist)
-    });
-    siblings.truncate(10);
-    let file_siblings: Vec<Value> = siblings.iter().map(|n| node_to_dict(n, compact)).collect();
+
+    // Compact: count only (skip full sibling serialization to save tokens).
+    // Non-compact: sort by proximity, truncate to 10, serialize full node dicts.
+    let (file_siblings_json, sibling_count) = if compact {
+        let count = store.get_nodes_by_file(&node.file_path)?
+            .into_iter()
+            .filter(|n| n.qualified_name != node_qn)
+            .count();
+        (None, count)
+    } else {
+        let mut siblings: Vec<_> = store.get_nodes_by_file(&node.file_path)?
+            .into_iter()
+            .filter(|n| n.qualified_name != node_qn)
+            .collect();
+        siblings.sort_by_key(|n| {
+            let kind_score: u8 = if n.kind == node_kind { 0 } else { 1 };
+            let line_dist = (n.line_start as i64 - node_line as i64).unsigned_abs() as usize;
+            (kind_score, line_dist)
+        });
+        siblings.truncate(10);
+        let count = siblings.len();
+        let dicts: Vec<Value> = siblings.iter()
+            .map(|n| node_to_dict(n, false, root))
+            .collect();
+        (Some(dicts), count)
+    };
+
+    // Adaptive preview size: shorter on large repos to save tokens.
+    let max_preview_lines: usize = {
+        let nc = store.get_stats().map(|s| s.total_nodes).unwrap_or(0);
+        if !compact {
+            if nc > 50_000 { 15 } else { 30 }
+        } else {
+            5
+        }
+    };
 
     let (source_preview, source_truncated) = {
         let file_path_str = &node.file_path;
@@ -2506,8 +2674,8 @@ pub fn open_node_context_with_store(
                 let start = node.line_start.saturating_sub(1);
                 let end = node.line_end.min(lines.len());
                 let available = end.saturating_sub(start);
-                let take = available.min(30);
-                let truncated = available > 30;
+                let take = available.min(max_preview_lines);
+                let truncated = available > max_preview_lines;
                 let preview: String = lines[start..start + take]
                     .iter()
                     .enumerate()
@@ -2521,25 +2689,68 @@ pub fn open_node_context_with_store(
     };
 
     let node_name = node.name.clone();
-    let node_dict_val = node_to_dict(&node, compact);
 
-    Ok(json!({
-        "status": "ok",
-        "node": node_dict_val,
-        "source_preview": source_preview,
-        "source_truncated": source_truncated,
-        "callers": callers,
-        "callers_count": callers_count,
-        "callees": callees,
-        "callees_count": callees_count,
-        "tests": tests,
-        "tests_count": tests_count,
-        "file_siblings": file_siblings,
-        "summary": format!(
-            "Context for {}: {} callers, {} callees, {} tests",
-            node_name, callers_count, callees_count, tests_count
-        ),
-    }))
+    let result = if compact {
+        let sig = {
+            let s = &node.signature;
+            let cut = s.char_indices().nth(120).map(|(i, _)| i).unwrap_or(s.len());
+            if cut < s.len() { format!("{}...", &s[..cut]) } else { s.clone() }
+        };
+        let mut r = json!({
+            "status": "ok",
+            "target": node_name,
+            "file": to_rel_path(&node.file_path, root),
+            "lines": format!("{}-{}", node.line_start, node.line_end),
+            "kind": node.kind.as_str(),
+            "sig": sig,
+            "callers": callers,
+            "callees": callees,
+            "tests": tests_count,
+            "sibling_count": sibling_count,
+            "preview": source_preview,
+        });
+        if expanded_from_methods {
+            r["expanded_methods"] = json!(method_names);
+        }
+        r
+    } else {
+        let node_dict_val = node_to_dict(&node, false, root);
+        let tests: Vec<Value> = test_edges.iter()
+            .filter_map(|e| store.get_node(&e.source_qualified).ok().flatten())
+            .map(|n| node_to_dict(&n, false, root))
+            .collect();
+        let mut r = json!({
+            "status": "ok",
+            "node": node_dict_val,
+            "source_preview": source_preview,
+            "source_truncated": source_truncated,
+            "callers": callers,
+            "callers_count": callers_count,
+            "callees": callees,
+            "callees_count": callees_count,
+            "tests": tests,
+            "tests_count": tests_count,
+            "file_siblings": file_siblings_json.unwrap_or_default(),
+            "summary": if expanded_from_methods {
+                format!(
+                    "Context for {} (class/type — expanded via methods {:?}): {} callers, {} callees, {} tests",
+                    node_name, method_names, callers_count, callees_count, tests_count
+                )
+            } else {
+                format!(
+                    "Context for {}: {} callers, {} callees, {} tests",
+                    node_name, callers_count, callees_count, tests_count
+                )
+            },
+        });
+        if expanded_from_methods {
+            if let Some(obj) = r.as_object_mut() {
+                obj.insert("expanded_from_methods".to_string(), json!(method_names));
+            }
+        }
+        r
+    };
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -2725,13 +2936,9 @@ pub fn find_large_functions_with_store(
         } else {
             0
         };
-        let relative_path = Utf8Path::new(&n.file_path)
-            .strip_prefix(root)
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_else(|_| n.file_path.clone());
         let mut d = node_dict(n, compact, root);
         d["line_count"] = json!(line_count);
-        d["relative_path"] = json!(relative_path);
+        d["relative_path"] = json!(to_rel_path(&n.file_path, root));
         d
     }).collect();
 
@@ -2906,7 +3113,7 @@ fn resolve_target_node(
         0 => Ok(ResolveResult::NotFound),
         1 => Ok(ResolveResult::Found(candidates.into_iter().next().unwrap())),
         _ => Ok(ResolveResult::Ambiguous(
-            candidates.iter().map(|n| node_to_dict(n, false)).collect(),
+            candidates.iter().map(|n| node_to_dict(n, false, Utf8Path::new(""))).collect(),
         )),
     }
 }
@@ -3960,16 +4167,13 @@ mod tests {
         assert!(result.is_ok(), "file mode should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
-        assert_eq!(val["method"], "fanout_file");
-        assert_eq!(val["result_mode"], "file");
         assert!(val["results"].is_array(), "results must be array");
+        // compact=true: response uses compressed format (no method/result_mode, file instead of file_path)
         let arr = val["results"].as_array().unwrap();
         if !arr.is_empty() {
             let first = &arr[0];
-            assert!(first.get("file_path").is_some(), "each result must have file_path");
-            assert!(first.get("score").is_some(), "each result must have score");
-            assert!(first.get("sources").is_some(), "each result must have sources");
-            assert!(first.get("top_nodes").is_some(), "each result must have top_nodes");
+            assert!(first.get("file").is_some(), "compact result must have file");
+            assert!(first.get("nodes").is_some(), "compact result must have nodes");
         }
     }
 
@@ -4013,7 +4217,7 @@ mod tests {
             "serverPatchReducer loses push",
             5,
             Some(&path),
-            true,
+            false, // compact=false so _debug is included
             None,
             None,
             Some(true), // debug = true
@@ -4023,7 +4227,7 @@ mod tests {
         assert!(result.is_ok(), "debug file mode should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
-        let debug = val.get("_debug").expect("_debug must be present when debug=true");
+        let debug = val.get("_debug").expect("_debug must be present when debug=true and compact=false");
         assert!(debug.get("query_parts").is_some(), "_debug must contain query_parts");
         assert!(debug.get("total_candidates").is_some(), "_debug must contain total_candidates");
         assert!(debug.get("files_scored").is_some(), "_debug must contain files_scored");

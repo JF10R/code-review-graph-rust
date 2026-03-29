@@ -1453,7 +1453,7 @@ pub fn semantic_search(
 ) -> Result<Vec<serde_json::Value>> {
     if emb_store.provider.is_none() {
         let nodes = store.search_nodes(query, limit)?;
-        return Ok(nodes.iter().map(|n| node_to_dict(n, compact)).collect());
+        return Ok(nodes.iter().map(|n| node_to_dict(n, compact, repo_root)).collect());
     }
 
     let provider = emb_store.provider.as_mut().expect("provider checked above");
@@ -1504,12 +1504,12 @@ fn nodes_from_scored(
     scored: Vec<(String, f64)>,
     store: &GraphStore,
     compact: bool,
-    _repo_root: &camino::Utf8Path, // kept for API compatibility; paths already normalized at source
+    repo_root: &camino::Utf8Path,
 ) -> Result<Vec<serde_json::Value>> {
     let mut results = Vec::with_capacity(scored.len());
     for (qn, score) in scored {
         if let Some(node) = store.get_node(&qn)? {
-            let mut d = node_to_dict(&node, compact);
+            let mut d = node_to_dict(&node, compact, repo_root);
             d["similarity_score"] =
                 serde_json::Value::from((score * 10_000.0).round() / 10_000.0);
             results.push(d);

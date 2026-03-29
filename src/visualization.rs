@@ -26,7 +26,7 @@ pub fn export_graph_data(store: &GraphStore) -> Result<Value> {
                 continue;
             }
             seen_qn.insert(gnode.qualified_name.clone());
-            let mut d = node_to_dict(&gnode, false);
+            let mut d = node_to_dict(&gnode, false, camino::Utf8Path::new(""));
             // params and return_type are not stored in GraphNode; emit nulls
             // so the JS template can safely reference them.
             if let Some(obj) = d.as_object_mut() {
