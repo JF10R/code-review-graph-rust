@@ -9,6 +9,7 @@
 (function_declaration) @definition.function
 (method_definition) @definition.function
 (arrow_function) @definition.function
+(public_field_definition) @definition.function
 
 ; --- Imports ---
 (import_statement) @reference.import

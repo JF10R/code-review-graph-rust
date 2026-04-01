@@ -5,8 +5,12 @@
 (enum_item) @definition.class
 (impl_item) @definition.class
 
+; --- Types (traits) ---
+(trait_item) @definition.type
+
 ; --- Functions ---
 (function_item) @definition.function
+(function_signature_item) @definition.function
 
 ; --- Imports ---
 (use_declaration) @reference.import

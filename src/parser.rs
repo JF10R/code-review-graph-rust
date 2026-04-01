@@ -1,7 +1,7 @@
 //! Multi-language source code parser using tree-sitter.
 //!
 //! Extracts functions, classes, imports, calls, and inheritance from ASTs.
-//! Supports 14 languages (+ Vue SFC) via native tree-sitter grammar crates.
+//! Supports 15 languages (+ Vue SFC) via native tree-sitter grammar crates.
 //! Node-type classification is driven by per-language `.scm` query files
 //! embedded at compile time via `include_str!()`.
 
@@ -37,6 +37,7 @@ pub fn detect_language(path: &Path) -> Option<&'static str> {
         "php" => Some("php"),
         "kt" | "kts" => Some("kotlin"),
         "swift" => Some("swift"),
+        "zig" | "zon" => Some("zig"),
         "vue" => Some("vue"),
         _ => None,
     }
@@ -62,6 +63,7 @@ fn grammar_for(language: &str) -> Option<Language> {
         "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
         "kotlin" => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         "swift" => Some(tree_sitter_swift::LANGUAGE.into()),
+        "zig" => Some(tree_sitter_zig::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -106,6 +108,7 @@ const SCM_SOURCES: &[(&str, &str)] = &[
     ("kotlin",     include_str!("../queries/kotlin.scm")),
     ("swift",      include_str!("../queries/swift.scm")),
     ("php",        include_str!("../queries/php.scm")),
+    ("zig",        include_str!("../queries/zig.scm")),
 ];
 
 type ScmSets = (HashSet<String>, HashSet<String>, HashSet<String>, HashSet<String>, HashSet<String>);
@@ -311,6 +314,87 @@ fn csharp_fn_has_test_attr(node: &Node, source: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 // SHA-256 body hash
 // ---------------------------------------------------------------------------
+// Zig helpers
+// ---------------------------------------------------------------------------
+
+/// Zig: unwrap `const Foo = struct { ... }` patterns.
+/// Returns `(name, inner_type_node, NodeKind)` if the variable_declaration
+/// contains an anonymous type expression (struct/enum/union/opaque/error_set).
+fn zig_unwrap_type_binding<'t>(
+    var_decl: &Node<'t>,
+    source: &[u8],
+    lt: &CompiledQueries,
+) -> Option<(String, Node<'t>, NodeKind)> {
+    let mut name: Option<String> = None;
+    let mut inner_type: Option<(Node<'t>, NodeKind)> = None;
+
+    let mut cur = var_decl.walk();
+    for child in var_decl.children(&mut cur) {
+        if child.kind() == "identifier" && name.is_none() {
+            name = Some(node_text(&child, source).to_owned());
+        }
+        if lt.is_class(child.kind()) {
+            inner_type = Some((child, NodeKind::Class));
+        } else if lt.is_type(child.kind()) {
+            inner_type = Some((child, NodeKind::Type));
+        }
+    }
+    let n = name?;
+    let (inner, kind) = inner_type?;
+    Some((n, inner, kind))
+}
+
+/// Zig: extract the name of a `test "description" { ... }` declaration.
+fn zig_test_name(test_decl: &Node, source: &[u8]) -> String {
+    let mut cur = test_decl.walk();
+    for child in test_decl.children(&mut cur) {
+        if child.kind() == "string" {
+            let raw = node_text(&child, source);
+            return raw.trim_matches('"').to_owned();
+        }
+        if child.kind() == "identifier" {
+            return node_text(&child, source).to_owned();
+        }
+    }
+    "<anonymous test>".to_owned()
+}
+
+/// Zig: extract `@import("path")` calls from variable_declarations.
+/// `const std = @import("std");` → maps "std" to "std".
+fn zig_collect_import(
+    node: &Node,
+    source: &[u8],
+    import_map: &mut HashMap<String, String>,
+) {
+    if node.kind() != "variable_declaration" {
+        return;
+    }
+    let mut var_name: Option<String> = None;
+    let mut import_path: Option<String> = None;
+
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        if child.kind() == "identifier" && var_name.is_none() {
+            var_name = Some(node_text(&child, source).to_owned());
+        }
+        if child.kind() == "builtin_function" || child.kind() == "call_expression" {
+            let text = node_text(&child, source);
+            if text.starts_with("@import") {
+                // Extract the path from @import("path")
+                if let Some(start) = text.find('"') {
+                    if let Some(end) = text[start + 1..].find('"') {
+                        import_path = Some(text[start + 1..start + 1 + end].to_owned());
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(name), Some(path)) = (var_name, import_path) {
+        import_map.insert(name, path);
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 fn body_hash(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -343,6 +427,12 @@ fn get_name(node: &Node, language: &str, kind: &str, source: &[u8]) -> Option<St
         }
     }
 
+    // Rust impl_item: `impl Trait for Type` → name should be `Type`, not `Trait`.
+    // For plain `impl Type`, name is `Type` (first type_identifier, no `for`).
+    if language == "rust" && node.kind() == "impl_item" {
+        return rust_impl_name(node, source);
+    }
+
     // Most languages: first identifier child
     // field_identifier is used by tree-sitter-go 0.25 for method names in method_declaration
     let name_kinds = &[
@@ -372,6 +462,144 @@ fn get_name(node: &Node, language: &str, kind: &str, source: &[u8]) -> Option<St
     }
 
     None
+}
+
+/// Rust: extract the correct name from an `impl_item`.
+/// `impl Foo` → "Foo", `impl Display for Foo` → "Foo".
+fn rust_impl_name(node: &Node, source: &[u8]) -> Option<String> {
+    let mut cur = node.walk();
+    let children: Vec<Node> = node.children(&mut cur).collect();
+
+    // Look for `for` keyword — if present, take the type_identifier after it.
+    let mut saw_for = false;
+    for child in &children {
+        if child.kind() == "for" {
+            saw_for = true;
+            continue;
+        }
+        if saw_for && matches!(child.kind(), "type_identifier" | "scoped_type_identifier" | "generic_type") {
+            // For generic_type like `Foo<T>`, extract just the base name
+            if child.kind() == "generic_type" {
+                let mut c2 = child.walk();
+                for gc in child.children(&mut c2) {
+                    if matches!(gc.kind(), "type_identifier" | "scoped_type_identifier") {
+                        return Some(node_text(&gc, source).to_owned());
+                    }
+                }
+            }
+            return Some(node_text(child, source).to_owned());
+        }
+    }
+
+    // No `for` keyword → plain `impl Type`, take first type_identifier
+    for child in &children {
+        if matches!(child.kind(), "type_identifier" | "scoped_type_identifier" | "generic_type") {
+            if child.kind() == "generic_type" {
+                let mut c2 = child.walk();
+                for gc in child.children(&mut c2) {
+                    if matches!(gc.kind(), "type_identifier" | "scoped_type_identifier") {
+                        return Some(node_text(&gc, source).to_owned());
+                    }
+                }
+            }
+            return Some(node_text(child, source).to_owned());
+        }
+    }
+
+    None
+}
+
+/// Rust: extract the trait name from `impl Trait for Type`.
+/// Returns `None` for plain `impl Type`.
+fn rust_impl_trait_name(node: &Node, source: &[u8]) -> Option<String> {
+    let mut cur = node.walk();
+    let children: Vec<Node> = node.children(&mut cur).collect();
+
+    // Check if there's a `for` keyword — if so, the type before it is the trait.
+    let has_for = children.iter().any(|c| c.kind() == "for");
+    if !has_for {
+        return None;
+    }
+
+    for child in &children {
+        if child.kind() == "for" {
+            break;
+        }
+        if matches!(child.kind(), "type_identifier" | "scoped_type_identifier" | "generic_type") {
+            if child.kind() == "generic_type" {
+                let mut c2 = child.walk();
+                for gc in child.children(&mut c2) {
+                    if matches!(gc.kind(), "type_identifier" | "scoped_type_identifier") {
+                        return Some(node_text(&gc, source).to_owned());
+                    }
+                }
+            }
+            return Some(node_text(child, source).to_owned());
+        }
+    }
+    None
+}
+
+/// Rust: collect names from `use` declarations into the import map.
+/// Handles simple paths, braced groups, and aliases.
+fn rust_collect_use_names(
+    node: &Node,
+    source: &[u8],
+    import_map: &mut HashMap<String, String>,
+) {
+    // Walk the use_declaration children to find scoped_identifier, use_list, use_as_clause, etc.
+    let text = node_text(node, source).trim().to_owned();
+
+    // Handle `use foo::bar as alias;`
+    if text.contains(" as ") {
+        let trimmed = text.trim_start_matches("pub ")
+            .trim_start_matches("use ")
+            .trim_end_matches(';');
+        if let Some(as_pos) = trimmed.find(" as ") {
+            let path = &trimmed[..as_pos];
+            let alias = trimmed[as_pos + 4..].trim();
+            let module = path.rsplit_once("::").map_or(path, |(m, _)| m);
+            import_map.insert(alias.to_owned(), module.to_owned());
+            return;
+        }
+    }
+
+    // Handle `use foo::bar::{Baz, Qux};`
+    if text.contains('{') {
+        let trimmed = text.trim_start_matches("pub ")
+            .trim_start_matches("use ")
+            .trim_end_matches(';');
+        if let Some(brace_pos) = trimmed.find('{') {
+            let base = trimmed[..brace_pos].trim_end_matches("::");
+            let inner = &trimmed[brace_pos + 1..];
+            let inner = inner.trim_end_matches('}');
+            for item in inner.split(',') {
+                let item = item.trim();
+                if item.is_empty() || item == "*" || item == "self" {
+                    continue;
+                }
+                // Handle `Foo as Bar` inside braces
+                if let Some(as_pos) = item.find(" as ") {
+                    let alias = item[as_pos + 4..].trim();
+                    import_map.insert(alias.to_owned(), base.to_owned());
+                } else {
+                    import_map.insert(item.to_owned(), base.to_owned());
+                }
+            }
+            return;
+        }
+    }
+
+    // Simple: `use std::collections::HashMap;`
+    let trimmed = text.trim_start_matches("pub ")
+        .trim_start_matches("use ")
+        .trim_end_matches(';')
+        .trim();
+    if trimmed.contains("::") && !trimmed.contains('*') {
+        if let Some((module, name)) = trimmed.rsplit_once("::") {
+            import_map.insert(name.to_owned(), module.to_owned());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +779,14 @@ fn get_bases(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
                 }
             }
         }
+        "rust" => {
+            // `impl Trait for Type` → trait is the "base" (Inherits edge).
+            if node.kind() == "impl_item" {
+                if let Some(trait_name) = rust_impl_trait_name(node, source) {
+                    bases.push(trait_name);
+                }
+            }
+        }
         _ => {}
     }
     bases
@@ -662,6 +898,10 @@ fn extract_imports(node: &Node, language: &str, source: &[u8]) -> Vec<String> {
                 }
             }
         }
+        "zig" => {
+            // `usingnamespace` imports: extract the expression text
+            imports.push(text.to_owned());
+        }
         _ => {
             imports.push(text.to_owned());
         }
@@ -733,6 +973,17 @@ fn collect_import_names(
                 }
             }
         }
+        "rust" => {
+            // `use std::collections::HashMap;` → maps "HashMap" → "std::collections"
+            // `use foo::bar::{Baz, Qux};` → maps "Baz" → "foo::bar", "Qux" → "foo::bar"
+            // `use foo::bar as alias;` → maps "alias" → "foo::bar"
+            rust_collect_use_names(node, source, import_map);
+        }
+        "zig" => {
+            // Zig imports are `const x = @import("path");` which are
+            // variable_declarations, not a dedicated import node.
+            // We handle them in collect_file_scope instead.
+        }
         _ => {}
     }
 }
@@ -771,6 +1022,23 @@ fn collect_js_import_names(
 // ---------------------------------------------------------------------------
 
 fn get_call_name(node: &Node, source: &[u8]) -> Option<String> {
+    // Zig builtin_function: `@import(...)` — the node itself contains
+    // a builtin_identifier child (`@import`).
+    if node.kind() == "builtin_function" {
+        let mut cur = node.walk();
+        for child in node.children(&mut cur) {
+            if child.kind() == "builtin_identifier" {
+                return Some(node_text(&child, source).to_owned());
+            }
+        }
+        // Fallback: extract @name from the text
+        let text = node_text(node, source);
+        if let Some(paren) = text.find('(') {
+            return Some(text[..paren].to_owned());
+        }
+        return Some(text.to_owned());
+    }
+
     let mut cur = node.walk();
     let first = node.children(&mut cur).next()?;
 
@@ -783,6 +1051,7 @@ fn get_call_name(node: &Node, source: &[u8]) -> Option<String> {
         "member_expression",
         "member_access_expression",
         "field_expression",
+        "field_access",       // Zig: foo.bar()
         "selector_expression",
     ];
     if member_types.contains(&first.kind()) {
@@ -895,6 +1164,22 @@ fn collect_file_scope(
         }
     }
 
+    // For Zig, scan top-level variable_declarations for @import bindings
+    // and `const Foo = struct { ... }` type bindings.
+    if language == "zig" {
+        let mut zig_cur = root.walk();
+        for child in root.children(&mut zig_cur) {
+            if child.kind() == "variable_declaration" {
+                // Collect @import bindings
+                zig_collect_import(&child, source, &mut import_map);
+                // Collect type bindings (const Foo = struct { ... })
+                if let Some((name, _, _)) = zig_unwrap_type_binding(&child, source, lt) {
+                    defined_names.insert(name);
+                }
+            }
+        }
+    }
+
     // For C#, also scan one level into namespace declarations to find
     // classes/functions that are not direct children of the root.
     if language == "csharp" {
@@ -922,6 +1207,33 @@ fn collect_file_scope(
                     if lt.is_func(nt) || lt.is_class(nt) || lt.is_type(nt) {
                         if let Some(name) = get_name(&inner, language, "class", source) {
                             defined_names.insert(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // For Rust, scan one level into `mod` blocks to find definitions
+    // that are not direct children of the root.
+    if language == "rust" {
+        let mut mod_cur = root.walk();
+        for child in root.children(&mut mod_cur) {
+            if child.kind() == "mod_item" {
+                let mut c2 = child.walk();
+                for inner in child.children(&mut c2) {
+                    if inner.kind() == "declaration_list" {
+                        let mut c3 = inner.walk();
+                        for decl in inner.children(&mut c3) {
+                            let nt = decl.kind();
+                            if lt.is_func(nt) || lt.is_class(nt) || lt.is_type(nt) {
+                                if let Some(name) = get_name(&decl, language, "class", source) {
+                                    defined_names.insert(name);
+                                }
+                            }
+                            if lt.is_import(nt) {
+                                collect_import_names(&decl, language, source, &mut import_map);
+                            }
                         }
                     }
                 }
@@ -1007,7 +1319,179 @@ fn extract_from_tree(
             }
         }
 
+        // --- Rust: mod blocks as namespaces ---
+        // `mod foo { fn bar() {} }` → functions inside get qualified as `file::foo.bar`
+        // `pub mod foo;` (no body) → treated as external module reference
+        if *language == "rust" && node_type == "mod_item" {
+            let mod_name = {
+                let mut c2 = child.walk();
+                let found = child.children(&mut c2)
+                    .find(|c| c.kind() == "identifier")
+                    .map(|c| node_text(&c, source).to_owned());
+                found
+            };
+            if let Some(ref name) = mod_name {
+                // Check if this mod has a body (declaration_list)
+                let has_body = {
+                    let mut c2 = child.walk();
+                    let result = child.children(&mut c2).any(|c| c.kind() == "declaration_list");
+                    result
+                };
+                if has_body {
+                    // Block mod: recurse into the body with namespace set
+                    let full_ns = match active_ns.as_deref() {
+                        Some(outer) => format!("{outer}.{name}"),
+                        None => name.clone(),
+                    };
+                    extract_from_tree(
+                        &child, ctx, nodes, edges, enclosing_class, enclosing_func,
+                        Some(&full_ns), depth + 1,
+                    );
+                } else {
+                    // `pub mod foo;` → external module reference, emit ImportsFrom edge
+                    edges.push(EdgeInfo {
+                        source_qualified: file_path.to_string(),
+                        target_qualified: name.clone(),
+                        kind: EdgeKind::ImportsFrom,
+                        file_path: file_path.to_string(),
+                        line: child.start_position().row + 1,
+                    });
+                }
+                continue;
+            }
+        }
+
+        // --- TypeScript: namespace/module blocks as namespaces ---
+        // `namespace Foo { ... }` or `module Foo { ... }` in .d.ts files
+        if matches!(*language, "typescript" | "tsx")
+            && matches!(node_type, "module" | "internal_module")
+        {
+            let ns_name = {
+                let mut c2 = child.walk();
+                let found = child.children(&mut c2)
+                    .find(|c| matches!(c.kind(), "identifier" | "nested_identifier" | "string"))
+                    .map(|c| {
+                        let t = node_text(&c, source);
+                        t.trim_matches(|ch| ch == '"' || ch == '\'').to_owned()
+                    });
+                found
+            };
+            if let Some(ref name) = ns_name {
+                let full_ns = match active_ns.as_deref() {
+                    Some(outer) => format!("{outer}.{name}"),
+                    None => name.clone(),
+                };
+                extract_from_tree(
+                    &child, ctx, nodes, edges, enclosing_class, enclosing_func,
+                    Some(&full_ns), depth + 1,
+                );
+                continue;
+            }
+        }
+
         let enc_ns = active_ns.as_deref();
+
+        // --- Zig: variable_declaration containing @import or anonymous types ---
+        if *language == "zig" && node_type == "variable_declaration" {
+            // Check for `const std = @import("std");` → emit ImportsFrom edge
+            let child_text = node_text(&child, source);
+            if child_text.contains("@import") {
+                // Extract the import path from `@import("...")`
+                if let Some(start) = child_text.find("@import(\"") {
+                    let after = &child_text[start + 9..];
+                    if let Some(end) = after.find('"') {
+                        let import_path = &after[..end];
+                        edges.push(EdgeInfo {
+                            source_qualified: file_path.to_string(),
+                            target_qualified: import_path.to_string(),
+                            kind: EdgeKind::ImportsFrom,
+                            file_path: file_path.to_string(),
+                            line: child.start_position().row + 1,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // `const Foo = struct { ... }` → variable_declaration contains
+            // struct_declaration as a child.  The name comes from the variable,
+            // not the (anonymous) type expression.
+            if let Some(zig_res) = zig_unwrap_type_binding(&child, source, lt) {
+                let (var_name, inner_node, node_kind) = zig_res;
+                let line_start = child.start_position().row + 1;
+                let line_end = child.end_position().row + 1;
+                let qualified = qualify(&var_name, file_path, enclosing_class, enc_ns);
+
+                nodes.push(NodeInfo {
+                    name: var_name.clone(),
+                    qualified_name: qualified.clone(),
+                    kind: node_kind,
+                    file_path: file_path.to_string(),
+                    line_start,
+                    line_end,
+                    language: language.to_string(),
+                    is_test: false,
+                    docstring: String::new(),
+                    signature: String::new(),
+                    body_hash: body_hash(&source[child.byte_range()]),
+                });
+
+                edges.push(EdgeInfo {
+                    source_qualified: file_path.to_string(),
+                    target_qualified: qualified.clone(),
+                    kind: EdgeKind::Contains,
+                    file_path: file_path.to_string(),
+                    line: line_start,
+                });
+
+                // Recurse into the inner type body (struct fields, methods, etc.)
+                extract_from_tree(
+                    &inner_node, ctx, nodes, edges,
+                    Some(&var_name), enclosing_func, enc_ns, depth + 1,
+                );
+                continue;
+            }
+        }
+
+        // --- Zig: test declarations ---
+        // `test "description" { ... }` are test_declaration nodes.
+        if *language == "zig" && node_type == "test_declaration" {
+            let test_name = zig_test_name(&child, source);
+            let qualified = qualify(&test_name, file_path, enclosing_class, enc_ns);
+            let line_start = child.start_position().row + 1;
+            let line_end = child.end_position().row + 1;
+
+            nodes.push(NodeInfo {
+                name: test_name.clone(),
+                qualified_name: qualified.clone(),
+                kind: NodeKind::Test,
+                file_path: file_path.to_string(),
+                line_start,
+                line_end,
+                language: language.to_string(),
+                is_test: true,
+                docstring: String::new(),
+                signature: String::new(),
+                body_hash: body_hash(&source[child.byte_range()]),
+            });
+
+            let container = match enclosing_func {
+                Some(f) => qualify(f, file_path, enclosing_class, enc_ns),
+                None => file_path.to_string(),
+            };
+            edges.push(EdgeInfo {
+                source_qualified: container,
+                target_qualified: qualified.clone(),
+                kind: EdgeKind::Contains,
+                file_path: file_path.to_string(),
+                line: line_start,
+            });
+
+            extract_from_tree(
+                &child, ctx, nodes, edges, enclosing_class, Some(&test_name), enc_ns, depth + 1,
+            );
+            continue;
+        }
 
         // --- Classes ---
         if lt.is_class(node_type) {
@@ -1086,6 +1570,14 @@ fn extract_from_tree(
                     file_path: file_path.to_string(),
                     line: line_start,
                 });
+
+                // For Rust trait declarations, recurse into the body to find
+                // function signatures and default method implementations.
+                if node_type == "trait_item" {
+                    extract_from_tree(
+                        &child, ctx, nodes, edges, Some(&name), None, enc_ns, depth + 1,
+                    );
+                }
 
                 // For interface declarations, index direct members (property signatures, methods).
                 if node_type == "interface_declaration" {
@@ -2155,6 +2647,8 @@ func main() { Hello() }
             ("foo.rb",    "ruby"),
             ("foo.kt",    "kotlin"),
             ("foo.swift", "swift"),
+            ("foo.zig",   "zig"),
+            ("build.zon", "zig"),
         ];
         let parser = CodeParser::new();
         for (filename, expected) in cases {
@@ -2805,7 +3299,6 @@ public class Service {
         assert!(test_nodes.is_empty(), "non-test methods should not be marked as tests");
     }
 
-    #[test]
     // -----------------------------------------------------------------------
     // C#: namespace-aware qualified names
     // -----------------------------------------------------------------------
@@ -2861,5 +3354,469 @@ public class TopLevel {
         // Without namespace, format should be file_path::TopLevel
         assert_eq!(class_node.qualified_name, "TopLevel.cs::TopLevel",
             "without namespace, qualified name should be simple");
+    }
+
+    // -----------------------------------------------------------------------
+    // Zig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zig_struct_from_variable_declaration() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const Allocator = struct {
+    ptr: *anyopaque,
+    pub fn alloc(self: Allocator, n: usize) ?[]u8 {
+        return null;
+    }
+};
+"#;
+        let (nodes, edges) = parse("alloc.zig", src);
+        let class_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Class).collect();
+        assert!(class_nodes.iter().any(|n| n.name == "Allocator"),
+            "expected Allocator struct as Class node, got: {:?}",
+            class_nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        let func_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+        assert!(func_nodes.iter().any(|n| n.name == "alloc"),
+            "expected alloc function inside struct");
+        let contains: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Contains).collect();
+        assert!(!contains.is_empty(), "expected CONTAINS edges");
+    }
+
+    #[test]
+    fn zig_enum_from_variable_declaration() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const Color = enum {
+    red,
+    green,
+    blue,
+};
+"#;
+        let (nodes, _) = parse("color.zig", src);
+        let class_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Class).collect();
+        assert!(class_nodes.iter().any(|n| n.name == "Color"),
+            "expected Color enum as Class node");
+    }
+
+    #[test]
+    fn zig_union_from_variable_declaration() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const Token = union(enum) {
+    number: f64,
+    string: []const u8,
+};
+"#;
+        let (nodes, _) = parse("token.zig", src);
+        let class_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Class).collect();
+        assert!(class_nodes.iter().any(|n| n.name == "Token"),
+            "expected Token union as Class node");
+    }
+
+    #[test]
+    fn zig_function_declaration() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+pub fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+fn helper() void {}
+"#;
+        let (nodes, _) = parse("math.zig", src);
+        let func_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Function).collect();
+        assert!(func_nodes.iter().any(|n| n.name == "add"), "expected add function");
+        assert!(func_nodes.iter().any(|n| n.name == "helper"), "expected helper function");
+    }
+
+    #[test]
+    fn zig_test_declaration() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const std = @import("std");
+
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+test "add works correctly" {
+    const result = add(2, 3);
+    try std.testing.expect(result == 5);
+}
+
+test "add with zero" {
+    try std.testing.expect(add(0, 5) == 5);
+}
+"#;
+        let (nodes, _) = parse("math.zig", src);
+        let test_nodes: Vec<_> = nodes.iter().filter(|n| n.is_test).collect();
+        assert!(test_nodes.len() >= 2,
+            "expected at least 2 test nodes, got {}: {:?}",
+            test_nodes.len(), test_nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        assert!(test_nodes.iter().any(|n| n.name == "add works correctly"),
+            "expected 'add works correctly' test");
+        assert!(test_nodes.iter().any(|n| n.name == "add with zero"),
+            "expected 'add with zero' test");
+    }
+
+    #[test]
+    fn zig_import_edges() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const std = @import("std");
+const mem = @import("mem");
+
+pub fn main() void {
+    std.debug.print("hello\n", .{});
+}
+"#;
+        let (_, edges) = parse("main.zig", src);
+        let imports: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::ImportsFrom).collect();
+        assert!(imports.iter().any(|e| e.target_qualified == "std"),
+            "expected import edge for std, got: {:?}",
+            imports.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
+        assert!(imports.iter().any(|e| e.target_qualified == "mem"),
+            "expected import edge for mem");
+    }
+
+    #[test]
+    fn zig_call_edges() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+fn helper() void {}
+
+pub fn main() void {
+    helper();
+}
+"#;
+        let (_, edges) = parse("main.zig", src);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        assert!(!calls.is_empty(), "expected CALLS edges");
+        assert!(calls.iter().any(|e| e.target_qualified.contains("helper")),
+            "expected call to helper, got: {:?}",
+            calls.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn zig_error_set_is_type() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const FileOpenError = error{
+    AccessDenied,
+    FileNotFound,
+};
+"#;
+        let (nodes, _) = parse("errors.zig", src);
+        let type_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
+        assert!(type_nodes.iter().any(|n| n.name == "FileOpenError"),
+            "expected FileOpenError as Type node, got: {:?}",
+            type_nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn zig_struct_with_methods_and_calls() {
+        if !grammar_available("zig") { return; }
+        let src = r#"
+const std = @import("std");
+
+const ArrayList = struct {
+    items: []u8,
+
+    pub fn init() ArrayList {
+        return ArrayList{ .items = &[_]u8{} };
+    }
+
+    pub fn append(self: *ArrayList, item: u8) void {
+        std.debug.print("appending\n", .{});
+    }
+};
+
+pub fn main() void {
+    var list = ArrayList.init();
+    list.append(42);
+}
+"#;
+        let (nodes, edges) = parse("list.zig", src);
+
+        // Struct as class
+        assert!(nodes.iter().any(|n| n.kind == NodeKind::Class && n.name == "ArrayList"),
+            "expected ArrayList class");
+
+        // Methods inside struct
+        let func_names: Vec<_> = nodes.iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(func_names.contains(&"init"), "expected init method");
+        assert!(func_names.contains(&"append"), "expected append method");
+        assert!(func_names.contains(&"main"), "expected main function");
+
+        // Contains edges for struct methods
+        let contains: Vec<_> = edges.iter()
+            .filter(|e| e.kind == EdgeKind::Contains && e.target_qualified.contains("ArrayList"))
+            .collect();
+        assert!(!contains.is_empty(), "expected CONTAINS edges for ArrayList");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rust enhancement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rust_mod_as_namespace() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+mod utils {
+    pub fn helper() -> i32 {
+        42
+    }
+
+    pub struct Config {
+    }
+}
+
+fn main() {
+    utils::helper();
+}
+"#;
+        let (nodes, _) = parse("main.rs", src);
+        let func = nodes.iter().find(|n| n.name == "helper").expect("expected helper");
+        assert!(func.qualified_name.contains("utils.helper"),
+            "expected qualified name to include namespace 'utils', got: {}", func.qualified_name);
+        let cls = nodes.iter().find(|n| n.name == "Config").expect("expected Config");
+        assert!(cls.qualified_name.contains("utils.Config"),
+            "expected Config qualified name to include namespace 'utils', got: {}", cls.qualified_name);
+    }
+
+    #[test]
+    fn rust_nested_mod_namespaces() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+mod outer {
+    mod inner {
+        pub fn deep() {}
+    }
+}
+"#;
+        let (nodes, _) = parse("lib.rs", src);
+        let func = nodes.iter().find(|n| n.name == "deep").expect("expected deep");
+        assert!(func.qualified_name.contains("outer.inner.deep"),
+            "expected nested namespace, got: {}", func.qualified_name);
+    }
+
+    #[test]
+    fn rust_extern_mod_import_edge() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+pub mod config;
+pub mod utils;
+
+fn main() {}
+"#;
+        let (_, edges) = parse("lib.rs", src);
+        let imports: Vec<_> = edges.iter()
+            .filter(|e| e.kind == EdgeKind::ImportsFrom)
+            .collect();
+        assert!(imports.iter().any(|e| e.target_qualified == "config"),
+            "expected ImportsFrom edge for config module, got: {:?}",
+            imports.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
+        assert!(imports.iter().any(|e| e.target_qualified == "utils"),
+            "expected ImportsFrom edge for utils module");
+    }
+
+    #[test]
+    fn rust_impl_trait_for_type_name() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+struct Foo;
+
+trait Display {
+    fn fmt(&self) -> String;
+}
+
+impl Display for Foo {
+    fn fmt(&self) -> String {
+        String::new()
+    }
+}
+"#;
+        let (nodes, _) = parse("foo.rs", src);
+        // The impl block should be named "Foo" (the type), not "Display" (the trait)
+        let impl_node = nodes.iter()
+            .find(|n| n.kind == NodeKind::Class && n.name == "Foo" && n.line_start > 5)
+            .expect("expected impl block named 'Foo' (the type being implemented for)");
+        assert!(impl_node.qualified_name.contains("Foo"),
+            "impl qualified name should contain Foo, got: {}", impl_node.qualified_name);
+
+        // There should be two fmt nodes: one in trait Display, one in impl Foo.
+        // The impl's fmt should be qualified under Foo, not Display.
+        let fmt_funcs: Vec<_> = nodes.iter().filter(|n| n.name == "fmt").collect();
+        assert!(fmt_funcs.len() >= 2,
+            "expected fmt in both trait and impl, got {} instances", fmt_funcs.len());
+        assert!(fmt_funcs.iter().any(|n| n.qualified_name.contains("Foo.fmt")),
+            "expected one fmt qualified under Foo, got: {:?}",
+            fmt_funcs.iter().map(|n| &n.qualified_name).collect::<Vec<_>>());
+        assert!(fmt_funcs.iter().any(|n| n.qualified_name.contains("Display.fmt")),
+            "expected one fmt qualified under Display (trait signature)");
+    }
+
+    #[test]
+    fn rust_impl_trait_inherits_edge() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+struct MyStruct;
+
+trait MyTrait {
+    fn do_thing(&self);
+}
+
+impl MyTrait for MyStruct {
+    fn do_thing(&self) {}
+}
+"#;
+        let (_, edges) = parse("foo.rs", src);
+        // Since MyTrait is a Type node (trait), the Inherits edge gets
+        // reclassified to Implements by the post-pass.
+        let impl_edges: Vec<_> = edges.iter()
+            .filter(|e| e.kind == EdgeKind::Implements || e.kind == EdgeKind::Inherits)
+            .collect();
+        assert!(impl_edges.iter().any(|e| e.target_qualified == "MyTrait"),
+            "expected Implements/Inherits edge to MyTrait, got: {:?}",
+            impl_edges.iter().map(|e| (&e.kind, &e.source_qualified, &e.target_qualified)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rust_trait_as_type_node() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+pub trait Iterator {
+    fn next(&mut self) -> Option<i32>;
+    fn size_hint(&self) -> (usize, Option<usize>);
+}
+"#;
+        let (nodes, _) = parse("iter.rs", src);
+        let type_nodes: Vec<_> = nodes.iter().filter(|n| n.kind == NodeKind::Type).collect();
+        assert!(type_nodes.iter().any(|n| n.name == "Iterator"),
+            "expected Iterator as Type node, got: {:?}",
+            type_nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        // Should NOT be a Class node
+        let class_nodes: Vec<_> = nodes.iter()
+            .filter(|n| n.kind == NodeKind::Class && n.name == "Iterator")
+            .collect();
+        assert!(class_nodes.is_empty(), "Iterator trait should not be a Class node");
+    }
+
+    #[test]
+    fn rust_trait_method_signatures_indexed() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+pub trait Repository {
+    fn find_by_id(&self, id: u64) -> Option<String>;
+    fn save(&mut self, item: String) -> bool;
+}
+"#;
+        let (nodes, _) = parse("repo.rs", src);
+        let func_nodes: Vec<_> = nodes.iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .collect();
+        assert!(func_nodes.iter().any(|n| n.name == "find_by_id"),
+            "expected find_by_id function signature in trait, got: {:?}",
+            func_nodes.iter().map(|n| &n.name).collect::<Vec<_>>());
+        assert!(func_nodes.iter().any(|n| n.name == "save"),
+            "expected save function signature in trait");
+    }
+
+    #[test]
+    fn rust_use_import_resolution() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use crate::utils::helper as my_helper;
+
+fn main() {
+    let map = HashMap::new();
+    my_helper();
+}
+"#;
+        let (_, edges) = parse("main.rs", src);
+        let calls: Vec<_> = edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        // HashMap call should resolve — check it's not just "HashMap"
+        let hm_call = calls.iter().find(|e| e.target_qualified.contains("HashMap"));
+        assert!(hm_call.is_some(), "expected call to HashMap, got: {:?}",
+            calls.iter().map(|e| &e.target_qualified).collect::<Vec<_>>());
+        // my_helper should resolve via alias
+        let helper_call = calls.iter().find(|e| e.target_qualified.contains("my_helper") || e.target_qualified.contains("helper"));
+        assert!(helper_call.is_some(), "expected call to my_helper/helper");
+    }
+
+    #[test]
+    fn rust_plain_impl_name_unchanged() {
+        if !grammar_available("rs") { return; }
+        let src = r#"
+struct Vec<T> {
+}
+
+impl Vec<i32> {
+    fn push(&mut self, item: i32) {}
+}
+"#;
+        let (nodes, _) = parse("vec.rs", src);
+        // Plain impl (no trait) should still be named after the type
+        let impl_node = nodes.iter()
+            .find(|n| n.kind == NodeKind::Class && n.line_start > 3)
+            .expect("expected impl block");
+        assert!(impl_node.name == "Vec",
+            "plain impl should be named Vec, got: {}", impl_node.name);
+    }
+
+    // -----------------------------------------------------------------------
+    // TypeScript enhancement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ts_public_field_definition_indexed() {
+        if !grammar_available("ts") { return; }
+        let src = r#"
+class Config {
+    public readonly name: string;
+    public value: number = 42;
+
+    constructor(name: string) {
+        this.name = name;
+    }
+}
+"#;
+        let (nodes, _) = parse("config.ts", src);
+        let func_nodes: Vec<_> = nodes.iter()
+            .filter(|n| n.kind == NodeKind::Function)
+            .collect();
+        let func_names: Vec<&str> = func_nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(func_names.contains(&"name") || func_names.contains(&"value"),
+            "expected class fields as Function nodes, got: {:?}", func_names);
+    }
+
+    #[test]
+    fn ts_namespace_qualified_names() {
+        if !grammar_available("ts") { return; }
+        let src = r#"
+namespace Models {
+    export interface User {
+        name: string;
+    }
+
+    export function createUser(): User {
+        return { name: "" };
+    }
+}
+"#;
+        let (nodes, _) = parse("models.ts", src);
+        // Check if namespace is reflected in qualified names
+        let create_fn = nodes.iter().find(|n| n.name == "createUser");
+        if let Some(f) = create_fn {
+            assert!(f.qualified_name.contains("Models"),
+                "expected Models namespace in qualified name, got: {}", f.qualified_name);
+        }
     }
 }
