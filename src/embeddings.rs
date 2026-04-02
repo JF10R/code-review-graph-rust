@@ -18,6 +18,8 @@
 //! postcard/zstd pattern as `graph.rs`.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "hnsw-index")]
+use std::time::Instant;
 use camino::{Utf8Path, Utf8PathBuf};
 
 #[cfg(feature = "hnsw-index")]
@@ -590,22 +592,62 @@ struct FastEmbedProvider {
 #[cfg(feature = "embeddings-fastembed")]
 impl FastEmbedProvider {
     fn new() -> Result<Self> {
-        #[allow(unused_mut)]
-        let mut init = fastembed::InitOptions::new(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode)
-            .with_show_download_progress(true);
-
-        #[cfg(feature = "gpu-directml")]
+        // Try GPU first (compile-time gated), fall back to CPU on any failure.
+        #[cfg(any(feature = "gpu-directml", feature = "gpu-cuda"))]
         {
-            use ort::execution_providers::DirectMLExecutionProvider;
-            tracing::info!("DirectML GPU acceleration enabled — trying GPU first, CPU fallback");
-            init = init.with_execution_providers(vec![
-                DirectMLExecutionProvider::default().build(),
-            ]);
+            match Self::try_gpu_init() {
+                Ok(model) => return Ok(Self { model }),
+                Err(e) => tracing::warn!("GPU embedding init failed ({e}), falling back to CPU"),
+            }
         }
 
+        // CPU path (default, or GPU fallback).
+        let init = fastembed::InitOptions::new(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode)
+            .with_show_download_progress(true);
         let model = fastembed::TextEmbedding::try_new(init)
-            .map_err(|e| CrgError::Other(format!("fastembed init: {e}")))?;
+            .map_err(|e| CrgError::Other(format!("fastembed CPU init: {e}")))?;
+        tracing::info!("Embedding provider: fastembed (CPU)");
         Ok(Self { model })
+    }
+
+    /// Attempt GPU-accelerated model init, catching both errors and ONNX FFI panics.
+    #[cfg(any(feature = "gpu-directml", feature = "gpu-cuda"))]
+    fn try_gpu_init() -> Result<fastembed::TextEmbedding> {
+        let result = std::panic::catch_unwind(|| {
+            let mut init = fastembed::InitOptions::new(
+                fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            )
+            .with_show_download_progress(true);
+
+            // CUDA takes priority over DirectML when both features are compiled.
+            #[cfg(feature = "gpu-cuda")]
+            {
+                use ort::execution_providers::CUDAExecutionProvider;
+                tracing::info!("CUDA GPU acceleration enabled");
+                init = init.with_execution_providers(vec![
+                    CUDAExecutionProvider::default().build(),
+                ]);
+            }
+            #[cfg(all(feature = "gpu-directml", not(feature = "gpu-cuda")))]
+            {
+                use ort::execution_providers::DirectMLExecutionProvider;
+                tracing::info!("DirectML GPU acceleration enabled");
+                init = init.with_execution_providers(vec![
+                    DirectMLExecutionProvider::default().build(),
+                ]);
+            }
+
+            fastembed::TextEmbedding::try_new(init)
+        });
+
+        match result {
+            Ok(Ok(model)) => {
+                tracing::info!("Embedding provider: fastembed (GPU)");
+                Ok(model)
+            }
+            Ok(Err(e)) => Err(CrgError::Other(format!("GPU init error: {e}"))),
+            Err(_) => Err(CrgError::Other("GPU init panicked (ONNX FFI crash)".into())),
+        }
     }
 }
 
@@ -902,6 +944,15 @@ pub struct EmbeddingStore {
     provider: Option<Box<dyn EmbeddingProvider>>,
     #[cfg(feature = "hnsw-index")]
     hnsw_cache: Option<HnswIndex>,
+    /// Dirty flag: set on mutation, cleared on HNSW rebuild.
+    /// When true + cache exists, the cache is stale but still usable.
+    #[cfg(feature = "hnsw-index")]
+    hnsw_dirty: bool,
+    /// Timestamp of last HNSW rebuild — used to debounce rebuilds.
+    #[cfg(feature = "hnsw-index")]
+    hnsw_last_rebuild: Option<Instant>,
+    /// Mutation counter since last gc() — triggers periodic GC.
+    mutations_since_gc: u32,
 }
 
 /// Derive the file-embeddings path from the node-embeddings path.
@@ -961,6 +1012,11 @@ impl EmbeddingStore {
             provider,
             #[cfg(feature = "hnsw-index")]
             hnsw_cache: None,
+            #[cfg(feature = "hnsw-index")]
+            hnsw_dirty: false,
+            #[cfg(feature = "hnsw-index")]
+            hnsw_last_rebuild: None,
+            mutations_since_gc: 0,
         })
     }
 
@@ -1014,9 +1070,35 @@ impl EmbeddingStore {
             }
             self.rebuild_data_from_lookup();
             #[cfg(feature = "hnsw-index")]
-            { self.hnsw_cache = None; }
+            { self.hnsw_dirty = true; }
         }
         Ok(removed)
+    }
+
+    /// Run gc if mutation counter exceeds threshold.
+    /// Call this after build_graph or watcher mutations to prevent
+    /// unbounded vector accumulation between sync_embeddings calls.
+    pub fn maybe_gc(&mut self, store: &GraphStore) -> Result<usize> {
+        const GC_MUTATION_THRESHOLD: u32 = 500;
+        if self.mutations_since_gc >= GC_MUTATION_THRESHOLD {
+            tracing::info!(
+                "Embedding auto-GC triggered ({} mutations, {} vectors, {} lookup entries)",
+                self.mutations_since_gc,
+                self.data.vectors.len(),
+                self.lookup.len(),
+            );
+            let removed = self.gc(store)?;
+            tracing::info!(
+                "Embedding auto-GC complete: removed={}, vectors_after={}, lookup_after={}",
+                removed,
+                self.data.vectors.len(),
+                self.lookup.len(),
+            );
+            self.mutations_since_gc = 0;
+            Ok(removed)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Persist in-memory state to disk (nodes + files).
@@ -1040,6 +1122,7 @@ impl EmbeddingStore {
     /// Insert or update a node's embedding in both the runtime lookup and the
     /// underlying V2 data structures.  Uses reverse maps for O(1) insert.
     fn insert_node(&mut self, qname: &str, vec: Vec<f32>, text_hash: [u8; 8], vector_idx: usize) {
+        self.mutations_since_gc += 1;
         // O(1) string table lookup via reverse map.
         let string_idx = match self.name_to_idx.get(qname) {
             Some(&idx) => idx,
@@ -1233,7 +1316,9 @@ impl EmbeddingStore {
 #[cfg(feature = "hnsw-index")]
 pub struct HnswIndex {
     index: Index,
-    key_to_name: HashMap<u64, String>,
+    /// Sequential key→name mapping.  Keys are dense 0..N so a Vec
+    /// is both faster and smaller than a HashMap<u64, String>.
+    key_to_name: Vec<String>,
 }
 
 #[cfg(feature = "hnsw-index")]
@@ -1260,14 +1345,14 @@ impl HnswIndex {
             .reserve(emb_store.lookup.len())
             .map_err(|e| CrgError::Other(format!("HNSW reserve: {e}")))?;
 
-        let mut key_to_name = HashMap::new();
+        let mut key_to_name = Vec::with_capacity(emb_store.lookup.len());
         for (i, (qn, (vec_idx, _))) in emb_store.lookup.iter().enumerate() {
             let key = i as u64;
             if let Some(vec) = emb_store.data.vectors.get(*vec_idx) {
                 index
                     .add(key, vec)
                     .map_err(|e| CrgError::Other(format!("HNSW add: {e}")))?;
-                key_to_name.insert(key, qn.clone());
+                key_to_name.push(qn.clone());
             }
         }
 
@@ -1286,7 +1371,7 @@ impl HnswIndex {
                 .zip(results.distances.iter())
                 .filter_map(|(&key, &dist)| {
                     self.key_to_name
-                        .get(&key)
+                        .get(key as usize)
                         .map(|name| (name.clone(), 1.0 - dist))
                 })
                 .collect(),
@@ -1337,7 +1422,11 @@ pub fn embed_all_nodes(
         emb_store.name_to_idx.clear();
         emb_store.hash_to_vec.clear();
         #[cfg(feature = "hnsw-index")]
-        { emb_store.hnsw_cache = None; }
+        {
+            // Provider changed — data wiped, cache is completely invalid.
+            emb_store.hnsw_cache = None;
+            emb_store.hnsw_dirty = false;
+        }
     }
 
     // GC: remove embeddings for nodes no longer in the graph.
@@ -1410,32 +1499,37 @@ pub fn embed_all_nodes(
         }
     }
 
-    // Embed new texts in batches.
-    let mut all_results: Vec<([u8; 8], Vec<String>, Vec<f32>)> = Vec::new();
-    {
-        let provider = emb_store.provider.as_mut().expect("checked above");
-        for chunk in need_embed.chunks(100) {
+    // Embed new texts in batches — process each batch before moving to the
+    // next to avoid accumulating all vectors in a single temporary Vec.
+    for chunk in need_embed.chunks(100) {
+        let batch_results: Vec<([u8; 8], Vec<String>, Vec<f32>)> = {
+            let provider = emb_store.provider.as_mut().expect("checked above");
             let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
             let vectors = provider.embed_batch(&texts)?;
-            for ((hash, _, qnames), vec) in chunk.iter().zip(vectors) {
-                all_results.push((*hash, qnames.clone(), vec));
+            chunk
+                .iter()
+                .zip(vectors)
+                .map(|((hash, _, qnames), vec)| (*hash, qnames.clone(), vec))
+                .collect()
+        };
+        for (hash, qnames, vec) in batch_results {
+            let vector_idx = emb_store.data.vectors.len();
+            emb_store.data.vectors.push(vec.clone());
+            for qn in &qnames {
+                emb_store.insert_node(qn, vec.clone(), hash, vector_idx);
+                count += 1;
             }
-        }
-    }
-
-    for (hash, qnames, vec) in all_results {
-        let vector_idx = emb_store.data.vectors.len();
-        emb_store.data.vectors.push(vec.clone());
-
-        for qn in &qnames {
-            emb_store.insert_node(qn, vec.clone(), hash, vector_idx);
-            count += 1;
         }
     }
 
     emb_store.save()?;
     #[cfg(feature = "hnsw-index")]
-    { emb_store.hnsw_cache = None; }
+    {
+        // New vectors added — mark stale but don't drop the index.
+        // Next search will rebuild if enough time has elapsed.
+        emb_store.hnsw_dirty = true;
+    }
+    emb_store.mutations_since_gc = 0; // sync_embeddings includes gc
     Ok(count)
 }
 
@@ -1462,17 +1556,54 @@ pub fn semantic_search(
     let query_vec = &query_vecs[0];
 
     // Use HNSW approximate nearest-neighbour search when the feature is compiled in.
+    // Debounced: when dirty, reuse the stale index unless ≥30s since last rebuild.
+    // This prevents 1GB transient spikes from rapid mutation→search cycles.
     #[cfg(feature = "hnsw-index")]
     {
-        let cached = emb_store.hnsw_cache.is_some();
-        let _span = tracing::info_span!("hnsw_search", cached).entered();
-        if emb_store.hnsw_cache.is_none() {
+        const HNSW_REBUILD_INTERVAL_SECS: u64 = 30;
+
+        let needs_rebuild = emb_store.hnsw_cache.is_none()
+            || (emb_store.hnsw_dirty && emb_store.hnsw_last_rebuild
+                .map_or(true, |t| t.elapsed().as_secs() >= HNSW_REBUILD_INTERVAL_SECS));
+
+        let cached = emb_store.hnsw_cache.is_some() && !needs_rebuild;
+        let _span = tracing::info_span!("hnsw_search", cached, dirty = emb_store.hnsw_dirty).entered();
+
+        if needs_rebuild {
+            let had_cache = emb_store.hnsw_cache.is_some();
+            let vec_count = emb_store.lookup.len();
+            tracing::info!(
+                "HNSW rebuild: had_cache={}, dirty={}, vectors={}, elapsed_since_last={:.1}s",
+                had_cache,
+                emb_store.hnsw_dirty,
+                vec_count,
+                emb_store.hnsw_last_rebuild
+                    .map_or(f64::INFINITY, |t| t.elapsed().as_secs_f64()),
+            );
+            // Drop old index BEFORE building new one to avoid 2x peak memory.
+            emb_store.hnsw_cache = None;
+            let start = Instant::now();
             match HnswIndex::build(emb_store) {
-                Ok(idx) => { emb_store.hnsw_cache = Some(idx); }
+                Ok(idx) => {
+                    tracing::info!(
+                        "HNSW rebuild complete: {} vectors in {:.1}s",
+                        vec_count,
+                        start.elapsed().as_secs_f64(),
+                    );
+                    emb_store.hnsw_cache = Some(idx);
+                    emb_store.hnsw_dirty = false;
+                    emb_store.hnsw_last_rebuild = Some(Instant::now());
+                }
                 Err(e) => {
                     tracing::warn!("HNSW index build failed ({}); falling back to linear scan", e);
                 }
             }
+        } else if emb_store.hnsw_dirty {
+            tracing::debug!(
+                "HNSW search: using stale cache ({:.0}s since rebuild, dirty=true)",
+                emb_store.hnsw_last_rebuild
+                    .map_or(0.0, |t| t.elapsed().as_secs_f64()),
+            );
         }
         if let Some(ref idx) = emb_store.hnsw_cache {
             let scored = idx
@@ -2028,6 +2159,201 @@ mod tests {
         assert_eq!(*h, hash);
         // 0.5, -0.5, 1.0 are exact in f16.
         assert_eq!(&reloaded.file_data.vectors[*idx], &[0.5f32, -0.5, 1.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Memory-leak regression tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a GraphStore + EmbeddingStore pair in a temp directory.
+    fn test_stores() -> (crate::graph::GraphStore, EmbeddingStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let graph_path = dir.path().join("graph.bin.zst");
+        let emb_path = dir.path().join("embeddings.bin.zst");
+        let store = crate::graph::GraphStore::new(p(&graph_path)).unwrap();
+        let emb_store = EmbeddingStore::new(p(&emb_path)).unwrap();
+        (store, emb_store, dir)
+    }
+
+    /// Helper: build a NodeInfo for graph insertion.
+    fn make_graph_node(name: &str, file: &str) -> crate::types::NodeInfo {
+        crate::types::NodeInfo {
+            name: name.to_string(),
+            qualified_name: format!("{file}::{name}"),
+            kind: NodeKind::Function,
+            file_path: file.to_string(),
+            line_start: 1,
+            line_end: 10,
+            language: "python".to_string(),
+            is_test: false,
+            docstring: String::new(),
+            signature: format!("def {name}()"),
+            body_hash: format!("hash_{name}"),
+        }
+    }
+
+    #[test]
+    fn gc_removes_stale_embeddings_after_node_removal() {
+        let (mut graph, mut emb, _dir) = test_stores();
+
+        // Insert 5 nodes into graph and their embeddings.
+        let nodes: Vec<_> = (0..5)
+            .map(|i| make_graph_node(&format!("fn_{i}"), "src/lib.py"))
+            .collect();
+        graph
+            .store_file_nodes_edges("src/lib.py", &nodes, &[], "aaa")
+            .unwrap();
+        for (i, n) in nodes.iter().enumerate() {
+            let vec = vec![i as f32; 4];
+            let hash = text_hash(&format!("text_{i}"));
+            let idx = emb.data.vectors.len();
+            emb.insert_node(&n.qualified_name, vec, hash, idx);
+        }
+        assert_eq!(emb.count().unwrap(), 5);
+        assert_eq!(emb.data.vectors.len(), 5);
+
+        // Remove the file from the graph → all 5 nodes become stale.
+        graph.remove_file_data("src/lib.py").unwrap();
+        let removed = emb.gc(&graph).unwrap();
+
+        assert_eq!(removed, 5, "GC should remove all 5 stale embeddings");
+        assert_eq!(emb.count().unwrap(), 0, "lookup must be empty after GC");
+        assert_eq!(
+            emb.data.vectors.len(),
+            0,
+            "vectors must be compacted to 0 after GC rebuild"
+        );
+    }
+
+    #[test]
+    fn gc_keeps_live_nodes_removes_only_stale() {
+        let (mut graph, mut emb, _dir) = test_stores();
+
+        // Insert nodes in two files.
+        let nodes_a: Vec<_> = (0..3)
+            .map(|i| make_graph_node(&format!("a_{i}"), "src/a.py"))
+            .collect();
+        let nodes_b: Vec<_> = (0..2)
+            .map(|i| make_graph_node(&format!("b_{i}"), "src/b.py"))
+            .collect();
+        graph
+            .store_file_nodes_edges("src/a.py", &nodes_a, &[], "aaa")
+            .unwrap();
+        graph
+            .store_file_nodes_edges("src/b.py", &nodes_b, &[], "bbb")
+            .unwrap();
+
+        for (i, n) in nodes_a.iter().chain(nodes_b.iter()).enumerate() {
+            let vec = vec![i as f32; 4];
+            let hash = text_hash(&format!("text_{i}"));
+            let idx = emb.data.vectors.len();
+            emb.insert_node(&n.qualified_name, vec, hash, idx);
+        }
+        assert_eq!(emb.count().unwrap(), 5);
+
+        // Remove only file B → 2 nodes become stale, 3 remain.
+        graph.remove_file_data("src/b.py").unwrap();
+        let removed = emb.gc(&graph).unwrap();
+
+        assert_eq!(removed, 2);
+        assert_eq!(emb.count().unwrap(), 3, "3 live nodes must survive GC");
+        assert!(
+            emb.data.vectors.len() <= 3,
+            "vectors should be compacted: got {}",
+            emb.data.vectors.len()
+        );
+    }
+
+    #[test]
+    fn repeated_insert_gc_cycles_stay_bounded() {
+        let (mut graph, mut emb, _dir) = test_stores();
+
+        // Simulate 10 cycles of: add nodes → embed → remove → GC.
+        for cycle in 0..10u32 {
+            let file = format!("src/cycle_{cycle}.py");
+            let nodes: Vec<_> = (0..50)
+                .map(|i| make_graph_node(&format!("fn_{cycle}_{i}"), &file))
+                .collect();
+            graph
+                .store_file_nodes_edges(&file, &nodes, &[], &format!("h{cycle}"))
+                .unwrap();
+
+            for (i, n) in nodes.iter().enumerate() {
+                let vec = vec![(cycle * 50 + i as u32) as f32; 4];
+                let hash = text_hash(&format!("text_{cycle}_{i}"));
+                let idx = emb.data.vectors.len();
+                emb.insert_node(&n.qualified_name, vec, hash, idx);
+            }
+
+            // Remove previous cycle's file (if any).
+            if cycle > 0 {
+                let prev_file = format!("src/cycle_{}.py", cycle - 1);
+                graph.remove_file_data(&prev_file).unwrap();
+                emb.gc(&graph).unwrap();
+            }
+        }
+
+        // After 10 cycles, only the last cycle's 50 nodes should be live.
+        // GC the last-but-one cycle.
+        graph
+            .remove_file_data(&format!("src/cycle_{}.py", 8))
+            .unwrap();
+        emb.gc(&graph).unwrap();
+
+        assert_eq!(
+            emb.count().unwrap(),
+            50,
+            "only the last cycle's 50 nodes should remain"
+        );
+        assert!(
+            emb.data.vectors.len() <= 50,
+            "vectors should not accumulate: got {}",
+            emb.data.vectors.len()
+        );
+        assert!(
+            emb.data.names.len() <= 50,
+            "names should not accumulate: got {}",
+            emb.data.names.len()
+        );
+    }
+
+    #[test]
+    fn embedding_store_data_structures_consistent_after_operations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.embeddings.bin.zst");
+        let mut store = EmbeddingStore::new(p(&path)).unwrap();
+
+        // Insert 100 entries.
+        for i in 0..100u32 {
+            let qn = format!("mod::fn_{i}");
+            let vec = vec![i as f32; 4];
+            let hash = text_hash(&format!("text_{i}"));
+            let idx = store.data.vectors.len();
+            store.insert_node(&qn, vec, hash, idx);
+        }
+
+        // Verify sizes are consistent.
+        assert_eq!(store.count().unwrap(), 100);
+        assert_eq!(store.lookup.len(), 100);
+        assert_eq!(store.data.entries.len(), 100);
+        assert_eq!(store.data.names.len(), 100);
+        assert_eq!(store.data.vectors.len(), 100);
+
+        // Remove half the entries directly.
+        for i in 0..50u32 {
+            store.remove_node(&format!("mod::fn_{i}")).unwrap();
+        }
+
+        // After removal + rebuild, everything should be compact.
+        assert_eq!(store.count().unwrap(), 50);
+        assert_eq!(store.lookup.len(), 50);
+        assert_eq!(store.data.entries.len(), 50);
+        assert_eq!(store.data.names.len(), 50);
+        assert!(
+            store.data.vectors.len() <= 50,
+            "vectors should be compacted: got {}",
+            store.data.vectors.len()
+        );
     }
 
     #[test]

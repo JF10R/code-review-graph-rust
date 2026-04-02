@@ -14,6 +14,7 @@ path = "src/main.rs"
 default = ["embeddings-fastembed"]
 embeddings-fastembed = ["dep:fastembed"]
 gpu-directml = ["dep:ort"]
+gpu-cuda = ["dep:ort"]
 embeddings-local = [
     "dep:candle-core",
     "dep:candle-nn",
@@ -28,8 +29,9 @@ tantivy-search = ["dep:tantivy"]
 # Fast local embeddings via fastembed (default — free, no API key needed)
 fastembed = { version = "5", optional = true }
 
-# GPU acceleration via DirectML (Windows, any GPU)
-ort = { version = "2.0.0-rc", optional = true, features = ["directml"] }
+# GPU acceleration — DirectML (Windows, any GPU) or CUDA (NVIDIA, recommended)
+# Both features compile into the same ort dep; only the registered EP is used at runtime.
+ort = { version = "2.0.0-rc", optional = true, features = ["directml", "cuda"] }
 
 # HNSW vector index (optional accelerated search)
 usearch = { version = "2", optional = true }

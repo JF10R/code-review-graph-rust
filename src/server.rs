@@ -371,6 +371,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
     };
     let parser = crate::parser::CodeParser::new();
     let mut tree_cache: HashMap<String, tree_sitter::Tree> = HashMap::new();
+    const MAX_TREE_CACHE: usize = 2_000;
 
     // Cached Tantivy full-text index — rebuilt after every store mutation.
     // Eliminates per-query index reconstruction on the keyword search path.
@@ -428,112 +429,156 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
         };
     }
 
+    // Helper: wrap a closure in catch_unwind, format panic as Err(String).
+    macro_rules! catch_panic {
+        ($name:expr, $body:expr) => {{
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { $body }));
+            match result {
+                Ok(v) => v,
+                Err(panic_info) => {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        format!("worker panic in {}: {s}", $name)
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        format!("worker panic in {}: {s}", $name)
+                    } else {
+                        format!("worker panic in {}: <unknown>", $name)
+                    };
+                    tracing::error!("{msg}");
+                    Err(msg)
+                }
+            }
+        }};
+    }
+
     for cmd in cmd_rx {
         match cmd {
             WorkerCommand::QueryGraph { pattern, target, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "query_graph").entered();
-                let result = crate::tools::query_graph_with_store(&store, &root, &pattern, &target, compact)
-                    .map_err(|e| e.to_string());
+                let result = catch_panic!("query_graph",
+                    crate::tools::query_graph_with_store(&store, &root, &pattern, &target, compact)
+                        .map_err(|e| e.to_string())
+                );
                 let _ = reply.send(result);
             }
 
             WorkerCommand::SemanticSearch { query, kind, limit, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "semantic_search").entered();
-                let kw_hits = kw_hits!(&query, limit * 2);
-                let result = crate::tools::semantic_search_nodes_with_store(
-                    &store, &mut emb_store, &root, &query, kind.as_deref(), limit, compact, kw_hits,
-                ).map_err(|e| e.to_string());
+                let result = catch_panic!("semantic_search", {
+                    let kw_hits = kw_hits!(&query, limit * 2);
+                    crate::tools::semantic_search_nodes_with_store(
+                        &store, &mut emb_store, &root, &query, kind.as_deref(), limit, compact, kw_hits,
+                    ).map_err(|e| e.to_string())
+                });
                 let _ = reply.send(result);
             }
 
             WorkerCommand::OpenNodeContext { target, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "open_node_context").entered();
-                let result = crate::tools::open_node_context_with_store(&store, &root, &target, compact)
-                    .map_err(|e| e.to_string());
+                let result = catch_panic!("open_node_context",
+                    crate::tools::open_node_context_with_store(&store, &root, &target, compact)
+                        .map_err(|e| e.to_string())
+                );
                 let _ = reply.send(result);
             }
 
             WorkerCommand::BatchNodeContext { targets, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "batch_node_context").entered();
-                let result = crate::tools::batch_open_node_context_with_store(&store, &root, targets, compact)
-                    .map_err(|e| e.to_string());
+                let result = catch_panic!("batch_node_context",
+                    crate::tools::batch_open_node_context_with_store(&store, &root, targets, compact)
+                        .map_err(|e| e.to_string())
+                );
                 let _ = reply.send(result);
             }
 
             WorkerCommand::ImpactRadius { changed_files, max_depth, compact, base, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "impact_radius").entered();
-                let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
-                let result = crate::tools::get_impact_radius_with_store(&store, &root, files, max_depth, compact)
-                    .map_err(|e| e.to_string());
+                let result = catch_panic!("impact_radius", {
+                    let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
+                    crate::tools::get_impact_radius_with_store(&store, &root, files, max_depth, compact)
+                        .map_err(|e| e.to_string())
+                });
                 let _ = reply.send(result);
             }
 
             WorkerCommand::TraceCallChain { from, to, max_depth, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "trace_call_chain").entered();
-                let result = crate::tools::trace_call_chain_with_store(&store, &root, &from, &to, max_depth, compact)
-                    .map_err(|e| e.to_string());
+                let result = catch_panic!("trace_call_chain",
+                    crate::tools::trace_call_chain_with_store(&store, &root, &from, &to, max_depth, compact)
+                        .map_err(|e| e.to_string())
+                );
                 let _ = reply.send(result);
             }
 
             WorkerCommand::HybridQuery { query, limit, compact, fusion, route, debug, result_mode, budget, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
-                let kw_hits = kw_hits!(&query, limit * 2);
-                let result = crate::tools::hybrid_query_with_store(
-                    &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None, budget.as_deref(),
-                ).map_err(|e| e.to_string());
+                let result = catch_panic!("hybrid_query", {
+                    let kw_hits = kw_hits!(&query, limit * 2);
+                    crate::tools::hybrid_query_with_store(
+                        &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None, budget.as_deref(),
+                    ).map_err(|e| e.to_string())
+                });
                 let _ = reply.send(result);
             }
 
             WorkerCommand::ListStats { reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "list_stats").entered();
-                let result = crate::tools::list_graph_stats_with_store(&store, &root)
-                    .map_err(|e| e.to_string());
+                let result = catch_panic!("list_stats",
+                    crate::tools::list_graph_stats_with_store(&store, &root)
+                        .map_err(|e| e.to_string())
+                );
                 let _ = reply.send(result);
             }
 
             WorkerCommand::FindLargeFunctions { min_lines, kind, file_path_pattern, limit, compact, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "find_large_functions").entered();
-                let result = crate::tools::find_large_functions_with_store(
-                    &store, &root, min_lines, kind.as_deref(), file_path_pattern.as_deref(), limit, compact,
-                ).map_err(|e| e.to_string());
+                let result = catch_panic!("find_large_functions",
+                    crate::tools::find_large_functions_with_store(
+                        &store, &root, min_lines, kind.as_deref(), file_path_pattern.as_deref(), limit, compact,
+                    ).map_err(|e| e.to_string())
+                );
                 let _ = reply.send(result);
             }
 
             WorkerCommand::GetReviewContext { changed_files, max_depth, include_source, max_lines, compact, base, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "get_review_context").entered();
-                let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
-                let result = crate::tools::get_review_context_with_store(
-                    &store, &root, files, max_depth, include_source, max_lines, compact,
-                ).map_err(|e| e.to_string());
+                let result = catch_panic!("get_review_context", {
+                    let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
+                    crate::tools::get_review_context_with_store(
+                        &store, &root, files, max_depth, include_source, max_lines, compact,
+                    ).map_err(|e| e.to_string())
+                });
                 let _ = reply.send(result);
             }
 
             WorkerCommand::BuildGraph { full_rebuild, base, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "build_graph").entered();
-                // build_or_update_graph opens its own store, writes to disk, closes it.
-                let root_str = root.as_str().to_owned();
-                let result = crate::tools::build_or_update_graph(full_rebuild, Some(&root_str), &base)
-                    .map_err(|e| e.to_string());
-                // Reload worker's in-memory store from disk.
-                reload_store!();
-                #[cfg(feature = "tantivy-search")]
-                rebuild_tantivy!();
+                let result = catch_panic!("build_graph", {
+                    let root_str = root.as_str().to_owned();
+                    let r = crate::tools::build_or_update_graph(full_rebuild, Some(&root_str), &base)
+                        .map_err(|e| e.to_string());
+                    reload_store!();
+                    #[cfg(feature = "tantivy-search")]
+                    rebuild_tantivy!();
+                    r
+                });
                 let _ = reply.send(result);
             }
 
             WorkerCommand::EmbedGraph { reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "embed_graph").entered();
-                // embed_graph opens its own stores, writes to disk, closes them.
-                let root_str = root.as_str().to_owned();
-                let result = crate::tools::embed_graph(Some(&root_str))
-                    .map_err(|e| e.to_string());
-                // Reload worker's in-memory embedding store from disk.
-                reload_emb!();
+                let result = catch_panic!("embed_graph", {
+                    let root_str = root.as_str().to_owned();
+                    let r = crate::tools::embed_graph(Some(&root_str))
+                        .map_err(|e| e.to_string());
+                    reload_emb!();
+                    r
+                });
                 let _ = reply.send(result);
             }
 
             WorkerCommand::WatcherUpdate { paths } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "watcher_update").entered();
+                let watcher_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Track processed paths to guard against circular import cycles.
                 let mut processed: HashSet<String> = paths
                     .iter()
@@ -600,15 +645,29 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                     }
                 }
 
+                // Evict tree cache when it grows too large to bound memory.
+                if evict_if_over(&mut tree_cache, MAX_TREE_CACHE) {
+                    tracing::info!("tree_cache evicted (exceeded {MAX_TREE_CACHE} entries)");
+                }
+
                 if let Err(e) = store.commit() {
                     tracing::error!("Worker commit error: {e}");
                 }
+                // Periodic GC to prevent unbounded vector accumulation.
+                if let Err(e) = emb_store.maybe_gc(&store) {
+                    tracing::warn!("Worker embedding GC: {e}");
+                }
                 #[cfg(feature = "tantivy-search")]
                 rebuild_tantivy!();
+                }));
+                if let Err(e) = watcher_result {
+                    tracing::error!("worker panic in watcher_update: {:?}", e);
+                }
             }
 
             WorkerCommand::WatcherRemove { paths } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "watcher_remove").entered();
+                let watcher_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 for path in &paths {
                     let abs_str = crate::paths::normalize_path(&path.to_string_lossy());
                     tree_cache.remove(&abs_str);
@@ -623,6 +682,10 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 }
                 #[cfg(feature = "tantivy-search")]
                 rebuild_tantivy!();
+                }));
+                if let Err(e) = watcher_result {
+                    tracing::error!("worker panic in watcher_remove: {:?}", e);
+                }
             }
 
             WorkerCommand::Shutdown => break,
@@ -1279,6 +1342,108 @@ fn run_watcher_notifier(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-repo instance lock — prevents multiple MCP servers for the same repo.
+// ---------------------------------------------------------------------------
+
+/// RAII guard that holds an exclusive file lock. Released on drop.
+struct InstanceLock {
+    _file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // File close releases the OS lock automatically.
+        // Clean up the lock file (best-effort).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Try to acquire an exclusive, non-blocking file lock.
+/// Returns `true` on success, `false` if another process holds the lock.
+#[cfg(windows)]
+fn try_exclusive_lock(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    // LockFileEx with LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY.
+    // We call it via raw FFI to avoid pulling in windows-sys as a dependency.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(
+            hFile: *mut std::ffi::c_void,
+            dwFlags: u32,
+            dwReserved: u32,
+            nNumberOfBytesToLockLow: u32,
+            nNumberOfBytesToLockHigh: u32,
+            lpOverlapped: *mut [u8; 32], // OVERLAPPED is 32 bytes on x64
+        ) -> i32;
+    }
+    let mut overlapped = [0u8; 32];
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x00000002;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x00000001;
+    unsafe {
+        LockFileEx(
+            file.as_raw_handle() as *mut _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        ) != 0
+    }
+}
+
+#[cfg(unix)]
+fn try_exclusive_lock(file: &std::fs::File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Try to acquire an exclusive lock for this repo root.
+/// Returns `Ok(guard)` if we're the only instance, or `Err` if another is running.
+fn acquire_instance_lock(root: &camino::Utf8Path) -> crate::error::Result<InstanceLock> {
+    use std::io::Write;
+
+    // Store locks in a central cache dir to avoid polluting repo roots.
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("code-review-graph")
+        .join("locks");
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| crate::error::CrgError::Other(format!("create lock dir: {e}")))?;
+
+    // Hash the repo root to get a stable, filesystem-safe lock name.
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        root.as_str().hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let lock_path = cache_dir.join(format!("{hash}.lock"));
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .map_err(|e| crate::error::CrgError::Other(format!("open lock file: {e}")))?;
+
+    // Platform-specific exclusive lock (non-blocking).
+    if !try_exclusive_lock(&file) {
+        return Err(crate::error::CrgError::Other(format!(
+            "Another code-review-graph instance is already running for {}",
+            root
+        )));
+    }
+
+    // Write PID for debugging.
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
+
+    tracing::info!("Instance lock acquired: {}", lock_path.display());
+    Ok(InstanceLock { _file: file, path: lock_path })
+}
+
 /// Run the MCP server over stdio. Blocks until the client disconnects.
 ///
 /// `tool_mode` controls which tools are exposed in `tools/list`:
@@ -1286,6 +1451,19 @@ fn run_watcher_notifier(
 pub async fn run_server(repo_root: Option<String>, tool_mode: &str) -> crate::error::Result<()> {
     // Resolve the repository root once.
     let root = resolve_root(repo_root.as_deref());
+
+    // Acquire per-repo instance lock to prevent duplicate MCP servers.
+    let _lock = if root.exists() {
+        match acquire_instance_lock(&root) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                tracing::warn!("{e} — proceeding without lock (shared instance possible)");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Spawn the worker thread and watcher only when we have a usable root.
     let worker_tx = if root.exists() {
@@ -1319,4 +1497,64 @@ pub async fn run_server(repo_root: Option<String>, tool_mode: &str) -> crate::er
         .await
         .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
     Ok(())
+}
+
+/// Evict all entries from a cache map when it exceeds `max_size`.
+///
+/// Extracted for testability — the worker thread applies this to `tree_cache`.
+fn evict_if_over<K, V>(cache: &mut HashMap<K, V>, max_size: usize) -> bool {
+    if cache.len() > max_size {
+        cache.clear();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_cache_eviction_clears_at_limit() {
+        let mut cache: HashMap<String, String> = HashMap::new();
+
+        // Fill to exactly MAX_TREE_CACHE — should NOT evict.
+        for i in 0..2_000 {
+            cache.insert(format!("file_{i}"), format!("tree_{i}"));
+        }
+        assert!(!evict_if_over(&mut cache, 2_000));
+        assert_eq!(cache.len(), 2_000);
+
+        // One more entry pushes it over — should evict.
+        cache.insert("file_2000".into(), "tree_2000".into());
+        assert!(evict_if_over(&mut cache, 2_000));
+        assert_eq!(cache.len(), 0, "cache must be empty after eviction");
+    }
+
+    #[test]
+    fn tree_cache_eviction_allows_regrowth() {
+        let mut cache: HashMap<String, String> = HashMap::new();
+
+        // Simulate 5 eviction cycles.
+        for cycle in 0..5u32 {
+            for i in 0..2_001 {
+                cache.insert(format!("c{cycle}_f{i}"), format!("t{i}"));
+            }
+            assert!(evict_if_over(&mut cache, 2_000));
+            assert_eq!(cache.len(), 0, "cycle {cycle}: cache must clear");
+        }
+    }
+
+    #[test]
+    fn tree_cache_small_repo_never_evicts() {
+        let mut cache: HashMap<String, String> = HashMap::new();
+
+        // A small repo with 500 files — should never trigger eviction.
+        for i in 0..500 {
+            cache.insert(format!("file_{i}"), format!("tree_{i}"));
+            assert!(!evict_if_over(&mut cache, 2_000));
+        }
+        assert_eq!(cache.len(), 500, "small cache should be untouched");
+    }
 }

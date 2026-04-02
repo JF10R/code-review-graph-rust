@@ -125,10 +125,12 @@ code-review-graph embed   # Downloads model on first run (~90 MB)
 
 Optional providers: OpenAI, Voyage AI, Google Gemini. See `code-review-graph config --help`.
 
-Optional GPU acceleration (Windows):
+Optional GPU acceleration:
 ```bash
-cargo install ... --features gpu-directml   # ~80x faster on large codebases
+cargo install ... --features gpu-cuda       # NVIDIA GPU (recommended, robust multi-process)
+cargo install ... --features gpu-directml   # Any GPU on Windows (AMD, Intel, NVIDIA)
 ```
+If GPU init fails at runtime, the server automatically falls back to CPU.
 
 ## Configuration
 
@@ -195,7 +197,8 @@ code-review-graph config      # API keys, provider settings
 ## Optional features
 
 ```bash
-cargo install ... --features gpu-directml    # GPU embeddings (DirectML)
+cargo install ... --features gpu-cuda         # GPU embeddings (CUDA, NVIDIA)
+cargo install ... --features gpu-directml    # GPU embeddings (DirectML, any GPU)
 cargo install ... --features hnsw-index      # HNSW vector search (10k+ nodes)
 cargo install ... --features tantivy-search  # Fuzzy full-text search
 cargo install ... --no-default-features      # Minimal binary (no embeddings)
