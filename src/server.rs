@@ -344,6 +344,8 @@ enum WorkerCommand {
     WatcherRemove {
         paths: Vec<std::path::PathBuf>,
     },
+    /// Reload stores from disk (triggered when graph.bin.zst or embeddings.bin.zst changes externally).
+    ReloadStores,
     #[allow(dead_code)]
     Shutdown,
 }
@@ -686,6 +688,15 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 if let Err(e) = watcher_result {
                     tracing::error!("worker panic in watcher_remove: {:?}", e);
                 }
+            }
+
+            WorkerCommand::ReloadStores => {
+                let _span = tracing::info_span!("worker_cmd", cmd = "reload_stores").entered();
+                tracing::info!("External store change detected — reloading graph + embeddings from disk");
+                reload_store!();
+                reload_emb!();
+                #[cfg(feature = "tantivy-search")]
+                rebuild_tantivy!();
             }
 
             WorkerCommand::Shutdown => break,
@@ -1295,6 +1306,7 @@ fn run_watcher_notifier(
 
         let mut paths_to_update: HashSet<std::path::PathBuf> = HashSet::new();
         let mut paths_to_remove: HashSet<std::path::PathBuf> = HashSet::new();
+        let mut store_changed = false;
 
         for event in events {
             let path = event.path;
@@ -1305,6 +1317,15 @@ fn run_watcher_notifier(
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
                 Err(_) => continue,
             };
+
+            // Detect external changes to graph/embedding store files.
+            if rel == ".code-review-graph/graph.bin.zst"
+                || rel == ".code-review-graph/embeddings.bin.zst"
+            {
+                store_changed = true;
+                continue;
+            }
+
             if should_ignore_pub(&rel, &ignore_patterns) {
                 continue;
             }
@@ -1314,6 +1335,14 @@ fn run_watcher_notifier(
                 }
             } else {
                 paths_to_remove.insert(path);
+            }
+        }
+
+        // Trigger store reload if graph/embedding files changed externally (e.g. CLI `build`).
+        if store_changed {
+            if cmd_tx.send(WorkerCommand::ReloadStores).is_err() {
+                tracing::warn!("Watcher: worker channel closed, stopping");
+                break;
             }
         }
 
