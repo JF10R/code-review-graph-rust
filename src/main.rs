@@ -60,13 +60,16 @@ enum Commands {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Start MCP server (stdio transport)
+    /// Start MCP server (stdio by default, HTTP with --port)
     Serve {
         #[arg(long)]
         repo: Option<String>,
         /// Which tools to expose in tools/list: "core" (3 tools, default) or "all" (13 tools)
         #[arg(long, default_value = "core", value_parser = ["core", "all"])]
         tools: String,
+        /// Bind HTTP transport on this port (omit for stdio)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Register MCP server with Claude Code (creates .mcp.json)
     Install {
@@ -74,6 +77,9 @@ enum Commands {
         repo: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Write HTTP transport entry instead of stdio (requires running `serve --port PORT` separately)
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Manage configuration (API keys, embedding provider)
     Config {
@@ -117,13 +123,64 @@ async fn main() -> anyhow::Result<()> {
             print_banner();
             Ok(())
         }
-        Some(Commands::Serve { repo, tools }) => {
-            code_review_graph::server::run_server(repo, &tools).await?;
+        Some(Commands::Serve { repo, tools, port }) => {
+            ensure_ort_dlls_on_path();
+            code_review_graph::server::run_server(repo, &tools, port).await?;
             Ok(())
         }
         Some(cmd) => {
             handle_command(cmd).await?;
             Ok(())
+        }
+    }
+}
+
+/// Ensure ONNX Runtime CUDA provider DLLs are findable at runtime.
+///
+/// `cargo install` copies the main binary but not the ORT provider DLLs.
+/// This function checks known locations and prepends them to PATH so the
+/// ONNX runtime can dlopen them when CUDA EP is requested.
+fn ensure_ort_dlls_on_path() {
+    let dll_name = if cfg!(windows) { "onnxruntime_providers_cuda.dll" } else { "libonnxruntime_providers_cuda.so" };
+
+    // Already on PATH?
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(dll_name).exists() {
+                return;
+            }
+        }
+    }
+
+    // Check: next to the current executable (ideal for deployed installs).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if dir.join(dll_name).exists() {
+                prepend_to_path(dir);
+                return;
+            }
+        }
+    }
+
+    // Check: cargo build target/release/ (dev workflow).
+    for candidate in &[
+        "target/release",
+        "target/debug",
+    ] {
+        let dir = std::path::Path::new(candidate);
+        if dir.join(dll_name).exists() {
+            prepend_to_path(dir);
+            return;
+        }
+    }
+}
+
+fn prepend_to_path(dir: &std::path::Path) {
+    if let Ok(current) = std::env::var("PATH") {
+        let mut paths = std::env::split_paths(&current).collect::<Vec<_>>();
+        paths.insert(0, dir.to_path_buf());
+        if let Ok(new_path) = std::env::join_paths(&paths) {
+            std::env::set_var("PATH", &new_path);
         }
     }
 }
@@ -198,8 +255,8 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             store.close()?;
         }
 
-        Commands::Install { repo, dry_run } => {
-            handle_install(repo.as_deref(), dry_run)?;
+        Commands::Install { repo, dry_run, port } => {
+            handle_install(repo.as_deref(), dry_run, port)?;
         }
 
         Commands::Config { action } => {
@@ -244,7 +301,7 @@ fn resolve_project_root(
 }
 
 /// Create or merge `.mcp.json` in the project root.
-fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
+fn handle_install(repo: Option<&str>, dry_run: bool, port: Option<u16>) -> anyhow::Result<()> {
     use code_review_graph::incremental;
 
     let root: Utf8PathBuf = if let Some(r) = repo {
@@ -255,12 +312,20 @@ fn handle_install(repo: Option<&str>, dry_run: bool) -> anyhow::Result<()> {
 
     let mcp_path = root.join(".mcp.json");
 
+    let server_entry = if let Some(p) = port {
+        serde_json::json!({
+            "type": "http",
+            "url": format!("http://127.0.0.1:{p}/mcp")
+        })
+    } else {
+        serde_json::json!({
+            "command": "code-review-graph",
+            "args": ["serve"]
+        })
+    };
     let entry = serde_json::json!({
         "mcpServers": {
-            "code-review-graph": {
-                "command": "code-review-graph",
-                "args": ["serve"]
-            }
+            "code-review-graph": server_entry
         }
     });
 

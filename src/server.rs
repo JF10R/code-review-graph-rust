@@ -372,6 +372,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
         Err(e) => panic!("Worker: cannot open embedding store: {e}"),
     };
     let parser = crate::parser::CodeParser::new();
+    let ignore_patterns = crate::incremental::load_ignore_patterns_pub(&root);
     let mut tree_cache: HashMap<String, tree_sitter::Tree> = HashMap::new();
     const MAX_TREE_CACHE: usize = 2_000;
 
@@ -614,6 +615,15 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                             let deps = find_dependents(&store, &abs_str).unwrap_or_default();
                             for dep_path in &deps {
                                 if processed.contains(dep_path.as_str()) {
+                                    continue;
+                                }
+                                // Skip dependents that match ignore patterns (e.g. target/**).
+                                let dep_rel = dep_path
+                                    .strip_prefix(root.as_str())
+                                    .unwrap_or(dep_path)
+                                    .trim_start_matches('/');
+                                if crate::incremental::should_ignore_pub(dep_rel, &ignore_patterns) {
+                                    tracing::debug!("Worker skipped ignored dependent: {dep_rel}");
                                     continue;
                                 }
                                 processed.insert(dep_path.clone());
@@ -1477,7 +1487,7 @@ fn acquire_instance_lock(root: &camino::Utf8Path) -> crate::error::Result<Instan
 ///
 /// `tool_mode` controls which tools are exposed in `tools/list`:
 /// `"core"` (default) shows 3 tools; `"all"` shows all 13.
-pub async fn run_server(repo_root: Option<String>, tool_mode: &str) -> crate::error::Result<()> {
+pub async fn run_server(repo_root: Option<String>, tool_mode: &str, port: Option<u16>) -> crate::error::Result<()> {
     // Resolve the repository root once.
     let root = resolve_root(repo_root.as_deref());
 
@@ -1517,14 +1527,54 @@ pub async fn run_server(repo_root: Option<String>, tool_mode: &str) -> crate::er
         None
     };
 
-    let server = CodeReviewServer::new_inner(repo_root, worker_tx, tool_mode == "all");
-    let (stdin, stdout) = transport::io::stdio();
-    serve_server(server, (stdin, stdout))
-        .await
-        .map_err(|e| crate::error::CrgError::Other(e.to_string()))?
-        .waiting()
-        .await
-        .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+    let expose_all = tool_mode == "all";
+    let server = CodeReviewServer::new_inner(repo_root.clone(), worker_tx.clone(), expose_all);
+
+    match port {
+        None => {
+            // Default: stdio transport (for Claude Code command-based MCP).
+            let (stdin, stdout) = transport::io::stdio();
+            serve_server(server, (stdin, stdout))
+                .await
+                .map_err(|e| crate::error::CrgError::Other(e.to_string()))?
+                .waiting()
+                .await
+                .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+        }
+        Some(p) => {
+            // HTTP transport: multiple clients share the same worker thread.
+            use rmcp::transport::streamable_http_server::{
+                StreamableHttpServerConfig,
+                StreamableHttpService,
+                session::local::LocalSessionManager,
+            };
+
+            let ct = tokio_util::sync::CancellationToken::new();
+            let service = StreamableHttpService::new(
+                {
+                    let server = server.clone();
+                    move || Ok(server.clone())
+                },
+                LocalSessionManager::default().into(),
+                StreamableHttpServerConfig::default()
+                    .with_cancellation_token(ct.child_token()),
+            );
+
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+            tracing::info!("MCP HTTP server listening on http://{addr}/mcp");
+            let router = axum::Router::new().nest_service("/mcp", service);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| crate::error::CrgError::Other(format!("bind {addr}: {e}")))?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    tokio::signal::ctrl_c().await.ok();
+                    ct.cancel();
+                })
+                .await
+                .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+        }
+    }
     Ok(())
 }
 

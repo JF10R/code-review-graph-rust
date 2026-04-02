@@ -46,8 +46,10 @@ candle-transformers = { version = "0.9", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 hf-hub = { version = "0.5", optional = true }
 
-# MCP server
-rmcp = { version = "1.2", features = ["server", "transport-io"] }
+# MCP server — stdio (default) + optional streamable HTTP for multi-client access
+rmcp = { version = "1.2", features = ["server", "transport-io", "transport-streamable-http-server"] }
+axum = "0.8"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Tree-sitter (native Rust - the original implementation)
 tree-sitter = "0.26"
