@@ -1622,20 +1622,26 @@ async fn run_proxy_server(
     let mut lines = stdin.lines();
     let mut pending_line: Option<String> = None;
 
+    tracing::info!("Proxy ready — waiting for stdio input");
+
     loop {
         // Use buffered request from failover, or read next from stdin.
         let line = if let Some(buffered) = pending_line.take() {
+            tracing::debug!("Replaying buffered request");
             buffered
         } else {
             match lines.next_line().await {
                 Ok(Some(l)) => l,
-                _ => break,
+                Ok(None) => { tracing::info!("Proxy: stdin closed"); break; }
+                Err(e) => { tracing::error!("Proxy: stdin error: {e}"); break; }
             }
         };
 
         if line.trim().is_empty() {
             continue;
         }
+
+        tracing::debug!("Proxy forwarding: {}...", &line[..line.len().min(80)]);
 
         let mut req = client
             .post(&url)
@@ -1653,10 +1659,33 @@ async fn run_proxy_server(
                         session_id = Some(s.to_string());
                     }
                 }
-                let body = resp.text().await.unwrap_or_default();
-                let _ = stdout.write_all(body.as_bytes()).await;
-                let _ = stdout.write_all(b"\n").await;
-                let _ = stdout.flush().await;
+
+                let is_sse = resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map_or(false, |ct| ct.contains("text/event-stream"));
+
+                if is_sse {
+                    // SSE: read full body, extract "data:" lines, relay each as a stdio line.
+                    // The SSE stream ends after the server sends all events for this request.
+                    let body = resp.text().await.unwrap_or_default();
+                    for sse_line in body.lines() {
+                        if let Some(data) = sse_line.strip_prefix("data:") {
+                            let data = data.trim();
+                            if !data.is_empty() {
+                                let _ = stdout.write_all(data.as_bytes()).await;
+                                let _ = stdout.write_all(b"\n").await;
+                                let _ = stdout.flush().await;
+                            }
+                        }
+                    }
+                } else {
+                    // Plain JSON response — relay as-is.
+                    let body = resp.text().await.unwrap_or_default();
+                    let _ = stdout.write_all(body.as_bytes()).await;
+                    let _ = stdout.write_all(b"\n").await;
+                    let _ = stdout.flush().await;
+                }
             }
             Err(e) if e.is_connect() => {
                 // Primary died. Buffer the failed request for replay.
