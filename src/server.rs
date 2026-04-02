@@ -1483,20 +1483,48 @@ fn acquire_instance_lock(root: &camino::Utf8Path) -> crate::error::Result<Instan
     Ok(InstanceLock { _file: file, path: lock_path })
 }
 
-/// Run the MCP server over stdio. Blocks until the client disconnects.
+/// Default HTTP port for shared MCP access. First instance binds this port
+/// and serves HTTP; subsequent instances proxy stdio through it.
+const DEFAULT_MCP_HTTP_PORT: u16 = 7432;
+
+/// Run the MCP server. Automatically selects primary or proxy mode:
 ///
-/// `tool_mode` controls which tools are exposed in `tools/list`:
-/// `"core"` (default) shows 3 tools; `"all"` shows all 13.
+/// - **Primary** (first instance): binds HTTP port, spawns worker + watcher,
+///   serves stdio to this session + HTTP to proxy instances.
+/// - **Proxy** (port already taken): lightweight forwarder, no worker/GPU.
+///   Reads stdio from Claude Code, forwards to primary via HTTP.
+///
+/// If the primary dies, a proxy promotes itself to primary automatically.
 pub async fn run_server(repo_root: Option<String>, tool_mode: &str, port: Option<u16>) -> crate::error::Result<()> {
-    // Resolve the repository root once.
+    let http_port = port.unwrap_or(DEFAULT_MCP_HTTP_PORT);
+
+    // Try to bind the HTTP port — determines primary vs proxy mode.
+    match tokio::net::TcpListener::bind(("127.0.0.1", http_port)).await {
+        Ok(listener) => {
+            tracing::info!("Primary mode — bound port {http_port}");
+            run_primary_server(repo_root, tool_mode, listener).await
+        }
+        Err(_) => {
+            tracing::info!("Port {http_port} in use — proxy mode");
+            run_proxy_server(http_port, repo_root, tool_mode).await
+        }
+    }
+}
+
+/// Primary server: owns worker thread, watcher, GPU. Serves stdio + HTTP.
+async fn run_primary_server(
+    repo_root: Option<String>,
+    tool_mode: &str,
+    listener: tokio::net::TcpListener,
+) -> crate::error::Result<()> {
     let root = resolve_root(repo_root.as_deref());
 
-    // Acquire per-repo instance lock to prevent duplicate MCP servers.
+    // Acquire per-repo instance lock.
     let _lock = if root.exists() {
         match acquire_instance_lock(&root) {
             Ok(lock) => Some(lock),
             Err(e) => {
-                tracing::warn!("{e} — proceeding without lock (shared instance possible)");
+                tracing::warn!("{e} — proceeding without lock");
                 None
             }
         }
@@ -1508,11 +1536,9 @@ pub async fn run_server(repo_root: Option<String>, tool_mode: &str, port: Option
     let worker_tx = if root.exists() {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerCommand>();
 
-        // Worker thread — owns GraphStore, EmbeddingStore, CodeParser, tree_cache.
         let worker_root = root.clone();
         std::thread::spawn(move || run_worker_thread(worker_root, rx));
 
-        // Watcher notifier thread — only routes paths to the worker.
         let watcher_root = root.clone();
         let watcher_tx = tx.clone();
         std::thread::spawn(move || {
@@ -1530,49 +1556,137 @@ pub async fn run_server(repo_root: Option<String>, tool_mode: &str, port: Option
     let expose_all = tool_mode == "all";
     let server = CodeReviewServer::new_inner(repo_root.clone(), worker_tx.clone(), expose_all);
 
-    match port {
-        None => {
-            // Default: stdio transport (for Claude Code command-based MCP).
-            let (stdin, stdout) = transport::io::stdio();
-            serve_server(server, (stdin, stdout))
-                .await
-                .map_err(|e| crate::error::CrgError::Other(e.to_string()))?
-                .waiting()
-                .await
-                .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+    // HTTP task: serves proxy instances on the bound port.
+    let ct = tokio_util::sync::CancellationToken::new();
+    let http_ct = ct.clone();
+    let http_server = server.clone();
+    let http_handle = tokio::spawn(async move {
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig,
+            StreamableHttpService,
+            session::local::LocalSessionManager,
+        };
+
+        let service = StreamableHttpService::new(
+            {
+                let s = http_server;
+                move || Ok(s.clone())
+            },
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default()
+                .with_cancellation_token(http_ct.child_token()),
+        );
+
+        let addr = listener.local_addr().unwrap();
+        tracing::info!("MCP HTTP server listening on http://{addr}/mcp");
+        let router = axum::Router::new().nest_service("/mcp", service);
+        if let Err(e) = axum::serve(listener, router)
+            .with_graceful_shutdown(async move { http_ct.cancelled().await })
+            .await
+        {
+            tracing::error!("HTTP server error: {e}");
         }
-        Some(p) => {
-            // HTTP transport: multiple clients share the same worker thread.
-            use rmcp::transport::streamable_http_server::{
-                StreamableHttpServerConfig,
-                StreamableHttpService,
-                session::local::LocalSessionManager,
-            };
+    });
 
-            let ct = tokio_util::sync::CancellationToken::new();
-            let service = StreamableHttpService::new(
-                {
-                    let server = server.clone();
-                    move || Ok(server.clone())
-                },
-                LocalSessionManager::default().into(),
-                StreamableHttpServerConfig::default()
-                    .with_cancellation_token(ct.child_token()),
-            );
+    // Stdio task: serves this session's Claude Code.
+    let (stdin, stdout) = transport::io::stdio();
+    serve_server(server, (stdin, stdout))
+        .await
+        .map_err(|e| crate::error::CrgError::Other(e.to_string()))?
+        .waiting()
+        .await
+        .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
 
-            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p));
-            tracing::info!("MCP HTTP server listening on http://{addr}/mcp");
-            let router = axum::Router::new().nest_service("/mcp", service);
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|e| crate::error::CrgError::Other(format!("bind {addr}: {e}")))?;
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    tokio::signal::ctrl_c().await.ok();
-                    ct.cancel();
-                })
-                .await
-                .map_err(|e| crate::error::CrgError::Other(e.to_string()))?;
+    // Stdio ended (this session closed). Shut down HTTP so port is freed.
+    ct.cancel();
+    let _ = http_handle.await;
+
+    Ok(())
+}
+
+/// Proxy server: no worker, no GPU. Forwards stdio ↔ HTTP to the primary.
+/// If the primary dies, attempts to promote itself.
+async fn run_proxy_server(
+    port: u16,
+    repo_root: Option<String>,
+    tool_mode: &str,
+) -> crate::error::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let mut session_id: Option<String> = None;
+
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::stdout();
+    let mut lines = stdin.lines();
+    let mut pending_line: Option<String> = None;
+
+    loop {
+        // Use buffered request from failover, or read next from stdin.
+        let line = if let Some(buffered) = pending_line.take() {
+            buffered
+        } else {
+            match lines.next_line().await {
+                Ok(Some(l)) => l,
+                _ => break,
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let mut req = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(line.clone());
+        if let Some(ref sid) = session_id {
+            req = req.header("mcp-session-id", sid);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                if let Some(sid) = resp.headers().get("mcp-session-id") {
+                    if let Ok(s) = sid.to_str() {
+                        session_id = Some(s.to_string());
+                    }
+                }
+                let body = resp.text().await.unwrap_or_default();
+                let _ = stdout.write_all(body.as_bytes()).await;
+                let _ = stdout.write_all(b"\n").await;
+                let _ = stdout.flush().await;
+            }
+            Err(e) if e.is_connect() => {
+                // Primary died. Buffer the failed request for replay.
+                pending_line = Some(line);
+                tracing::warn!("Primary disconnected — attempting promotion");
+                match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => {
+                        tracing::info!("Promoted to primary on port {port}");
+                        return run_primary_server(repo_root, tool_mode, listener).await;
+                    }
+                    Err(_) => {
+                        // Another proxy beat us — retry as proxy with new session.
+                        tracing::info!("Another instance became primary — retrying");
+                        session_id = None;
+                        // pending_line still set — will be replayed next iteration.
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Proxy request failed: {e}");
+                let err_resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": format!("proxy: {e}")},
+                    "id": null
+                });
+                let _ = stdout.write_all(err_resp.to_string().as_bytes()).await;
+                let _ = stdout.write_all(b"\n").await;
+                let _ = stdout.flush().await;
+            }
         }
     }
     Ok(())
