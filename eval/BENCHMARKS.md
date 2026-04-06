@@ -58,7 +58,7 @@ After Tier 1 improvements + #42 conditional structural expansion (strip callers/
 | 1 | **Scout MCP** | **115s** | **52K** | **16t** | 3/4 |
 | 2 | **Scout+Graph** | 133s | 57K | 21t | 3/4 |
 | 3 | **Graph MCP** | 140s | 53K | 17t | **4/4** |
-| 4 | CodeDB MCP | 252s | 66K | 28t | — |
+| 4 | CodeDB MCP | 235s | 54K | 19t | 3/4 |
 | 5 | Grep (6-way) | 291s | 54K | 25t | 2/4 |
 
 **Key finding: strip noise, keep signal.** Both Scout (4-tier confidence gating) and Graph (#42 conditional expansion) independently proved that stripping structural data at high confidence dramatically improves agent convergence. All three MCP variants now beat Grep by ~2x and cluster at 115-140s. Graph MCP achieved the best quality (4/4 secondary findings) with the fewest tokens (53K).

@@ -269,7 +269,7 @@ Sequential runs (no concurrency). Grep baseline from 6-way run (`BENCHMARK_6WAY_
 | 1 | **Scout MCP** | **115s** | **52K** | **16t** | YES | 3/4 |
 | 2 | **Scout+Graph** | 133s | 57K | 21t | YES | 3/4 |
 | 3 | **Graph MCP** | 140s | 53K | 17t | YES | **4/4** |
-| 4 | CodeDB MCP | 252s | 66K | 28t | YES | — |
+| 4 | CodeDB MCP | 235s | 54K | 19t | YES | 3/4 |
 | 5 | Grep (6-way) | 291s | 54K | 25t | YES | 2/4 |
 
 ### vs 6-Way Baselines (vscode-003)
@@ -285,13 +285,13 @@ Sequential runs (no concurrency). Grep baseline from 6-way run (`BENCHMARK_6WAY_
 
 Ground truth: 4 secondary findings for vscode-003.
 
-| Finding | Grep (6-way) | Scout MCP | Graph MCP | Scout+Graph |
-|---------|-------------|-----------|-----------|-------------|
-| `_addKeyPress` removes from `_lookupMap` | Y | Y | Y | Y |
-| `implies()` no complement/negation awareness | Y | Y | Y | Y |
-| `_findCommand` reverse iteration (last-wins) | Y | Y | Y | Y |
-| `MoreChordsNeeded` with negated binding | - | - | Y | ~ |
-| **Total** | **2/4** | **3/4** | **4/4** | **3/4** |
+| Finding | Grep (6-way) | Scout MCP | Graph MCP | Scout+Graph | CodeDB MCP |
+|---------|-------------|-----------|-----------|-------------|------------|
+| `_addKeyPress` removes from `_lookupMap` | Y | Y | Y | Y | Y |
+| `implies()` no complement/negation awareness | Y | Y | Y | Y | ~ |
+| `_findCommand` reverse iteration (last-wins) | Y | Y | Y | Y | Y |
+| `MoreChordsNeeded` with negated binding | - | - | Y | ~ | Y |
+| **Total** | **2/4** | **3/4** | **4/4** | **3/4** | **3/4** |
 
 Graph MCP found all 4 secondaries including the subtle `MoreChordsNeeded` chord-length interaction — the deepest analysis despite being the most token-efficient (53K). Scout MCP was fastest (115s) but missed the chord-length edge case.
 
