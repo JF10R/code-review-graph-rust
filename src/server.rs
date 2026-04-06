@@ -422,13 +422,13 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
         };
     }
 
-    /// Reload the embedding store from disk (called after EmbedGraph mutations).
+    /// Reload embedding data from disk, preserving the ONNX provider session.
+    ///
+    /// DO NOT change this to `EmbeddingStore::new()` — that would create a
+    /// new ONNX/CUDA session per reload, leaking kernel NPP memory (#42169).
     macro_rules! reload_emb {
         () => {
-            match crate::embeddings::EmbeddingStore::new(&emb_path) {
-                Ok(s) => { emb_store = s; }
-                Err(e) => tracing::error!("Worker: reload emb store failed: {e}"),
-            }
+            emb_store.reload_from_disk();
         };
     }
 
@@ -879,12 +879,13 @@ impl CodeReviewServer {
         }
     }
 
-    /// Explore structural code relationships — use INSTEAD of grepping for
-    /// function names. callers_of: who calls this? callees_of: what does it
-    /// call? children_of: what's in this file/class? file_summary: overview.
-    /// Use callers_of/callees_of to navigate between functions instead of
-    /// running grep in bash. After finding connected functions, use the
-    /// Read tool to examine their logic.
+    /// Navigate structural code relationships: callers_of, callees_of, children_of, file_summary, tests_for, imports_of, inheritors_of.
+    ///
+    /// WHEN TO USE: Trace call chains between functions, list contents of a file/class, find test files.
+    /// WHEN NOT TO USE: For initial discovery (use hybrid_query first).
+    ///
+    /// Returns: List of connected nodes with qualified names and line ranges.
+    /// Example: query_graph(pattern="callers_of", target="_findCommand", repo_root="...")
     #[tool(name = "query_graph")]
     async fn query_graph_tool(
         &self,
@@ -1078,11 +1079,13 @@ impl CodeReviewServer {
         }
     }
 
-    /// Smart search combining keyword matching with semantic similarity
-    /// via Reciprocal Rank Fusion (RRF). Prefer this over semantic_search_nodes
-    /// when you want the best of both worlds — exact name matches AND
-    /// conceptual similarity in one ranked result set. Falls back to
-    /// keyword-only when embeddings are unavailable.
+    /// Search code by keyword + semantic similarity. Returns ranked files with matching functions.
+    ///
+    /// WHEN TO USE: First call for any code discovery — find files, functions, or concepts.
+    /// WHEN NOT TO USE: If you already know the exact function name, use query_graph(callers_of) or open_node_context instead.
+    ///
+    /// Returns: Ranked files with function names, line ranges, and an action_hint ("read_file", "structural_query", or "explore") suggesting your next step.
+    /// Example: hybrid_query(query="zstd decode empty", repo_root="...")
     #[tool(name = "hybrid_query")]
     #[tracing::instrument(skip(self))]
     async fn hybrid_query_tool(
@@ -1109,10 +1112,13 @@ impl CodeReviewServer {
         }
     }
 
-    /// Get complete context for a function or class in one call — source preview,
-    /// callers, callees, tests, and file siblings. Use this as your PRIMARY
-    /// investigation tool instead of making separate query_graph + Read calls.
-    /// Returns everything you need to understand a symbol's role in the codebase.
+    /// Get a function's source, callers, callees, and tests in one call.
+    ///
+    /// WHEN TO USE: After hybrid_query finds a function — inspect it deeply without multiple calls.
+    /// WHEN NOT TO USE: For broad discovery (use hybrid_query) or navigating call chains (use query_graph callers_of/callees_of).
+    ///
+    /// Returns: Source preview, direct callers, direct callees, related tests, file siblings.
+    /// Example: open_node_context(target="ZStandardDecoder::decode", repo_root="...")
     #[tool(name = "open_node_context")]
     async fn open_node_context_tool(
         &self,
@@ -1159,7 +1165,7 @@ impl CodeReviewServer {
 // ServerHandler implementation (wired to the tool router)
 // ---------------------------------------------------------------------------
 
-const CORE_TOOLS: &[&str] = &["hybrid_query", "open_node_context", "query_graph"];
+const CORE_TOOLS: &[&str] = &["hybrid_query", "open_node_context", "query_graph", "build_or_update_graph", "embed_graph"];
 
 impl ServerHandler for CodeReviewServer {
     fn get_info(&self) -> ServerInfo {
@@ -1170,6 +1176,9 @@ impl ServerHandler for CodeReviewServer {
         )
         .with_instructions(
             "Persistent incremental knowledge graph for token-efficient code reviews.\n\n\
+             MULTI-REPO: Pass repo_root on EVERY call to target a specific repo.\n\
+             If the graph doesn't exist yet, call build_or_update_graph(repo_root=PATH) first.\n\
+             Embeddings are built automatically on the first hybrid_query for that repo.\n\n\
              WHEN TO USE GRAPH TOOLS vs GREP:\n\
              - Grep/Read: exact filename, symbol name, or string literal lookups\n\
              - Graph tools: structural queries (who calls X?), semantic/conceptual search, cross-file tracing\n\n\
@@ -1600,6 +1609,13 @@ async fn run_primary_server(
     // Stdio ended (this session closed). Shut down HTTP so port is freed.
     ct.cancel();
     let _ = http_handle.await;
+
+    // Signal the worker thread to shut down so it can run Drop destructors
+    // (ONNX Session, CUDA context, file watcher handles). Without this, a
+    // hard process exit skips destructors and may leak GPU kernel objects.
+    if let Some(tx) = worker_tx {
+        let _ = tx.send(WorkerCommand::Shutdown);
+    }
 
     Ok(())
 }

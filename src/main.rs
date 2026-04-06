@@ -110,7 +110,15 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // CRITICAL: logs MUST go to stderr with ANSI disabled.
+    // stdout is MCP's JSON-RPC stdio channel — any non-JSON bytes (like ANSI
+    // escape codes) corrupt the protocol, causing Claude Code to drop the
+    // connection and respawn the server. Each respawn creates a new ONNX
+    // session with CUDA/DirectML kernel objects (Windows NPP), and repeated
+    // respawns caused a 57 GB kernel memory leak (2026-04-01, #42169).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::WARN.into()),

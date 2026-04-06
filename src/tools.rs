@@ -850,7 +850,7 @@ pub fn query_graph_with_store(
     let node_opt = resolve_target_node(store, target, root)?;
 
     let node = match node_opt {
-        ResolveResult::Found(n) => {
+        ResolveResult::Found(n, _quality) => {
             target_name = n.qualified_name.clone();
             Some(n)
         }
@@ -2079,10 +2079,10 @@ pub fn hybrid_query(
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
-            "status": "ok",
+            "status": "no_match",
             "query": query,
-            "method": "keyword_only",
             "results": [],
+            "suggestion": "Provide a search query — try a function name, file path, or natural language description.",
         }));
     }
 
@@ -2115,10 +2115,10 @@ pub fn hybrid_query_with_store(
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
-            "status": "ok",
+            "status": "no_match",
             "query": query,
-            "method": "keyword_only",
             "results": [],
+            "suggestion": "Provide a search query — try a function name, file path, or natural language description.",
         }));
     }
 
@@ -2128,15 +2128,13 @@ pub fn hybrid_query_with_store(
     let is_thorough = budget_str == "thorough";
     let is_auto = budget_str == "auto";
 
-    // Build repo profile and extract node count for auto-budget sizing.
-    let (repo_profile, node_count) = match store.get_stats() {
-        Ok(stats) => (json!({
-            "file_count": stats.files_count,
-            "node_count": stats.total_nodes,
-            "languages": stats.languages,
-        }), stats.total_nodes),
-        Err(_) => (json!({}), 0),
-    };
+    // O(1) repo profile — avoids O(N+E) get_stats() on every query (#38).
+    let node_count = store.node_count();
+    let file_count = store.file_count();
+    let repo_profile = json!({
+        "file_count": file_count,
+        "node_count": node_count,
+    });
 
     // Determine effective limit and mode based on budget + repo size.
     let (effective_limit, effective_mode, auto_skip_preview, auto_skip_expansion) = if is_thorough {
@@ -2204,6 +2202,18 @@ pub fn hybrid_query_with_store(
             file_results, query, &parts, debug, route, fusion, total_candidates, files_scored,
             should_preview, root, compact,
         );
+
+        // Structured suggestion when no results found (#37).
+        if let Some(arr) = response.get("results").and_then(|v| v.as_array()) {
+            if arr.is_empty() {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("suggestion".to_string(), json!(
+                        "No results found. Try: a more specific function/class name, a file path, or use query_graph(callers_of/callees_of) if you know a specific symbol."
+                    ));
+                }
+            }
+        }
+
         // Inject budget metadata, repo profile, and classification info.
         if let Some(obj) = response.as_object_mut() {
             obj.insert("budget".to_string(), json!(budget_str));
@@ -2217,8 +2227,17 @@ pub fn hybrid_query_with_store(
                 QueryRoute::Causal => "causal_query",
                 QueryRoute::General => "general",
             }));
-            // On large repos with auto budget, strip verbose metadata to save tokens.
-            if !(is_auto && node_count > 50_000) {
+            // Confidence-tiered action hint — tells agent what to do next (#35).
+            let action_hint = if classification.confidence >= 0.85 {
+                "read_file"
+            } else if classification.confidence >= 0.60 {
+                "structural_query"
+            } else {
+                "explore"
+            };
+            obj.insert("action_hint".to_string(), json!(action_hint));
+            // On auto budget, strip verbose metadata to save tokens (#36).
+            if !is_auto {
                 obj.insert("repo_profile".to_string(), repo_profile);
                 obj.insert("query_signals".to_string(), json!({
                     "has_quoted_span": classification.signals.has_quoted_span,
@@ -2232,6 +2251,16 @@ pub fn hybrid_query_with_store(
             }
             if results_capped {
                 obj.insert("results_capped".to_string(), json!(true));
+            }
+        }
+        // In compact + auto mode, strip internal diagnostics to save tokens (#36).
+        // Keep confidence (agent stopping signal) + action_hint + budget.
+        if compact && is_auto {
+            if let Some(obj) = response.as_object_mut() {
+                obj.remove("match_type");
+                obj.remove("route");
+                obj.remove("query_signals");
+                obj.remove("preview_included");
             }
         }
         return Ok(response);
@@ -2507,8 +2536,8 @@ pub fn open_node_context_with_store(
     target: &str,
     compact: bool,
 ) -> Result<Value> {
-    let node = match resolve_target_node(store, target, root)? {
-        ResolveResult::Found(n) => n,
+    let (node, match_quality) = match resolve_target_node(store, target, root)? {
+        ResolveResult::Found(n, q) => (n, q),
         ResolveResult::Ambiguous(candidates) => {
             return Ok(json!({
                 "status": "ambiguous",
@@ -2690,7 +2719,7 @@ pub fn open_node_context_with_store(
 
     let node_name = node.name.clone();
 
-    let result = if compact {
+    let mut result = if compact {
         let sig = {
             let s = &node.signature;
             let cut = s.char_indices().nth(120).map(|(i, _)| i).unwrap_or(s.len());
@@ -2750,6 +2779,21 @@ pub fn open_node_context_with_store(
         }
         r
     };
+
+    // Conditional structural expansion (#42): strip noise at high confidence.
+    // Exact-match + compact → sparse tier: counts only, no structural arrays.
+    // Search-match + compact → summary tier: top 3 callers/callees (already capped at 5).
+    // Non-compact → full tier always (agent explicitly asked for details).
+    if compact && match_quality == MatchQuality::Exact {
+        if let Some(obj) = result.as_object_mut() {
+            obj.remove("callers");
+            obj.remove("callees");
+            obj.insert("action_hint".to_string(), json!(
+                "High-confidence match. Use query_graph(callers_of/callees_of) for structural details."
+            ));
+        }
+    }
+
     Ok(result)
 }
 
@@ -2999,7 +3043,7 @@ pub fn trace_call_chain_with_store(
     compact: bool,
 ) -> Result<Value> {
     let from_node = match resolve_target_node(store, from, root)? {
-        ResolveResult::Found(n) => n,
+        ResolveResult::Found(n, _) => n,
         ResolveResult::NotFound => {
             return Ok(json!({
                 "status": "error",
@@ -3016,7 +3060,7 @@ pub fn trace_call_chain_with_store(
     };
 
     let to_node = match resolve_target_node(store, to, root)? {
-        ResolveResult::Found(n) => n,
+        ResolveResult::Found(n, _) => n,
         ResolveResult::NotFound => {
             return Ok(json!({
                 "status": "error",
@@ -3089,8 +3133,18 @@ pub fn resolve_changed_files(
     incremental::get_staged_and_unstaged(root)
 }
 
+/// How confidently the target was resolved.
+/// Used by open_node_context for tiered response shaping (#42).
+#[derive(Clone, Copy, PartialEq)]
+enum MatchQuality {
+    /// Direct qualified-name or path lookup — highest confidence.
+    Exact,
+    /// Fuzzy search returned a single candidate.
+    Search,
+}
+
 enum ResolveResult {
-    Found(crate::types::GraphNode),
+    Found(crate::types::GraphNode, MatchQuality),
     Ambiguous(Vec<Value>),
     NotFound,
 }
@@ -3102,16 +3156,16 @@ fn resolve_target_node(
     root: &Utf8Path,
 ) -> Result<ResolveResult> {
     if let Some(node) = store.get_node(target)? {
-        return Ok(ResolveResult::Found(node));
+        return Ok(ResolveResult::Found(node, MatchQuality::Exact));
     }
     let abs_target = root.join(target).as_str().to_owned();
     if let Some(node) = store.get_node(&abs_target)? {
-        return Ok(ResolveResult::Found(node));
+        return Ok(ResolveResult::Found(node, MatchQuality::Exact));
     }
     let candidates = store.search_nodes(target, 5)?;
     match candidates.len() {
         0 => Ok(ResolveResult::NotFound),
-        1 => Ok(ResolveResult::Found(candidates.into_iter().next().unwrap())),
+        1 => Ok(ResolveResult::Found(candidates.into_iter().next().unwrap(), MatchQuality::Search)),
         _ => Ok(ResolveResult::Ambiguous(
             candidates.iter().map(|n| node_to_dict(n, false, Utf8Path::new(""))).collect(),
         )),

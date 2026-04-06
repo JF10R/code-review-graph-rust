@@ -748,6 +748,17 @@ impl GraphStore {
         })
     }
 
+    /// O(1) node count via petgraph's internal counter.
+    /// Use instead of get_stats() when only the count is needed.
+    pub fn node_count(&self) -> usize {
+        self.data.graph.node_count()
+    }
+
+    /// O(1) file count via file_index length.
+    pub fn file_count(&self) -> usize {
+        self.data.file_index.len()
+    }
+
     /// Set a metadata key-value pair.
     pub fn set_metadata(&mut self, key: &str, value: &str) -> Result<()> {
         self.data

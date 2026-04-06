@@ -1020,6 +1020,72 @@ impl EmbeddingStore {
         })
     }
 
+    /// Reload embedding data from disk without recreating the ONNX provider.
+    ///
+    /// DO NOT replace this with `EmbeddingStore::new()` — each new store would
+    /// create a fresh ONNX Runtime session via `detect_provider()`, allocating
+    /// CUDA/DirectML kernel objects (Windows Non-Paged Pool memory). Those
+    /// kernel objects are not always fully reclaimed by `ReleaseSession`, and
+    /// repeated creation caused a 57 GB NPP leak (#42169). By keeping the
+    /// provider alive across reloads, the ONNX session (and its GPU context)
+    /// is created exactly once per process lifetime.
+    pub fn reload_from_disk(&mut self) {
+        let data = if self.path.exists() {
+            match load_embedding_data(self.path.as_std_path()) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not reload embeddings from {}: {} — keeping empty",
+                        self.path,
+                        e
+                    );
+                    EmbeddingDataV2::default()
+                }
+            }
+        } else {
+            EmbeddingDataV2::default()
+        };
+        self.lookup = data.build_lookup();
+        self.name_to_idx = data.build_name_to_idx();
+        self.hash_to_vec = data.build_hash_to_vec();
+        self.data = data;
+
+        let file_data = if self.file_path.exists() {
+            load_embedding_data(self.file_path.as_std_path()).unwrap_or_default()
+        } else {
+            EmbeddingDataV2::default()
+        };
+        self.file_lookup = file_data.build_lookup();
+        self.file_name_to_idx = file_data.build_name_to_idx();
+        self.file_hash_to_vec = file_data.build_hash_to_vec();
+        self.file_data = file_data;
+
+        #[cfg(feature = "hnsw-index")]
+        {
+            self.hnsw_cache = None;
+            self.hnsw_dirty = false;
+            self.hnsw_last_rebuild = None;
+        }
+        self.mutations_since_gc = 0;
+        tracing::info!("Embedding store reloaded from disk (provider preserved)");
+    }
+
+    /// Drop the current ONNX provider and create a fresh one.
+    ///
+    /// Use this as a recovery path if the provider enters a bad state (e.g.
+    /// CUDA OOM, driver error). Normal reloads should use `reload_from_disk()`
+    /// which preserves the existing provider.
+    pub fn reset_provider(&mut self) {
+        // Drop old provider first so its ONNX session is released before
+        // allocating a new one — avoids holding two CUDA contexts at once.
+        let _ = self.provider.take();
+        self.provider = detect_provider();
+        tracing::info!(
+            "Embedding provider reset (new={})",
+            self.provider.as_ref().map_or("none", |p| p.name())
+        );
+    }
+
     /// Whether an embedding provider is available.
     pub fn available(&self) -> bool {
         self.provider.is_some()

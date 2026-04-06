@@ -9,33 +9,59 @@ Code search tool benchmarks using Claude Sonnet 4.6 in `bypassPermissions` mode,
 For full methodology, see `BENCHMARK_METHODOLOGY.md`.
 For historical round-by-round details, see `BENCHMARK_HISTORY.md`.
 
-## Latest: Round 9 — Clean 5-Way, Fixed Tools (2026-04-01)
+## Latest: Round 9 — Clean 4-Way Comparison (2026-04-02)
 
-Clean re-run with fixed tools: Scout MCP (persistent server), CodeDB CLI (Windows patches applied), Grep baseline, Scout+Graph (Scout CLI + code-review-graph MCP). 3 agents max per batch for accurate timing. See `BENCHMARK_R9_CLEAN.md`.
+Clean comparison with all tools working: Grep, Scout MCP, Scout+Graph, CodeDB MCP. 3 agents max per batch for accurate timing. See `BENCHMARK_R9_CLEAN.md`.
 
 ### Performance (4 Tier 1 cases, natural v3 prompt)
 
-| Variant | Avg Time | Avg Tokens | Avg Tools | vs Grep |
-|---------|----------|------------|-----------|---------|
-| **Scout MCP** | **60.5s** | **35.5K** | **12.8t** | **2.2x faster** |
-| Scout CLI | 65.5s | 39.0K | 11.5t | 2.0x faster |
-| Scout+Graph | 70.7s | 38.0K | 15.0t | 1.8x faster |
-| CodeDB | 124.3s | 40.0K | 16.5t | 1.1x faster |
-| Grep | 130.6s | 43.3K | 22.0t | 1.0x |
+| Rank | Variant | Avg Time | Avg Tokens | Avg Tools | vs Grep |
+|------|---------|----------|------------|-----------|---------|
+| 1 | **Scout MCP** | **60.5s** | **36.0K** | **12.8t** | **2.2x faster** |
+| 2 | Scout+Graph | 69.3s | 37.3K | 12.3t | 1.9x faster |
+| 3 | Grep | 130.6s | 43.3K | 22.0t | 1.0x |
+| 4 | CodeDB MCP | 161.7s | 49.5K | 30.8t | 0.8x (slower) |
 
-### Key Finding: Scout MCP vs Grep
+### Key Finding: Scout MCP is the speed king
 
-Scout MCP is **2.2x faster** with **18% fewer tokens** and identical quality (4/4 root cause, 12/12 secondaries). Per-case speedup ranges from 1.2x (small repo, simple bug) to 3.9x (Grep over-explored with Python experiments).
+Scout MCP is **2.2x faster** than Grep with **17% fewer tokens** and identical quality (4/4 root cause, 12/12 secondaries). Per-case speedup ranges from 1.2x (small repo) to 3.9x (Grep over-explored).
 
-### Key Finding: CodeDB Re-Index Tax
+### Key Finding: CodeDB MCP is slower than Grep
 
-CodeDB has sub-millisecond query speed but re-indexes on every CLI call (no persistent server on Windows). On httpx (60 files, 270ms re-index), CodeDB won httpx-003 outright (41.6s, fastest). On fastapi (1.1K files, 3.6s re-index), CodeDB was 2.2x slower than Scout MCP. Gap will widen on larger repos.
+CodeDB MCP is **2.7x slower** than Scout MCP and even **1.2x slower than Grep**. Despite sub-millisecond query speed, CodeDB's line-level results trigger 2.4x more tool calls than Scout MCP. Each extra round-trip costs ~3-5s of LLM inference — tool speed doesn't matter when think time is 90% of wall time.
 
-### Key Finding: Scout MCP ≈ Scout CLI on Small/Medium Repos
+### Key Finding: Scout+Graph is the quality leader
 
-Scout MCP is 8% faster than Scout CLI on average — marginal on small repos. The persistent MCP server avoids process-spawn overhead (~300ms/call) but agents compensate by making fewer CLI calls. Expect MCP advantage to grow on larger repos.
+Scout+Graph and CodeDB MCP tied at 13 secondary findings (vs 12 for Scout MCP and Grep). Scout+Graph achieved this at only a 17% time premium over Scout MCP — best quality/speed tradeoff.
 
-**Note**: Prior rounds (R6-R8) used broken tool builds. R6-R7 Scout was v1 (pre-confidence-gating). R8 had 20-agent concurrency contamination. R9 is the first clean comparison with all tools working correctly.
+**Note**: Prior rounds (R6-R8) used broken tools. CodeDB CLI (segfaults) replaced by CodeDB MCP. R9 is the first clean comparison.
+
+### Re-run: httpx-002 with New Builds (2026-04-06)
+
+After CodeDB rebuild + NPP leak fixes, all MCP tools improved significantly on httpx-002:
+
+| Variant | R9 → Rerun | Tokens | Tools |
+|---------|------------|--------|-------|
+| CodeDB MCP | 213s → **42s** (5.1x faster) | 53K → 41K | 44t → 9t |
+| Scout+Graph | 73s → **31s** (2.4x faster) | 38K → 36K | 14t → 7t |
+| Graph MCP | 82s → **34s** (2.4x faster) | 40K → 37K | 17t → 6t |
+| Scout MCP | 39s → **27s** (1.4x faster) | 36K → 33K | 7t → 5t |
+
+CodeDB's over-querying problem (44t → 9t) is resolved. All MCP tools now beat Grep (118s) by 2.8–4.4x. Full details in `BENCHMARK_R9_CLEAN.md`.
+
+### New Case: vscode-003 — Complex, 7K files (2026-04-06)
+
+After Tier 1 improvements + #42 conditional structural expansion (strip callers/callees at high confidence):
+
+| Rank | Variant | Time | Tokens | Tools | Secondary (4) |
+|------|---------|------|--------|-------|---------------|
+| 1 | **Scout MCP** | **115s** | **52K** | **16t** | 3/4 |
+| 2 | **Scout+Graph** | 133s | 57K | 21t | 3/4 |
+| 3 | **Graph MCP** | 140s | 53K | 17t | **4/4** |
+| 4 | CodeDB MCP | 252s | 66K | 28t | — |
+| 5 | Grep (6-way) | 291s | 54K | 25t | 2/4 |
+
+**Key finding: strip noise, keep signal.** Both Scout (4-tier confidence gating) and Graph (#42 conditional expansion) independently proved that stripping structural data at high confidence dramatically improves agent convergence. All three MCP variants now beat Grep by ~2x and cluster at 115-140s. Graph MCP achieved the best quality (4/4 secondary findings) with the fewest tokens (53K).
 
 ## Previous: Round 7 — Natural Prompt, New Cases (2026-04-01)
 
@@ -70,69 +96,76 @@ All per-case results across tools. Format: `time / tokens / tools`. Bold = faste
 ### Legend
 
 - **Grep**: Native Grep + Read (baseline)
-- **Scout MCP**: repo-scout MCP server (persistent, 2026-04-01 build)
-- **Scout CLI**: repo-scout CLI via Bash (same binary, process-per-call)
+- **Scout MCP**: repo-scout MCP server (persistent)
 - **Scout+Graph**: Scout CLI + code-review-graph MCP (structural queries)
-- **CodeDB**: codedb CLI (Windows patched build, re-indexes per invocation)
-- **Graph MCP**: code-review-graph Rust MCP v1.5 (semantic search + call graph)
+- **CodeDB MCP**: CodeDB MCP server (persistent, trigram + symbol index)
+- **Graph MCP**: code-review-graph Rust MCP v1.5 (semantic search + call graph, historical only)
 - Prompt: `N` = natural v3, `E` = "be efficient" v2
 
-### R9 results (clean, 2026-04-01) — all tools fixed, 3-agent batches
+### R9 results (clean, 2026-04-02) — all tools fixed, 3-agent batches
 
 #### Time (seconds) — bold = fastest
 
-| Case | Diff. | Grep | Scout MCP | Scout CLI | Scout+Graph | CodeDB |
-|------|-------|------|-----------|-----------|-------------|--------|
-| httpx-002 | Simple | 118 | 39 | **34** | 56 | 165 |
-| httpx-003 | Medium | 56 | 47 | 75 | 78 | **42** |
-| httpx-001 | Simple | 237 | 60 | **40** | 68 | 77 |
-| fastapi-003 | Medium | 111 | 96 | 113 | **81** | 214 |
-| nextjs-006 | Medium | — | — | — | — | — |
-| nextjs-005 | Simple | — | — | — | — | — |
-| nextjs-004 | Complex | — | — | — | — | — |
-| k8s-003 | Complex | — | — | — | — | — |
-| vscode-003 | Complex | — | — | — | — | — |
-| rust-002 | Complex | — | — | — | — | — |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
+|------|-------|------|-----------|-------------|------------|
+| httpx-002 | Simple | 118 | **39** | 73 | 213 |
+| httpx-003 | Medium | 56 | **47** | 67 | 182 |
+| httpx-001 | Simple | 237 | **60** | 71 | 122 |
+| fastapi-003 | Medium | 111 | **96** | 67 | 130 |
+| nextjs-006 | Medium | 258 | **191** | 257 | — |
+| nextjs-005 | Simple | **180** | 286 | 199 | — |
+| nextjs-004 | Complex | 342 | **108** | 138 | — |
+| k8s-003 | Complex | **116** | 428 | 434 | — |
+| fastapi-002 | Simple | 267 | **262** | 361 | — |
+| vscode-003 | Complex | — | — | — | — |
+| rust-002 | Complex | — | — | — | — |
 
 #### Tokens (K) — bold = most efficient
 
-| Case | Diff. | Grep | Scout MCP | Scout CLI | Scout+Graph | CodeDB |
-|------|-------|------|-----------|-----------|-------------|--------|
-| httpx-002 | Simple | 42 | 36 | 37 | 37 | 48 |
-| httpx-003 | Medium | 36 | **33** | 38 | 38 | **33** |
-| httpx-001 | Simple | 51 | 35 | **33** | 35 | 39 |
-| fastapi-003 | Medium | 44 | **38** | 48 | 42 | 40 |
-| nextjs-006 | Medium | — | — | — | — | — |
-| nextjs-005 | Simple | — | — | — | — | — |
-| nextjs-004 | Complex | — | — | — | — | — |
-| k8s-003 | Complex | — | — | — | — | — |
-| vscode-003 | Complex | — | — | — | — | — |
-| rust-002 | Complex | — | — | — | — | — |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
+|------|-------|------|-----------|-------------|------------|
+| httpx-002 | Simple | 42 | **36** | 38 | 53 |
+| httpx-003 | Medium | 36 | **35** | 36 | 50 |
+| httpx-001 | Simple | 51 | **35** | 36 | 39 |
+| fastapi-003 | Medium | 44 | **38** | 39 | 56 |
+| nextjs-006 | Medium | **76** | **76** | 81 | — |
+| nextjs-005 | Simple | **58** | 84 | 75 | — |
+| nextjs-004 | Complex | 69 | 56 | **48** | — |
+| k8s-003 | Complex | 51 | **42** | 49 | — |
+| fastapi-002 | Simple | **57** | 59 | 66 | — |
+| vscode-003 | Complex | — | — | — | — |
+| rust-002 | Complex | — | — | — | — |
 
 #### Tool Calls — bold = fewest
 
-| Case | Diff. | Grep | Scout MCP | Scout CLI | Scout+Graph | CodeDB |
-|------|-------|------|-----------|-----------|-------------|--------|
-| httpx-002 | Simple | 23 | 7 | **5** | 14 | 28 |
-| httpx-003 | Medium | 9 | 8 | **5** | 13 | **6** |
-| httpx-001 | Simple | 30 | 13 | **6** | 13 | 14 |
-| fastapi-003 | Medium | 26 | 23 | 30 | **20** | 18 |
-| nextjs-006 | Medium | — | — | — | — | — |
-| nextjs-005 | Simple | — | — | — | — | — |
-| nextjs-004 | Complex | — | — | — | — | — |
-| k8s-003 | Complex | — | — | — | — | — |
-| vscode-003 | Complex | — | — | — | — | — |
-| rust-002 | Complex | — | — | — | — | — |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
+|------|-------|------|-----------|-------------|------------|
+| httpx-002 | Simple | 23 | **7** | 14 | 44 |
+| httpx-003 | Medium | 9 | 8 | **10** | 27 |
+| httpx-001 | Simple | 30 | 13 | **10** | 24 |
+| fastapi-003 | Medium | 26 | 23 | **15** | 28 |
+| nextjs-006 | Medium | 60 | **19** | 31 | — |
+| nextjs-005 | Simple | 43 | 47 | **37** | — |
+| nextjs-004 | Complex | 45 | **21** | 27 | — |
+| k8s-003 | Complex | **20** | **18** | 22 | — |
+| fastapi-002 | Simple | 45 | 50 | 54 | — |
+| vscode-003 | Complex | — | — | — | — |
+| rust-002 | Complex | — | — | — | — |
 
 #### Quality: Root Cause Found
 
-| Case | Diff. | Grep | Scout MCP | Scout CLI | Scout+Graph | CodeDB |
-|------|-------|------|-----------|-----------|-------------|--------|
-| httpx-002 | Simple | YES | YES | YES | YES | YES |
-| httpx-003 | Medium | YES | YES | YES | YES | YES |
-| httpx-001 | Simple | YES | YES | YES | YES | YES |
-| fastapi-003 | Medium | YES | YES | YES | YES | YES |
-| **Total** | | **4/4** | **4/4** | **4/4** | **4/4** | **4/4** |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
+|------|-------|------|-----------|-------------|------------|
+| httpx-002 | Simple | YES | YES | YES | YES |
+| httpx-003 | Medium | YES | YES | YES | YES |
+| httpx-001 | Simple | YES | YES | YES | YES |
+| fastapi-003 | Medium | YES | YES | YES | YES |
+| nextjs-006 | Medium | YES | YES | YES | — |
+| nextjs-005 | Simple | YES | YES | YES | — |
+| nextjs-004 | Complex | YES | YES | YES | — |
+| k8s-003 | Complex | YES | YES | YES | — |
+| fastapi-002 | Simple | YES | YES | YES | — |
+| **Total** | | **9/9** | **9/9** | **9/9** | **4/4** |
 
 ### Historical R6-R7 results (older tools, mixed prompts)
 
@@ -221,12 +254,12 @@ MCP reviews produce ~2x more real findings at higher token cost.
 
 ## Key Findings
 
-1. **All tools find the root cause** — 100% primary accuracy across every variant, every round
-2. **Think time is 86% of wall time** — fewer tool calls > faster tool execution
-3. **Scout MCP is 2.2x faster than Grep** (R9) — with 18% fewer tokens and identical quality
-4. **CodeDB is repo-size-sensitive** — fastest on small repos (httpx-003: 42s), slowest on medium+ due to re-indexing tax (3.6s/call on fastapi)
-5. **Scout MCP ≈ Scout CLI on small repos** — MCP's persistent connection saves ~8% on average; gap expected to grow on larger repos
-6. **Scout+Graph produces the cleanest fixes** — structural queries enable deeper impact analysis, but at 17% time premium over Scout MCP
-7. **Over-exploration is the #1 failure mode** — more tool calls often = worse quality (CodeDB httpx-002: 28 tools, 165s vs Scout MCP: 7 tools, 39s)
-8. **Prompt matters as much as tools** — v2 "be efficient" eliminates 80% of speed variance (R6-R7 finding, still relevant)
-9. **Prior rounds had broken tools** — R6-R8 CodeDB segfaulted, Scout cache was corrupt, R8 had 20-agent concurrency. R9 is the first clean comparison.
+1. **All tools find the root cause** — 100% primary accuracy (9/9) across every variant, every case
+2. **Repo size determines the winner** — Scout MCP wins on small/medium repos (2-4x faster), Grep wins on large repos (>10K files, 2-4x faster)
+3. **Scout+Graph is the quality leader** — 30 total secondaries vs 27 for Grep/Scout MCP across 9 cases. Structural queries find connected issues grep misses.
+4. **Think time is 86% of wall time** — fewer tool calls > faster tool execution. Scout MCP averages 22 tools (T1+T2) vs Grep's 33.
+5. **Large repos hurt MCP variants** — k8s-003 (16.9K files): Grep 116s vs Scout MCP 428s (3.7x slower). MCP query latency scales with repo size.
+6. **Complex cases favor Scout MCP** — nextjs-004 (complex history bug): Scout MCP 108s vs Grep 342s (3.2x faster). Ranked results guide investigation more efficiently.
+7. **CodeDB MCP is slowest** (Tier 1 only) — 2.7x slower than Scout MCP. Sub-ms queries don't help when line-level results trigger 2.4x more tool calls.
+8. **Tool output verbosity drives agent behavior** — Scout MCP's convergence hints let agents stop sooner; verbose tools cause over-exploration
+9. **No single tool wins everywhere** — optimal strategy depends on repo size and bug complexity
