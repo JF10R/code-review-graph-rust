@@ -210,6 +210,9 @@ struct HybridQueryParams {
     #[schemars(description = "'fast' (default: file-mode, top 3, no expansion) or 'thorough' (full pipeline, all channels).")]
     #[serde(default)]
     budget: Option<String>,
+    #[schemars(description = "Filter results to this directory prefix (e.g., 'src/api/'). Relative to repo root.")]
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -305,6 +308,7 @@ enum WorkerCommand {
         debug: Option<bool>,
         result_mode: Option<String>,
         budget: Option<String>,
+        scope: Option<String>,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
     },
     ListStats {
@@ -512,12 +516,12 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 let _ = reply.send(result);
             }
 
-            WorkerCommand::HybridQuery { query, limit, compact, fusion, route, debug, result_mode, budget, reply } => {
+            WorkerCommand::HybridQuery { query, limit, compact, fusion, route, debug, result_mode, budget, scope, reply } => {
                 let _span = tracing::info_span!("worker_cmd", cmd = "hybrid_query").entered();
                 let result = catch_panic!("hybrid_query", {
                     let kw_hits = kw_hits!(&query, limit * 2);
                     crate::tools::hybrid_query_with_store(
-                        &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None, budget.as_deref(),
+                        &store, &mut emb_store, &root, &query, limit, compact, fusion.as_deref(), kw_hits, route.as_deref(), debug, result_mode.as_deref(), None, budget.as_deref(), scope.as_deref(),
                     ).map_err(|e| e.to_string())
                 });
                 let _ = reply.send(result);
@@ -547,7 +551,7 @@ fn run_worker_thread(root: Utf8PathBuf, cmd_rx: std::sync::mpsc::Receiver<Worker
                 let result = catch_panic!("get_review_context", {
                     let files = crate::tools::resolve_changed_files(changed_files, &root, &base);
                     crate::tools::get_review_context_with_store(
-                        &store, &root, files, max_depth, include_source, max_lines, compact,
+                        &store, &root, files, max_depth, include_source, max_lines, compact, &base,
                     ).map_err(|e| e.to_string())
                 });
                 let _ = reply.send(result);
@@ -1103,11 +1107,12 @@ impl CodeReviewServer {
                 debug: p.debug,
                 result_mode: p.result_mode,
                 budget: p.budget,
+                scope: p.scope,
                 reply,
             }).await
         } else {
             self.spawn_blocking_fallback(move || {
-                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact, p.fusion.as_deref(), p.route.as_deref(), p.debug, p.result_mode.as_deref(), p.budget.as_deref())
+                crate::tools::hybrid_query(&p.query, p.limit, repo_root.as_deref(), p.compact, p.fusion.as_deref(), p.route.as_deref(), p.debug, p.result_mode.as_deref(), p.budget.as_deref(), p.scope.as_deref())
             }).await
         }
     }

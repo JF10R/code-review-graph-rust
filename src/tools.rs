@@ -1029,9 +1029,34 @@ pub fn get_review_context(
     let (mut store, root) = get_store(repo_root)?;
     maybe_auto_update(&mut store, &root);
     let files = resolve_changed_files(changed_files, &root, base);
-    let result = get_review_context_with_store(&store, &root, files, max_depth, include_source, max_lines_per_file, compact)?;
+    let result = get_review_context_with_store(&store, &root, files, max_depth, include_source, max_lines_per_file, compact, base)?;
     store.close()?;
     Ok(result)
+}
+
+/// Map git diff line ranges to specific graph nodes whose line spans overlap.
+fn map_diff_ranges_to_nodes(
+    store: &GraphStore,
+    root: &Utf8Path,
+    diff_ranges: &HashMap<String, Vec<(usize, usize)>>,
+) -> Vec<(crate::types::GraphNode, String)> {
+    let mut changed_nodes = Vec::new();
+    for (rel_path, ranges) in diff_ranges {
+        let abs_path = root.join(rel_path).to_string();
+        let file_nodes = match store.get_nodes_by_file(&abs_path) {
+            Ok(nodes) => nodes,
+            Err(_) => continue,
+        };
+        for node in &file_nodes {
+            for &(start, end) in ranges {
+                if node.line_start <= end && node.line_end >= start {
+                    changed_nodes.push((node.clone(), rel_path.clone()));
+                    break; // Don't duplicate if multiple hunks hit same node
+                }
+            }
+        }
+    }
+    changed_nodes
 }
 
 pub fn get_review_context_with_store(
@@ -1042,6 +1067,7 @@ pub fn get_review_context_with_store(
     include_source: bool,
     max_lines_per_file: usize,
     compact: bool,
+    base: &str,
 ) -> Result<Value> {
     if files.is_empty() {
         return Ok(json!({
@@ -1098,6 +1124,23 @@ pub fn get_review_context_with_store(
 
     let guidance = generate_review_guidance(&impact);
     context["review_guidance"] = json!(guidance);
+
+    // Map git diff line ranges to changed function/test nodes.
+    let diff_ranges = crate::incremental::get_diff_line_ranges(root, base);
+    let changed_fns = map_diff_ranges_to_nodes(store, root, &diff_ranges);
+    let fns_json: Vec<Value> = changed_fns.iter()
+        .filter(|(n, _)| matches!(n.kind, crate::types::NodeKind::Function | crate::types::NodeKind::Test))
+        .take(20)
+        .map(|(n, rel)| json!({
+            "name": n.name,
+            "file": rel,
+            "lines": format!("{}-{}", n.line_start, n.line_end),
+            "kind": format!("{:?}", n.kind),
+        }))
+        .collect();
+    if !fns_json.is_empty() {
+        context["changed_functions"] = json!(fns_json);
+    }
 
     let summary_parts = [
         format!("Review context for {} changed file(s):", files.len()),
@@ -1532,14 +1575,17 @@ pub(crate) fn classify_query(query: &str) -> Classification {
 // ---------------------------------------------------------------------------
 
 /// Convert a ranked list of `GraphNode`s into `NodeCandidate` entries using
-/// standard RRF rank-to-score: `1.0 / (60.0 + rank + 1.0)`.
+/// standard RRF rank-to-score: `channel_weight * (1.0 / (60.0 + rank + 1.0))`.
+/// `channel_weight` scales the contribution of this retrieval channel relative
+/// to others; pass `1.0` for neutral (identical to the original un-weighted RRF).
 fn nodes_to_candidates(
     nodes: &[crate::types::GraphNode],
     source: CandidateSource,
+    channel_weight: f64,
     pool: &mut HashMap<String, NodeCandidate>,
 ) {
     for (rank, node) in nodes.iter().enumerate() {
-        let rrf_score = 1.0 / (RRF_K + rank as f64 + 1.0);
+        let rrf_score = channel_weight * (1.0 / (RRF_K + rank as f64 + 1.0));
         let entry = pool.entry(node.qualified_name.clone()).or_insert_with(|| NodeCandidate {
             qualified_name: node.qualified_name.clone(),
             file_path: node.file_path.clone(),
@@ -1567,6 +1613,11 @@ fn nodes_to_candidates(
 /// 5. Semantic           — only when `emb_store` has node embeddings.
 ///    5b. File-semantic     — top files by embedding similarity, expanded to nodes.
 /// 6. Tantivy            — only when `kw_hits` is `Some`.
+///
+/// Per-channel weights are derived from `classification.route` so that the
+/// retrieval channels most likely to be useful for the query type contribute
+/// more strongly to the final RRF scores.  When all weights equal 1.0 the
+/// result is identical to the original un-weighted RRF.
 #[allow(clippy::too_many_arguments)]
 fn fanout_retrieve(
     store: &GraphStore,
@@ -1576,33 +1627,43 @@ fn fanout_retrieve(
     limit: usize,
     kw_hits: Option<Vec<crate::types::GraphNode>>,
     ablation: &AblationConfig,
+    classification: &Classification,
 ) -> Result<HashMap<String, NodeCandidate>> {
+    // Derive per-channel weights from the query route.
+    // (kw_exact_w, kw_relaxed_w, semantic_w, path_w)
+    let (kw_exact_w, kw_relaxed_w, semantic_w, path_w) = match classification.route {
+        QueryRoute::ExactSymbol | QueryRoute::ExactText => (1.5, 1.0, 0.7, 1.0),
+        QueryRoute::FilePath => (1.0, 1.0, 0.7, 1.5),
+        QueryRoute::Causal | QueryRoute::General => (1.0, 0.8, 1.3, 1.0),
+        _ => (1.0, 1.0, 1.0, 1.0),
+    };
+
     let pool_limit = limit * 5;
     let mut pool: HashMap<String, NodeCandidate> = HashMap::new();
 
     // Channel 1: keyword relaxed (always).
     let relaxed_hits = store.search_nodes_relaxed(&parts.raw, pool_limit)?;
-    nodes_to_candidates(&relaxed_hits, CandidateSource::KeywordRelaxed, &mut pool);
+    nodes_to_candidates(&relaxed_hits, CandidateSource::KeywordRelaxed, kw_relaxed_w, &mut pool);
 
     // Channel 2: keyword exact — symbols only with full fanout (known regression risk).
     if ablation.fanout && !parts.symbols.is_empty() {
         let exact_query = parts.symbols.join(" ");
         let exact_hits = store.search_nodes(&exact_query, pool_limit)?;
-        nodes_to_candidates(&exact_hits, CandidateSource::KeywordExact, &mut pool);
+        nodes_to_candidates(&exact_hits, CandidateSource::KeywordExact, kw_exact_w, &mut pool);
     }
 
     // Channel 2a: compound terms — always-on (cheap, no regression risk).
     if ablation.exact_channels && !parts.compound_terms.is_empty() {
         let compound_query = parts.compound_terms.join(" ");
         let compound_hits = store.search_nodes(&compound_query, pool_limit)?;
-        nodes_to_candidates(&compound_hits, CandidateSource::KeywordExact, &mut pool);
+        nodes_to_candidates(&compound_hits, CandidateSource::KeywordExact, kw_exact_w, &mut pool);
     }
 
     // Channel 2b: error strings — exact search per quoted/backtick span (cheap, always-on).
     if ablation.exact_channels && !parts.error_strings.is_empty() {
         for err_str in &parts.error_strings {
             let err_hits = store.search_nodes(err_str, pool_limit)?;
-            nodes_to_candidates(&err_hits, CandidateSource::KeywordExact, &mut pool);
+            nodes_to_candidates(&err_hits, CandidateSource::KeywordExact, kw_exact_w, &mut pool);
         }
     }
 
@@ -1621,7 +1682,7 @@ fn fanout_retrieve(
             .collect();
         path_boosted.append(&mut non_path);
         path_boosted.truncate(pool_limit);
-        nodes_to_candidates(&path_boosted, CandidateSource::PathBoosted, &mut pool);
+        nodes_to_candidates(&path_boosted, CandidateSource::PathBoosted, path_w, &mut pool);
     }
 
     // Channel 4: config-boosted — reweight relaxed results for Type-kind nodes.
@@ -1640,7 +1701,7 @@ fn fanout_retrieve(
             .collect();
         config_boosted.append(&mut non_config);
         config_boosted.truncate(pool_limit);
-        nodes_to_candidates(&config_boosted, CandidateSource::ConfigBoosted, &mut pool);
+        nodes_to_candidates(&config_boosted, CandidateSource::ConfigBoosted, 1.0, &mut pool);
     }
 
     // Channel 5: semantic — only when embeddings are available and semantic is enabled.
@@ -1655,7 +1716,7 @@ fn fanout_retrieve(
                     .and_then(|qn| store.get_node(qn).ok().flatten())
             })
             .collect();
-        nodes_to_candidates(&sem_nodes, CandidateSource::Semantic, &mut pool);
+        nodes_to_candidates(&sem_nodes, CandidateSource::Semantic, semantic_w, &mut pool);
     }
 
     // Channel 5b: file-semantic — find top files by embedding similarity, then expand to nodes.
@@ -1664,7 +1725,7 @@ fn fanout_retrieve(
         let top_files = semantic_search_files(&parts.raw, emb_store, limit)?;
         for (file_path, _score) in &top_files {
             if let Ok(nodes) = store.get_nodes_by_file(file_path) {
-                nodes_to_candidates(&nodes, CandidateSource::FileSemantic, &mut pool);
+                nodes_to_candidates(&nodes, CandidateSource::FileSemantic, semantic_w, &mut pool);
             }
         }
     }
@@ -1672,7 +1733,7 @@ fn fanout_retrieve(
     // Channel 6: Tantivy — only when pre-computed hits are provided and fanout is enabled.
     if ablation.fanout {
         if let Some(tantivy_nodes) = kw_hits {
-            nodes_to_candidates(&tantivy_nodes, CandidateSource::Tantivy, &mut pool);
+            nodes_to_candidates(&tantivy_nodes, CandidateSource::Tantivy, 1.0, &mut pool);
         }
     }
 
@@ -1780,6 +1841,7 @@ fn expand_candidates(
 /// Aggregate a candidate pool into file-level results with capped top-k scoring
 /// and conditional priors.
 fn aggregate_to_files(
+    store: &GraphStore,
     candidates: HashMap<String, NodeCandidate>,
     parts: &QueryParts,
     limit: usize,
@@ -1864,7 +1926,29 @@ fn aggregate_to_files(
                 1.0
             };
 
-            let final_score = base * exact_symbol_boost * test_prior * compiled_prior * multi_source * symbol_path;
+            // Risk boost: high fan-in + no tests = likely important and risky.
+            // Uses top-3 nodes by score (already sorted above).
+            let risk_boost = if ablation.priors {
+                let max_fan_in = nodes.iter().take(3).map(|n| {
+                    store.get_edges_by_target(&n.qualified_name)
+                        .map(|edges| edges.iter().filter(|e| e.kind == EdgeKind::Calls).count())
+                        .unwrap_or(0)
+                }).max().unwrap_or(0);
+
+                let any_untested = nodes.iter().take(3).any(|n| {
+                    !store.get_edges_by_target(&n.qualified_name)
+                        .map(|edges| edges.iter().any(|e| e.kind == EdgeKind::TestedBy))
+                        .unwrap_or(false)
+                });
+
+                let fan_in_factor = if max_fan_in > 5 { 1.1 } else { 1.0 };
+                let test_factor = if any_untested && max_fan_in > 3 { 1.15 } else { 1.0 };
+                fan_in_factor * test_factor
+            } else {
+                1.0
+            };
+
+            let final_score = base * exact_symbol_boost * test_prior * compiled_prior * multi_source * symbol_path * risk_boost;
 
             // Top-3 evidence nodes.
             let top_nodes: Vec<NodeEvidence> = nodes
@@ -2076,6 +2160,7 @@ pub fn hybrid_query(
     debug: Option<bool>,
     result_mode: Option<&str>,
     budget: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -2091,10 +2176,102 @@ pub fn hybrid_query(
 
     let emb_db_path = incremental::get_embeddings_db_path(&root);
     let mut emb_store = EmbeddingStore::new(&emb_db_path)?;
-    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode, None, budget)?;
+    let result = hybrid_query_with_store(&store, &mut emb_store, &root, query, limit, compact, fusion, None, route, debug, result_mode, None, budget, scope)?;
     emb_store.close()?;
     store.close()?;
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-view retrieval helpers for budget="auto"
+// ---------------------------------------------------------------------------
+
+/// Server-side multi-view retrieval for budget="auto".
+/// Runs up to 3 query reformulations, tracks novelty per view,
+/// applies revisit demotion, and stops when progress stalls.
+#[allow(clippy::too_many_arguments)]
+fn auto_budget_multi_view(
+    store: &GraphStore,
+    emb_store: &mut EmbeddingStore,
+    root: &Utf8Path,
+    query: &str,
+    parts: &QueryParts,
+    limit: usize,
+    kw_hits: Option<Vec<crate::types::GraphNode>>,
+    ablation: &AblationConfig,
+    classification: &Classification,
+) -> Result<HashMap<String, NodeCandidate>> {
+    let mut pool: HashMap<String, NodeCandidate> = HashMap::new();
+    let mut seen_files: HashSet<String> = HashSet::new();
+    let mut stall_count = 0;
+
+    // View 1: Original query (always runs).
+    let view1 = fanout_retrieve(store, emb_store, root, parts, limit, kw_hits, ablation, classification)?;
+    let new_files_1 = count_new_files(&view1, &seen_files);
+    multi_view_merge(&mut pool, view1, &mut seen_files, 1.0);
+    if new_files_1 < 2 {
+        stall_count += 1;
+    }
+
+    // View 2: Symbols-only query (if meaningful symbols exist and not stalled).
+    if !parts.symbols.is_empty() && stall_count < 2 {
+        let sym_query = parts.symbols.join(" ");
+        let sym_parts = decompose_query(&sym_query);
+        let sym_class = classify_query(&sym_query);
+        let view2 = fanout_retrieve(store, emb_store, root, &sym_parts, limit, None, ablation, &sym_class)?;
+        let new_files_2 = count_new_files(&view2, &seen_files);
+        multi_view_merge(&mut pool, view2, &mut seen_files, 0.8);
+        if new_files_2 < 2 {
+            stall_count += 1;
+        } else {
+            stall_count = 0;
+        }
+    }
+
+    // View 3: Domain terms only (if enough terms and different from original query).
+    if parts.domain_terms.len() >= 2 && stall_count < 2 {
+        let dom_query = parts.domain_terms.join(" ");
+        if dom_query != query {
+            let dom_parts = decompose_query(&dom_query);
+            let dom_class = classify_query(&dom_query);
+            let view3 = fanout_retrieve(store, emb_store, root, &dom_parts, limit, None, ablation, &dom_class)?;
+            multi_view_merge(&mut pool, view3, &mut seen_files, 0.7);
+        }
+    }
+
+    Ok(pool)
+}
+
+/// Count how many distinct file paths in `candidates` are not already in `seen`.
+fn count_new_files(candidates: &HashMap<String, NodeCandidate>, seen: &HashSet<String>) -> usize {
+    candidates
+        .values()
+        .map(|c| c.file_path.as_str())
+        .collect::<HashSet<_>>()
+        .iter()
+        .filter(|fp| !seen.contains(**fp))
+        .count()
+}
+
+/// Merge `new` candidates into `pool` with a `view_weight` multiplier.
+/// Candidates already in pool get a 0.7× revisit demotion on the added score.
+fn multi_view_merge(
+    pool: &mut HashMap<String, NodeCandidate>,
+    new: HashMap<String, NodeCandidate>,
+    seen_files: &mut HashSet<String>,
+    view_weight: f64,
+) {
+    for (qn, mut candidate) in new {
+        seen_files.insert(candidate.file_path.clone());
+        candidate.score *= view_weight;
+        pool.entry(qn)
+            .and_modify(|existing| {
+                // Revisit demotion: diminished score for candidates seen in multiple views.
+                existing.score += candidate.score * 0.7;
+                existing.sources.extend(candidate.sources.iter().cloned());
+            })
+            .or_insert(candidate);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2112,6 +2289,7 @@ pub fn hybrid_query_with_store(
     result_mode: Option<&str>,
     ablation: Option<&AblationConfig>,
     budget: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<Value> {
     if query.trim().is_empty() {
         return Ok(json!({
@@ -2176,9 +2354,24 @@ pub fn hybrid_query_with_store(
             cfg
         };
         let parts = if abl.decomposition { decompose_query(query) } else { decompose_query_passthrough(query) };
-        let mut candidates = fanout_retrieve(store, emb_store, root, &parts, effective_limit, keyword_hits, &abl)?;
+        // Classify query — used for channel weighting in fanout_retrieve and metadata.
+        let classification = classify_query(query);
+        let mut candidates = if is_auto && node_count > 1_000 {
+            auto_budget_multi_view(store, emb_store, root, query, &parts, effective_limit, keyword_hits, &abl, &classification)?
+        } else {
+            fanout_retrieve(store, emb_store, root, &parts, effective_limit, keyword_hits, &abl, &classification)?
+        };
         if abl.expansion {
             expand_candidates(store, &mut candidates, effective_limit)?;
+        }
+        if let Some(scope) = scope {
+            candidates.retain(|_, c| {
+                let rel = c.file_path.strip_prefix(root.as_str())
+                    .unwrap_or(&c.file_path)
+                    .trim_start_matches('/')
+                    .trim_start_matches('\\');
+                rel.starts_with(scope)
+            });
         }
         let total_candidates = candidates.len();
         let files_scored = {
@@ -2188,11 +2381,8 @@ pub fn hybrid_query_with_store(
             }
             files.len()
         };
-        let file_results = aggregate_to_files(candidates, &parts, effective_limit, &abl);
+        let file_results = aggregate_to_files(store, candidates, &parts, effective_limit, &abl);
         let results_capped = !is_thorough && limit > effective_limit;
-
-        // Classify query for metadata and preview decisions (does not affect retrieval).
-        let classification = classify_query(query);
         let should_preview = !is_thorough
             && !auto_skip_preview
             && effective_limit <= 5
@@ -2440,10 +2630,18 @@ pub fn hybrid_query_with_store(
             combined.truncate(limit);
             ("hybrid_cc", combined)
         } else {
+            // Derive per-channel weights for node-mode RRF from the query route.
+            let (node_kw_w, node_sem_w) = match classification.route {
+                QueryRoute::ExactSymbol | QueryRoute::ExactText => (1.5, 0.7),
+                QueryRoute::FilePath => (1.0, 0.7),
+                QueryRoute::Causal | QueryRoute::General => (0.8, 1.3),
+                _ => (1.0, 1.0),
+            };
+
             let mut rrf_scores: HashMap<String, f64> = HashMap::new();
 
             for (rank, node) in keyword_hits.iter().enumerate() {
-                let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                let score = node_kw_w * (1.0 / (RRF_K + rank as f64 + 1.0));
                 *rrf_scores.entry(node.qualified_name.clone()).or_insert(0.0) += score;
             }
 
@@ -2451,7 +2649,7 @@ pub fn hybrid_query_with_store(
                 let semantic_hits = crate::embeddings::semantic_search(query, store, emb_store, limit * 2, compact, root)?;
                 for (rank, hit) in semantic_hits.iter().enumerate() {
                     if let Some(qn) = hit.get("qualified_name").and_then(|v| v.as_str()) {
-                        let score = 1.0 / (RRF_K + rank as f64 + 1.0);
+                        let score = node_sem_w * (1.0 / (RRF_K + rank as f64 + 1.0));
                         *rrf_scores.entry(qn.to_string()).or_insert(0.0) += score;
                     }
                 }
@@ -2474,10 +2672,19 @@ pub fn hybrid_query_with_store(
     let results: Vec<Value> = ranked
         .iter()
         .filter_map(|(qn, score)| {
-            store.get_node(qn).ok().flatten().map(|node| {
+            store.get_node(qn).ok().flatten().and_then(|node| {
+                if let Some(scope) = scope {
+                    let rel = node.file_path.strip_prefix(root.as_str())
+                        .unwrap_or(&node.file_path)
+                        .trim_start_matches('/')
+                        .trim_start_matches('\\');
+                    if !rel.starts_with(scope) {
+                        return None;
+                    }
+                }
                 let mut d = node_dict(&node, compact, root);
                 d[score_field] = json!(score);
-                d
+                Some(d)
             })
         })
         .collect();
@@ -3449,10 +3656,10 @@ mod tests {
         fs::write(dir.path().join("mod.py"), b"def compute(): pass\n").unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("", 10, Some(&path), false, None, None, None, None, Some("thorough"));
+        let result = hybrid_query("", 10, Some(&path), false, None, None, None, None, Some("thorough"), None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
-        assert_eq!(val["status"], "ok");
+        assert_eq!(val["status"], "no_match");
         let results = val["results"].as_array().unwrap();
         assert!(results.is_empty(), "empty query should return empty results");
     }
@@ -3467,7 +3674,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("add", 5, Some(&path), false, None, None, None, None, Some("thorough"));
+        let result = hybrid_query("add", 5, Some(&path), false, None, None, None, None, Some("thorough"), None);
         assert!(result.is_ok(), "hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3488,7 +3695,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("square", 5, Some(&path), false, None, None, None, None, Some("thorough"));
+        let result = hybrid_query("square", 5, Some(&path), false, None, None, None, None, Some("thorough"), None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3514,7 +3721,7 @@ mod tests {
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         // Explicit "rrf" fusion — no embeddings, so falls back to keyword_only
-        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None, None, Some("thorough"));
+        let result = hybrid_query("multiply", 5, Some(&path), false, Some("rrf"), None, None, None, Some("thorough"), None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3537,7 +3744,7 @@ mod tests {
 
         // CC mode without embeddings: embeddings_available = false, so falls into RRF branch
         // which returns "keyword_only" (since no embeddings are present)
-        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None, None, Some("thorough"));
+        let result = hybrid_query("abs_val", 5, Some(&path), false, Some("cc"), None, None, None, Some("thorough"), None);
         assert!(result.is_ok());
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3558,7 +3765,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None, None, Some("thorough"));
+        let result = hybrid_query("sort", 5, Some(&path), false, Some("cc"), None, None, None, Some("thorough"), None);
         assert!(result.is_ok(), "cc fusion hybrid_query should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -3923,6 +4130,14 @@ mod tests {
     // fanout_retrieve helpers
     // -----------------------------------------------------------------------
 
+    /// Build an empty GraphStore backed by a temp file for unit tests that don't need graph edges.
+    fn make_empty_store() -> (TempDir, GraphStore) {
+        let dir = TempDir::new().unwrap();
+        let db_path = Utf8Path::from_path(dir.path()).unwrap().join("graph.bin");
+        let store = GraphStore::new(&db_path).unwrap();
+        (dir, store)
+    }
+
     /// Build a minimal NodeCandidate for testing.
     fn make_candidate(qn: &str, file: &str, kind: NodeKind, score: f64, source: CandidateSource) -> NodeCandidate {
         let mut sources = HashSet::new();
@@ -3960,8 +4175,8 @@ mod tests {
             file_hash: String::new(),
         }];
 
-        nodes_to_candidates(&nodes_a, CandidateSource::KeywordRelaxed, &mut pool);
-        nodes_to_candidates(&nodes_a, CandidateSource::KeywordExact, &mut pool);
+        nodes_to_candidates(&nodes_a, CandidateSource::KeywordRelaxed, 1.0, &mut pool);
+        nodes_to_candidates(&nodes_a, CandidateSource::KeywordExact, 1.0, &mut pool);
 
         let candidate = pool.get("src/foo::foo").expect("candidate should be in pool");
         assert!(
@@ -3998,7 +4213,8 @@ mod tests {
         let parts = decompose_query("processRequest fails");
         assert!(!parts.symbols.is_empty(), "processRequest should be detected as symbol");
 
-        let pool = fanout_retrieve(&store, &mut emb_store, &root, &parts, 10, None, &AblationConfig::all_enabled()).unwrap();
+        let classification = classify_query("processRequest fails");
+        let pool = fanout_retrieve(&store, &mut emb_store, &root, &parts, 10, None, &AblationConfig::all_enabled(), &classification).unwrap();
 
         // The candidate pool must be non-empty (keyword relaxed at minimum).
         assert!(!pool.is_empty(), "fanout pool should not be empty");
@@ -4030,7 +4246,8 @@ mod tests {
         }
 
         let parts = decompose_query("something");
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         assert_eq!(results[0].file_path, "src/a.ts", "strong file should rank first");
@@ -4054,7 +4271,8 @@ mod tests {
         ));
 
         let parts = decompose_query("foo implementation detail");
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         let test_file_rank = results.iter().position(|r| r.file_path.contains("test")).unwrap();
@@ -4101,7 +4319,8 @@ mod tests {
             "cache_reducer should be detected as symbol token"
         );
 
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         // After symbol-path boost the cache_reducer file should rank first.
@@ -4143,7 +4362,8 @@ mod tests {
         }
 
         let parts = decompose_query("coerce_from_fn_pointer");
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         assert_eq!(
@@ -4183,7 +4403,8 @@ mod tests {
         }
 
         let parts = decompose_query("something");
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
 
         assert!(results.len() >= 2);
         assert_eq!(
@@ -4217,6 +4438,7 @@ mod tests {
             None,
             Some("file"),
             Some("thorough"),
+            None,
         );
         assert!(result.is_ok(), "file mode should succeed: {:?}", result);
         let val = result.unwrap();
@@ -4242,7 +4464,7 @@ mod tests {
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
         // result_mode omitted → node mode, existing behaviour must be preserved.
-        let result = hybrid_query("add", 5, Some(&path), true, None, None, None, None, Some("thorough"));
+        let result = hybrid_query("add", 5, Some(&path), true, None, None, None, None, Some("thorough"), None);
         assert!(result.is_ok(), "node mode should succeed: {:?}", result);
         let val = result.unwrap();
         assert_eq!(val["status"], "ok");
@@ -4277,6 +4499,7 @@ mod tests {
             Some(true), // debug = true
             Some("file"),
             Some("thorough"),
+            None,
         );
         assert!(result.is_ok(), "debug file mode should succeed: {:?}", result);
         let val = result.unwrap();
@@ -4297,7 +4520,7 @@ mod tests {
         .unwrap();
         build_or_update_graph(true, Some(&path), "HEAD").unwrap();
 
-        // budget="fast" (default when omitted), single identifier → ExactSymbol → should include preview
+        // budget="fast", single identifier → ExactSymbol → should include preview
         let result = hybrid_query(
             "handleRequest",
             5,
@@ -4307,7 +4530,8 @@ mod tests {
             None,  // route
             None,  // debug
             None,  // result_mode (fast mode forces file)
-            None,  // budget (defaults to "fast")
+            Some("fast"),  // budget
+            None,  // scope
         );
         assert!(result.is_ok(), "fast exact query should succeed: {:?}", result);
         let val = result.unwrap();
@@ -4342,7 +4566,7 @@ mod tests {
             "\"invalid JSON\"",
             5,
             Some(&path),
-            true, None, None, None, None, None,
+            true, None, None, None, None, Some("fast"), None,
         );
         assert!(result.is_ok());
         let val = result.unwrap();
@@ -4365,7 +4589,7 @@ mod tests {
             "handleRequest",
             5,
             Some(&path),
-            true, None, None, None, Some("file"), Some("thorough"),
+            true, None, None, None, Some("file"), Some("thorough"), None,
         );
         assert!(result.is_ok());
         let val = result.unwrap();
@@ -4391,7 +4615,7 @@ mod tests {
             "why does cache invalidation fail",
             5,
             Some(&path),
-            true, None, None, None, None, None,
+            true, None, None, None, None, None, None,
         );
         assert!(result.is_ok());
         let val = result.unwrap();
@@ -4425,7 +4649,8 @@ mod tests {
             "serverPatchReducer should be detected as a symbol"
         );
 
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
         assert!(!results.is_empty(), "should have at least one file result");
 
         let top = &results[0];
@@ -4460,7 +4685,8 @@ mod tests {
         );
 
         let parts = decompose_query("foo");
-        let results = aggregate_to_files(candidates, &parts, 10, &AblationConfig::full());
+        let (_dir, store) = make_empty_store();
+        let results = aggregate_to_files(&store, candidates, &parts, 10, &AblationConfig::full());
         assert!(!results.is_empty(), "should have at least one file result");
 
         let top = &results[0];

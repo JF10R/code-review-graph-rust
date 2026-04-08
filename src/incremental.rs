@@ -217,6 +217,60 @@ fn run_git(repo_root: &Utf8Path, args: &[&str]) -> Option<String> {
     }
 }
 
+/// Parse `git diff --unified=0` to extract per-file changed line ranges.
+/// Returns a map from relative file path to list of (start_line, end_line) ranges.
+pub fn get_diff_line_ranges(repo_root: &Utf8Path, base: &str) -> HashMap<String, Vec<(usize, usize)>> {
+    let mut ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+
+    let output = run_git(repo_root, &["diff", "--unified=0", base]);
+    let text = match output {
+        Some(s) => s,
+        None => return ranges,
+    };
+
+    let mut current_file: Option<String> = None;
+
+    for line in text.lines() {
+        // Detect file headers: +++ b/path/to/file
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            current_file = Some(path.to_string());
+            continue;
+        }
+
+        // Parse hunk headers: @@ -old_start,old_count +new_start,new_count @@
+        if line.starts_with("@@ ") {
+            if let Some(ref file) = current_file {
+                if let Some(range) = parse_hunk_header(line) {
+                    ranges.entry(file.clone()).or_default().push(range);
+                }
+            }
+        }
+    }
+
+    ranges
+}
+
+/// Parse "@@ -10,5 +15,7 @@" → Some((15, 21))  (new_start, new_start + new_count - 1)
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    // Find the +start,count portion
+    let plus_idx = line.find('+')?;
+    let rest = &line[plus_idx + 1..];
+    let end_idx = rest.find(' ').unwrap_or(rest.len());
+    let range_str = &rest[..end_idx];
+
+    let (start, count) = if let Some((s, c)) = range_str.split_once(',') {
+        (s.parse::<usize>().ok()?, c.parse::<usize>().ok()?)
+    } else {
+        (range_str.parse::<usize>().ok()?, 1) // Single-line change
+    };
+
+    if count == 0 {
+        return None; // Pure deletion, no new lines
+    }
+
+    Some((start, start + count - 1))
+}
+
 /// Get list of changed files via `git diff`.
 pub fn get_changed_files(repo_root: &Utf8Path, base: &str) -> Vec<String> {
     // Try diff against base

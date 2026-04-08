@@ -18,6 +18,7 @@
 //! postcard/zstd pattern as `graph.rs`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "hnsw-index")]
 use std::time::Instant;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -320,7 +321,7 @@ fn text_hash(text: &str) -> [u8; 8] {
 
 #[allow(dead_code)]
 trait EmbeddingProvider: Send + Sync {
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
     fn dimensions(&self) -> usize;
     fn name(&self) -> &str;
     /// Optional human-readable model identifier (defaults to `name()`).
@@ -350,7 +351,7 @@ impl OpenAiProvider {
 }
 
 impl EmbeddingProvider for OpenAiProvider {
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let body = serde_json::json!({
             "input": texts,
             "model": self.model,
@@ -441,7 +442,7 @@ impl VoyageProvider {
 }
 
 impl EmbeddingProvider for VoyageProvider {
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let body = serde_json::json!({
             "input": texts,
             "model": self.model,
@@ -504,7 +505,7 @@ impl GeminiProvider {
 }
 
 impl EmbeddingProvider for GeminiProvider {
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:batchEmbedContents?key={}",
             self.model, self.api_key
@@ -586,7 +587,7 @@ impl EmbeddingProvider for GeminiProvider {
 
 #[cfg(feature = "embeddings-fastembed")]
 struct FastEmbedProvider {
-    model: fastembed::TextEmbedding,
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
 }
 
 #[cfg(feature = "embeddings-fastembed")]
@@ -596,7 +597,7 @@ impl FastEmbedProvider {
         #[cfg(any(feature = "gpu-directml", feature = "gpu-cuda"))]
         {
             match Self::try_gpu_init() {
-                Ok(model) => return Ok(Self { model }),
+                Ok(model) => return Ok(Self { model: std::sync::Mutex::new(model) }),
                 Err(e) => tracing::warn!("GPU embedding init failed ({e}), falling back to CPU"),
             }
         }
@@ -607,7 +608,7 @@ impl FastEmbedProvider {
         let model = fastembed::TextEmbedding::try_new(init)
             .map_err(|e| CrgError::Other(format!("fastembed CPU init: {e}")))?;
         tracing::info!("Embedding provider: fastembed (CPU)");
-        Ok(Self { model })
+        Ok(Self { model: std::sync::Mutex::new(model) })
     }
 
     /// Attempt GPU-accelerated model init, catching both errors and ONNX FFI panics.
@@ -665,9 +666,9 @@ impl EmbeddingProvider for FastEmbedProvider {
         768
     }
 
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let embeddings = self
-            .model
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let mut model = self.model.lock().expect("fastembed mutex poisoned");
+        let embeddings = model
             .embed(texts.to_vec(), None)
             .map_err(|e| CrgError::Other(format!("fastembed embed: {e}")))?;
         Ok(embeddings)
@@ -741,7 +742,7 @@ mod candle_impl {
     }
 
     impl EmbeddingProvider for CandleProvider {
-        fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             let mut all_embeddings = Vec::with_capacity(texts.len());
 
             for chunk in texts.chunks(32) {
@@ -916,6 +917,20 @@ fn detect_provider() -> Option<Box<dyn EmbeddingProvider>> {
 }
 
 // ---------------------------------------------------------------------------
+// Global provider singleton — avoids re-creating the ONNX session per
+// EmbeddingStore, preventing arena memory leaks (#49).
+// ---------------------------------------------------------------------------
+
+static GLOBAL_PROVIDER: OnceLock<Option<Arc<dyn EmbeddingProvider>>> = OnceLock::new();
+
+/// Return the process-wide embedding provider, initialising it on first call.
+fn get_or_init_provider() -> Option<Arc<dyn EmbeddingProvider>> {
+    GLOBAL_PROVIDER
+        .get_or_init(|| detect_provider().map(Arc::from))
+        .clone()
+}
+
+// ---------------------------------------------------------------------------
 // EmbeddingStore
 // ---------------------------------------------------------------------------
 
@@ -941,7 +956,7 @@ pub struct EmbeddingStore {
     file_hash_to_vec: HashMap<[u8; 8], u32>,
     path: Utf8PathBuf,
     file_path: Utf8PathBuf,
-    provider: Option<Box<dyn EmbeddingProvider>>,
+    provider: Option<Arc<dyn EmbeddingProvider>>,
     #[cfg(feature = "hnsw-index")]
     hnsw_cache: Option<HnswIndex>,
     /// Dirty flag: set on mutation, cleared on HNSW rebuild.
@@ -997,7 +1012,7 @@ impl EmbeddingStore {
         let file_name_to_idx = file_data.build_name_to_idx();
         let file_hash_to_vec = file_data.build_hash_to_vec();
 
-        let provider = detect_provider();
+        let provider = get_or_init_provider();
         Ok(Self {
             data,
             lookup,
@@ -1079,7 +1094,7 @@ impl EmbeddingStore {
         // Drop old provider first so its ONNX session is released before
         // allocating a new one — avoids holding two CUDA contexts at once.
         let _ = self.provider.take();
-        self.provider = detect_provider();
+        self.provider = detect_provider().map(Arc::from);
         tracing::info!(
             "Embedding provider reset (new={})",
             self.provider.as_ref().map_or("none", |p| p.name())
@@ -1569,7 +1584,7 @@ pub fn embed_all_nodes(
     // next to avoid accumulating all vectors in a single temporary Vec.
     for chunk in need_embed.chunks(100) {
         let batch_results: Vec<([u8; 8], Vec<String>, Vec<f32>)> = {
-            let provider = emb_store.provider.as_mut().expect("checked above");
+            let provider = emb_store.provider.as_ref().expect("checked above");
             let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
             let vectors = provider.embed_batch(&texts)?;
             chunk
@@ -1616,7 +1631,7 @@ pub fn semantic_search(
         return Ok(nodes.iter().map(|n| node_to_dict(n, compact, repo_root)).collect());
     }
 
-    let provider = emb_store.provider.as_mut().expect("provider checked above");
+    let provider = emb_store.provider.as_ref().expect("provider checked above");
 
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
     let query_vec = &query_vecs[0];
@@ -1838,7 +1853,7 @@ pub fn embed_all_files(
     // Embed in batches, then mutate store.
     let mut all_results: Vec<([u8; 8], String, Vec<f32>)> = Vec::new();
     {
-        let provider = emb_store.provider.as_mut().expect("checked above");
+        let provider = emb_store.provider.as_ref().expect("checked above");
         for chunk in to_embed.chunks(100) {
             let texts: Vec<String> = chunk.iter().map(|(_, t, _)| t.clone()).collect();
             let vectors = provider.embed_batch(&texts)?;
@@ -1873,7 +1888,7 @@ pub fn semantic_search_files(
         return Ok(Vec::new());
     }
 
-    let provider = emb_store.provider.as_mut().expect("checked above");
+    let provider = emb_store.provider.as_ref().expect("checked above");
     let query_vecs = provider.embed_batch(&[query.to_string()])?;
     let query_vec = &query_vecs[0];
 
