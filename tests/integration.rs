@@ -466,7 +466,7 @@ fn hybrid_query_returns_ok_with_method_field() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("add", 5, Some(&root_str), false, None, None, None, None, Some("thorough")).unwrap();
+    let result = hybrid_query("add", 5, Some(&root_str), false, None, None, None, None, Some("thorough"), None).unwrap();
     assert_eq!(result["status"], "ok");
     // No embeddings in temp test repos — should fall back to keyword_only
     assert_eq!(
@@ -483,8 +483,8 @@ fn hybrid_query_empty_query_returns_empty() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("", 10, Some(&root_str), false, None, None, None, None, Some("thorough")).unwrap();
-    assert_eq!(result["status"], "ok");
+    let result = hybrid_query("", 10, Some(&root_str), false, None, None, None, None, Some("thorough"), None).unwrap();
+    assert_eq!(result["status"], "no_match");
     assert!(result["results"].as_array().unwrap().is_empty());
 }
 
@@ -495,7 +495,7 @@ fn hybrid_query_results_include_rrf_score() {
     let root_str = dir.path().to_string_lossy().into_owned();
     build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
 
-    let result = hybrid_query("subtract", 5, Some(&root_str), false, None, None, None, None, Some("thorough")).unwrap();
+    let result = hybrid_query("subtract", 5, Some(&root_str), false, None, None, None, None, Some("thorough"), None).unwrap();
     assert_eq!(result["status"], "ok");
     let arr = result["results"].as_array().unwrap();
     if !arr.is_empty() {
@@ -689,6 +689,100 @@ fn snapshot_trace_call_chain() {
     insta::assert_json_snapshot!(result, {
         ".summary" => "[summary]",
     });
+}
+
+// ---------------------------------------------------------------------------
+// C parser quality: typedef dedup, enum/union capture
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c_typedef_struct_no_duplicate_class_nodes() {
+    if !grammars_available() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+
+    fs::write(
+        dir.path().join("types.h"),
+        b"\
+/* Forward declaration */
+typedef struct request_rec request_rec;
+
+/* Full definition */
+struct request_rec {
+    int status;
+    const char *uri;
+};
+
+/* Typedef enum */
+typedef enum {
+    OK = 0,
+    DECLINED = -1
+} status_t;
+
+/* Bare enum */
+enum method_e {
+    M_GET,
+    M_POST
+};
+
+/* Bare union */
+union val_u {
+    int i;
+    float f;
+};
+",
+    )
+    .unwrap();
+
+    let root_str = dir.path().to_string_lossy().into_owned();
+    build_or_update_graph(true, Some(&root_str), "HEAD").unwrap();
+
+    let result = query_graph("children_of", "types.h", Some(&root_str), false).unwrap();
+    let results = result["results"].as_array().unwrap();
+
+    // Collect class node names
+    let class_names: Vec<&str> = results
+        .iter()
+        .filter(|r| r["kind"].as_str() == Some("Class"))
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+
+    // Forward decl should NOT create a nested .request_rec child node
+    assert!(
+        !class_names.iter().any(|n| n.contains('.')),
+        "should not create nested dotted class names, got: {:?}",
+        class_names
+    );
+
+    // request_rec appears (from forward decl typedef + full struct def)
+    assert!(
+        class_names.contains(&"request_rec"),
+        "request_rec should be captured, got: {:?}",
+        class_names
+    );
+
+    // status_t from typedef enum
+    assert!(
+        class_names.contains(&"status_t"),
+        "typedef enum status_t should be captured, got: {:?}",
+        class_names
+    );
+
+    // method_e from bare enum
+    assert!(
+        class_names.contains(&"method_e"),
+        "bare enum method_e should be captured, got: {:?}",
+        class_names
+    );
+
+    // val_u from bare union
+    assert!(
+        class_names.contains(&"val_u"),
+        "bare union val_u should be captured, got: {:?}",
+        class_names
+    );
 }
 
 #[test]

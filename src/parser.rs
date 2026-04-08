@@ -1493,6 +1493,31 @@ fn extract_from_tree(
             continue;
         }
 
+        // --- C/C++: skip struct/enum/union specifiers nested inside type_definition —
+        // the type_definition already creates the Class node (avoids duplicates
+        // like request_rec + request_rec.request_rec from `typedef struct request_rec request_rec;`)
+        if matches!(language.as_ref(), "c" | "cpp")
+            && matches!(
+                node_type,
+                "struct_specifier" | "enum_specifier" | "union_specifier"
+            )
+            && child
+                .parent()
+                .map_or(false, |p| p.kind() == "type_definition")
+        {
+            extract_from_tree(
+                &child,
+                ctx,
+                nodes,
+                edges,
+                enclosing_class,
+                enclosing_func,
+                enc_ns,
+                depth + 1,
+            );
+            continue;
+        }
+
         // --- Classes ---
         if lt.is_class(node_type) {
             if let Some(name) = get_name(&child, language, "class", source) {
@@ -1843,6 +1868,32 @@ fn reclassify_inheritance_pass(nodes: &[NodeInfo], edges: Vec<EdgeInfo>) -> Vec<
         .collect()
 }
 
+/// Strip common test prefixes/suffixes to find the function being tested.
+/// Returns None if stripping yields an empty string or an unchanged name.
+fn strip_test_affixes(name: &str) -> Option<String> {
+    // Try prefix stripping first
+    let stripped = name
+        .strip_prefix("test_")
+        .or_else(|| name.strip_prefix("Test"))
+        .or_else(|| name.strip_prefix("test"))
+        .unwrap_or(name);
+
+    // Then try suffix stripping
+    let stripped = stripped
+        .strip_suffix("_test")
+        .or_else(|| stripped.strip_suffix("_spec"))
+        .or_else(|| stripped.strip_suffix("Test"))
+        .or_else(|| stripped.strip_suffix("Spec"))
+        .unwrap_or(stripped);
+
+    let result = stripped.trim_start_matches('_').to_string();
+    if result.is_empty() || result == name {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 fn emit_tested_by_edges(nodes: &[NodeInfo], edges: &[EdgeInfo]) -> Vec<EdgeInfo> {
     let test_qnames: HashSet<&str> = nodes
         .iter()
@@ -1862,6 +1913,39 @@ fn emit_tested_by_edges(nodes: &[NodeInfo], edges: &[EdgeInfo]) -> Vec<EdgeInfo>
             });
         }
     }
+
+    // Name-matching heuristic: test_add → add, TestAdd → Add, etc.
+    // Complements the CALLS-based approach above for convention-based test names.
+    let non_test_map: HashMap<String, &str> = nodes
+        .iter()
+        .filter(|n| !n.is_test)
+        .map(|n| (n.name.to_lowercase(), n.qualified_name.as_str()))
+        .collect();
+
+    // Track already-created (target, test) pairs to avoid duplicates.
+    // Use owned strings so we don't hold a borrow on `extra` while pushing below.
+    let existing_pairs: HashSet<(String, String)> = extra
+        .iter()
+        .map(|e| (e.source_qualified.clone(), e.target_qualified.clone()))
+        .collect();
+
+    for test_node in nodes.iter().filter(|n| n.is_test) {
+        if let Some(stripped) = strip_test_affixes(&test_node.name) {
+            if let Some(&target_qn) = non_test_map.get(&stripped.to_lowercase()) {
+                let pair = (target_qn.to_string(), test_node.qualified_name.clone());
+                if !existing_pairs.contains(&pair) {
+                    extra.push(EdgeInfo {
+                        source_qualified: target_qn.to_string(),
+                        target_qualified: test_node.qualified_name.clone(),
+                        kind: EdgeKind::TestedBy,
+                        file_path: String::new(),
+                        line: 0,
+                    });
+                }
+            }
+        }
+    }
+
     extra
 }
 

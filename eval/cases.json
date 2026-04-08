@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "cases": {
+    "httpx-001": {
+      "repo": "encode/httpx",
+      "repo_path": "bench-repos/httpx",
+      "issue": "https://github.com/encode/httpx/pull/3442",
+      "prompt": "SSL certificate verification silently ignored when verify=False is set alongside a client certificate path",
+      "ground_truth": {
+        "primary_file": "httpx/_config.py",
+        "description": "verify=str branch early-returns before cert loading"
+      },
+      "secondary_findings": [
+        "cert silently ignored on verify=str path",
+        "pragma: nocover = zero test coverage on cert path",
+        "deprecation warning formatting bug"
+      ],
+      "difficulty": "simple",
+      "language": "python",
+      "repo_size_files": 60
+    },
+    "httpx-002": {
+      "repo": "encode/httpx",
+      "repo_path": "bench-repos/httpx",
+      "issue": "https://github.com/encode/httpx/pull/3412",
+      "prompt": "Empty zstd-encoded response body causes decode error instead of returning empty bytes",
+      "ground_truth": {
+        "primary_file": "httpx/_decoders.py",
+        "primary_function": "ZStandardDecoder.decode",
+        "description": "Missing empty-input guard before calling decompressor",
+        "fix_summary": "Add `if not data: return b\"\"` before `self.seen_data = True`"
+      },
+      "secondary_findings": [
+        "seen_data flag poisoned before guard",
+        "BrotliDecoder has correct pattern",
+        "test_zstd_empty doesn't exercise streaming"
+      ],
+      "difficulty": "simple",
+      "language": "python",
+      "repo_size_files": 60
+    },
+    "httpx-003": {
+      "repo": "encode/httpx",
+      "repo_path": "bench-repos/httpx",
+      "issue": "https://github.com/encode/httpx/pull/3045",
+      "prompt": "RFC 2069 digest authentication fails — where is the qop field omitted for legacy digest auth compatibility?",
+      "ground_truth": {
+        "primary_file": "httpx/_auth.py",
+        "primary_function": "_resolve_qop / _build_auth_header",
+        "description": "qop omission for RFC 2069 not handled"
+      },
+      "secondary_findings": [
+        "_resolve_qop doesn't handle empty qop b\"\"",
+        "algorithm field always emitted (not RFC 2069)",
+        "nc_value/cnonce computed unnecessarily",
+        "test masks bug via DigestApp filter"
+      ],
+      "difficulty": "medium",
+      "language": "python",
+      "repo_size_files": 60
+    },
+    "fastapi-001": {
+      "repo": "fastapi/fastapi",
+      "repo_path": "bench-repos/fastapi",
+      "issue": "https://github.com/fastapi/fastapi/issues/14454",
+      "pr": "https://github.com/fastapi/fastapi/pull/14455",
+      "prompt": "OAuth2 security schemes appear duplicated in OpenAPI spec with and without scopes when declared at APIRouter level",
+      "ground_truth": {
+        "primary_file": "fastapi/openapi/utils.py",
+        "primary_function": "get_openapi_security_definitions",
+        "description": "list vs dict merge causes duplication"
+      },
+      "secondary_findings": [],
+      "difficulty": "medium",
+      "language": "python",
+      "repo_size_files": 1100
+    },
+    "fastapi-002": {
+      "repo": "fastapi/fastapi",
+      "repo_path": "bench-repos/fastapi",
+      "issue": "https://github.com/fastapi/fastapi/issues/10997",
+      "pr": "https://github.com/fastapi/fastapi/pull/14616",
+      "prompt": "Pydantic Json type with list annotation fails in form dependency resolution",
+      "ground_truth": {
+        "primary_file": "fastapi/dependencies/utils.py",
+        "primary_function": "analyze_param",
+        "description": "Json metadata stripped from annotation during dependency analysis"
+      },
+      "secondary_findings": [],
+      "difficulty": "simple",
+      "language": "python",
+      "repo_size_files": 1100
+    },
+    "fastapi-003": {
+      "repo": "fastapi/fastapi",
+      "repo_path": "bench-repos/fastapi",
+      "issue": "https://github.com/fastapi/fastapi/issues/13533",
+      "pr": "https://github.com/fastapi/fastapi/pull/13537",
+      "prompt": "Form fields with empty string values are incorrectly treated as None/missing instead of empty string in FastAPI dependency injection",
+      "ground_truth": {
+        "primary_file": "fastapi/dependencies/utils.py",
+        "primary_function": "_get_multidict_value",
+        "description": "Treats value == \"\" same as None"
+      },
+      "secondary_findings": [
+        "_get_multidict_value empty string check",
+        "Query/Header/Cookie same pattern",
+        "missing test for empty string form values"
+      ],
+      "difficulty": "medium",
+      "language": "python",
+      "repo_size_files": 1100
+    },
+    "vscode-003": {
+      "repo": "microsoft/vscode",
+      "repo_path": "bench-repos/vscode",
+      "issue": "https://github.com/microsoft/vscode/issues/229761",
+      "prompt": "Keybinding resolver picks the wrong command when two keybindings have the same chord and one has a when clause with a negated context key",
+      "ground_truth": {
+        "primary_file": "src/vs/platform/keybinding/common/keybindingResolver.ts",
+        "primary_function": "whenIsEntirelyIncluded + _findCommand",
+        "description": "whenIsEntirelyIncluded returns true for negated-when vs undefined; _findCommand last-wins ordering"
+      },
+      "secondary_findings": [
+        "_addKeyPress removes from _lookupMap",
+        "implies() no complement/negation awareness",
+        "_findCommand reverse iteration (last-wins)",
+        "MoreChordsNeeded with negated binding"
+      ],
+      "difficulty": "complex",
+      "language": "typescript",
+      "repo_size_files": 7000
+    },
+    "nextjs-004": {
+      "repo": "vercel/next.js",
+      "repo_path": "bench-repos/next.js",
+      "issue": "https://github.com/vercel/next.js/issues/90513",
+      "pr": "https://github.com/vercel/next.js/pull/90533",
+      "prompt": "serverPatchReducer loses push/replace history intent on soft navigation retry, causing incorrect browser history entries",
+      "ground_truth": {
+        "primary_file": "packages/next/src/client/components/router-reducer/reducers/server-patch-reducer.ts",
+        "description": "Boolean condition inversion (&&  vs ||) in refreshReducer fallback"
+      },
+      "secondary_findings": [],
+      "difficulty": "complex",
+      "language": "typescript",
+      "repo_size_files": 6400
+    },
+    "nextjs-005": {
+      "repo": "vercel/next.js",
+      "repo_path": "bench-repos/next.js",
+      "issue": "https://github.com/vercel/next.js/issues/85416",
+      "pr": "https://github.com/vercel/next.js/pull/85418",
+      "prompt": "Race condition in middleware body cloning with server actions causes request body to be consumed twice",
+      "ground_truth": {
+        "primary_file": "packages/next/src/server/next-server.ts",
+        "description": "replaceRequestBody fragility + body cloning race"
+      },
+      "secondary_findings": [],
+      "difficulty": "simple",
+      "language": "typescript",
+      "repo_size_files": 6400
+    },
+    "nextjs-006": {
+      "repo": "vercel/next.js",
+      "repo_path": "bench-repos/next.js",
+      "issue": "https://github.com/vercel/next.js/issues/89033",
+      "pr": "https://github.com/vercel/next.js/pull/89040",
+      "prompt": "LRU cache memory leak — null route handler cache entries have size zero so they are never evicted causing unbounded memory growth",
+      "ground_truth": {
+        "primary_file": "packages/next/src/server/lib/lru-cache.ts",
+        "description": "calculateSize returns 0 for null; require.ts falsy check on cached null"
+      },
+      "secondary_findings": [
+        "truthy check on cached null",
+        "lru guard missing",
+        "use-cache-wrapper byte hack",
+        "prod-only cache path"
+      ],
+      "difficulty": "medium",
+      "language": "typescript",
+      "repo_size_files": 6400
+    },
+    "k8s-003": {
+      "repo": "kubernetes/kubernetes",
+      "repo_path": "bench-repos/kubernetes",
+      "issue": "https://github.com/kubernetes/kubernetes/issues/124847",
+      "prompt": "Deployment rollout stalls indefinitely when maxUnavailable and maxSurge are both set — reconcileOldReplicaSets in the rolling update controller gets stuck in a loop without making progress",
+      "ground_truth": {
+        "primary_file": "pkg/controller/deployment/deployment_controller.go",
+        "primary_function": "reconcileOldReplicaSets",
+        "description": "Rolling update controller loop stalls"
+      },
+      "secondary_findings": [
+        "error swallowing (return false, nil instead of false, err)",
+        "ResolveFenceposts silently converts maxUnavailable=0%/maxSurge=0%",
+        "newRSUnavailablePodCount uses Spec.Replicas not Status.Replicas"
+      ],
+      "difficulty": "complex",
+      "language": "go",
+      "repo_size_files": 16900
+    },
+    "k8s-004": {
+      "repo": "kubernetes/kubernetes",
+      "repo_path": "bench-repos/kubernetes",
+      "issue": "https://github.com/kubernetes/kubernetes/issues/122718",
+      "prompt": "kubelet volume manager deadlocks when reconciler detaches a volume while attach/detach controller holds the global volume lock",
+      "ground_truth": {
+        "primary_file": "pkg/kubelet/volumemanager/volume_manager.go",
+        "description": "Deadlock chain across 5 files, 2 lock types (VolumePluginMgr.mutex + nestedPendingOperations.lock)"
+      },
+      "secondary_findings": [
+        "FindPluginBySpec uses write lock for reads",
+        "GenerateDetachVolumeFunc acquires pm.mutex before pendingOperations.Run (attach does it inside closure)",
+        "FlexVolume prober.mutex 3-goroutine cycle",
+        "Distributed liveness via informer lag (MountedByNode stale)"
+      ],
+      "difficulty": "complex",
+      "language": "go",
+      "repo_size_files": 16900
+    },
+    "rust-001": {
+      "repo": "rust-lang/rust",
+      "repo_path": "bench-repos/rust",
+      "issue": "https://github.com/rust-lang/rust/issues/130528",
+      "prompt": "Borrow checker emits confusing error message about lifetime mismatch when returning a reference from a closure that captures a local",
+      "ground_truth": {
+        "primary_file": "compiler/rustc_borrowck/src/diagnostics/region_errors.rs",
+        "description": "5-crate compiler trace (borrowck -> diagnostics -> region_name -> nice_region_error -> session_diagnostics)"
+      },
+      "secondary_findings": [],
+      "difficulty": "complex",
+      "language": "rust",
+      "repo_size_files": 36800
+    },
+    "httpd-001": {
+      "repo": "apache/httpd",
+      "repo_path": "bench-repos/httpd",
+      "prompt": "How is an HTTP request processed through the core handler pipeline?",
+      "ground_truth": {
+        "primary_file": "server/request.c",
+        "primary_function": "ap_process_request_internal",
+        "description": "Core request processing pipeline routing through hooks"
+      },
+      "secondary_findings": [
+        "ap_run_handler dispatches to module handlers",
+        "ap_invoke_handler in config.c",
+        "request_rec struct in httpd.h defines request lifecycle"
+      ],
+      "difficulty": "medium",
+      "language": "c",
+      "repo_size_files": 562
+    }
+  }
+}
