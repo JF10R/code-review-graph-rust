@@ -9,48 +9,68 @@ Code search tool benchmarks using Claude Sonnet 4.6 in `bypassPermissions` mode,
 For full methodology, see `BENCHMARK_METHODOLOGY.md`.
 For historical round-by-round details, see `BENCHMARK_HISTORY.md`.
 
-## Latest: Round 10 — Phase 2-3 Validation (2026-04-07)
+## Latest: Round 10 — Full-Suite 5-Way Comparison (2026-04-07)
 
-First standalone Graph MCP benchmark after Phase 2-3 improvements (confidence-weighted RRF, budget="auto" multi-view, TESTED_BY heuristics, risk ranking, scope filtering, git-diff node mapping).
+33 sequential runs across 11 cases, 5 variants (Grep, Scout MCP, Graph MCP, CodeDB MCP, Scout+Graph). All Sonnet 4.6, `bypassPermissions`, sequential (no concurrency). First C language eval (httpd). 100% root cause hit rate.
 
-### httpx-001 — Phase 2-3 results
+### Global Averages (R10 runs only, where N >= 9)
 
-| Metric | R9 Grep | **R10 Scout MCP** | **R10 Graph MCP** | **R10 Scout+Graph** |
-|--------|---------|-------------------|-------------------|---------------------|
-| Time | 237s | **70s** | 85s | 127s |
-| Tokens | 51K | **36K** | 39K | 44K |
-| Tools | 30 | **8** | 16 | 23 |
-| Root cause | YES | YES | YES | YES |
-| Secondaries | 3/3 | 3/3 | 3/3 | 3/3 |
+| Rank | Variant | Avg Time | Avg Tokens | Avg Tools | Wins (fastest) | Wins (lowest tokens) |
+|------|---------|----------|------------|-----------|----------------|---------------------|
+| 1 | **Graph MCP** | **139s** | **52K** | 30t | **4/9** | **7/9** |
+| 2 | Scout+Graph | 193s | 66K | 34t | 2/9 | 0/9 |
+| 3 | CodeDB MCP | 284s | 69K | 40t | 2/9 | 2/9 |
 
-**Key findings:**
-- **Graph MCP standalone is 2.8x faster than Grep** with identical quality (3/3 secondaries)
-- **Single-tool > multi-tool**: Scout alone (70s, 8t) and Graph alone (85s, 16t) both beat Scout+Graph combo (127s, 23t). Two discovery systems = over-exploration.
-- Scout MCP improved vs R9 (70s/8t vs 60s/13t) — fewer tools, comparable speed
-- Graph MCP standalone is **2.8x faster than Grep** — competitive with Scout on small repos, expected to shine on larger repos with structural queries
-- budget="auto" activated multi-view retrieval, correctly identifying `_config.py` at rank #1 on first call
+Grep and Scout MCP had only 2 R10 cases each (httpd-001, fastapi-001) — not enough for aggregate comparison.
 
-### fastapi-002 — Phase 2-3 results + Opus comparison
+### Per-Case Results (R10 new runs)
 
-| Metric | R9 Grep | R10 Scout | R10 Graph | R10 Scout+Graph | R10 Scout (Opus) |
-|--------|---------|-----------|-----------|-----------------|------------------|
-| Time | **267s** | 466s | 473s | 594s | 429s |
-| Tokens | **57K** | 97K | **73K** | 92K | 96K |
-| Tools | **45** | 52 | 57 | 67 | 52 |
-| Root cause | YES | YES | YES | YES | YES |
+| Case | Diff. | Repo | Graph | CodeDB | S+Graph | Winner |
+|------|-------|------|-------|--------|---------|--------|
+| httpx-001 | Simple | httpx (60) | 59s/35K/9t | **53s**/36K/12t | 68s/39K/12t | CodeDB (time) |
+| httpx-003 | Medium | httpx (60) | 61s/36K/10t | **45s/35K**/8t | 49s/37K/**7t** | CodeDB (time) |
+| fastapi-001 | Medium | fastapi (1.1K) | 253s/68K/42t | 259s/**64K**/39t | **194s**/74K/**33t** | S+Graph (time) |
+| fastapi-002 | Simple | fastapi (1.1K) | **322s/63K/55t** | 568s/94K/69t | 721s/116K/90t | Graph (all) |
+| fastapi-003 | Medium | fastapi (1.1K) | 73s/**40K**/20t | 78s/43K/20t | **69s**/52K/**16t** | S+Graph (time) |
+| httpd-001 | Medium | httpd (562) | 101s/**50K**/36t | 157s/55K/30t | 109s/63K/31t | Scout MCP (73s) |
+| nextjs-004 | Complex | next.js (6.4K) | **94s/51K/23t** | 390s/88K/48t | 100s/59K/23t | Graph (all) |
+| nextjs-005 | Simple | next.js (6.4K) | **157s/63K/44t** | 182s/67K/46t | 179s/69K/43t | Graph (all) |
+| nextjs-006 | Medium | next.js (6.4K) | **132s/68K/33t** | 231s/81K/58t | 253s/86K/54t | Graph (all) |
+| k8s-004 | Complex | k8s (16.9K) | — | 657s/131K/75t | — | (only CodeDB) |
+| rust-001 | Complex | rust (36.8K) | — | 507s/69K/43t | — | (only CodeDB) |
 
-### vscode-003 — Phase 2-3 results (Complex, 7K files)
+### Key Findings
 
-| Metric | R9 Grep | R9 Graph | R10 Graph | R10 Scout | R10 Scout+Graph |
-|--------|---------|----------|-----------|-----------|-----------------|
-| Time | 291s | **140s** | **209s** | 449s | 1,526s |
-| Tokens | 54K | **53K** | **63K** | 88K | 129K |
-| Tools | 25 | **17** | 30 | 31 | 48 |
-| Secondaries | 2/4 | **4/4** | 3-4/4 | 4/4 | 4/4 |
+**Graph MCP dominates on token efficiency** — lowest tokens on 7/9 contested cases. Structural queries (`callers_of`, `callees_of`, `file_summary`) give precise context without the token bloat of full file reads.
 
-**Key finding: Graph MCP remains fastest MCP tool on complex cases.** R10 Graph (209s) is 1.4x faster than Grep and 2.1x faster than Scout. Scout+Graph took 25 minutes (48 tools, 129K tokens) — extreme over-exploration from two-tool ping-ponging. High variance across runs (R9 Graph 140s vs R10 209s) confirms k=1 is insufficient for significance.
+**Graph MCP wins on large TS repos** — nextjs-004/005/006 all won by Graph. On 6.4K-file TypeScript repos, structural navigation beats broad search. 94s on nextjs-004 (Complex) is 4x faster than CodeDB (390s).
 
-**Key finding: Grep wins on runtime-behavior bugs.** All MCP/Scout agents entered a Sonnet reproduction spiral (25-31 Bash calls testing Pydantic annotation unwrapping). Grep agents found the file faster via simple text search and trusted code reading. Opus was more disciplined (19 Bash vs 25-31) but still reproduced. Graph MCP had the fewest tokens (73K) thanks to terse output, but structural queries didn't help — the bug is in type metadata propagation, not call graph structure.
+**CodeDB wins on small Python repos** — httpx-001 (53s) and httpx-003 (45s). The `codedb_bundle` tool packs efficient multi-file context. But CodeDB is **consistently slowest on large repos** due to indexing overhead (k8s-004: 657s, rust-001: 507s).
+
+**Scout+Graph: inconsistent** — fastest on fastapi-001/003 but worst on fastapi-002 (721s, 116K tokens, 90 tool calls). Two discovery tools cause over-exploration on complex dependency-injection bugs. Best used on cases where Scout provides fast initial discovery and Graph confirms structural relationships.
+
+**C is grep-friendly** — httpd-001 Grep needed 34 tool calls vs R9 T2 average of 43 for TS/Go. C function names are globally unique, no namespaces. MCP tools add depth, not speed.
+
+### Tool Strengths/Weaknesses Summary
+
+| Tool | Best at | Worst at | Sweet spot |
+|------|---------|----------|------------|
+| **Graph MCP** | Token efficiency, large TS repos, structural bugs | Small repos (overkill), no-embedding fallback | 1K-10K file TS/JS repos |
+| **Scout MCP** | Speed on small/medium repos, fewest tool calls | Large repos (diminishing returns) | <1K file repos |
+| **CodeDB MCP** | Small Python repos, multi-file bundling | Large repos (indexing tax), high tool counts | 60-500 file Python repos |
+| **Scout+Graph** | Complex dependency chains (fastapi) | Over-exploration on simple bugs | Cases requiring both discovery + structural tracing |
+| **Grep** | Predictable, no setup, C/Go codebases | Large TS repos, high tool counts | Any repo where symbol names are unique |
+
+### Cross-Case Pattern: Which Tool Wins by Repo Size (updated)
+
+| Repo Size | Speed Winner | Token Winner |
+|-----------|-------------|-------------|
+| Small (httpx, 60 files) | CodeDB MCP | Graph MCP |
+| Medium C (httpd, 562 files) | Scout MCP | Graph MCP |
+| Medium Python (fastapi, 1.1K) | Scout+Graph | Graph MCP |
+| Large TS (next.js, 6.4K files) | **Graph MCP** | **Graph MCP** |
+| Large Go (k8s, 16.9K files) | Grep (R9) | Graph MCP (R9) |
+| Large Rust (rust, 36.8K files) | Scout+Graph (R9) | Scout MCP (R9) |
 
 ## Previous: Round 9 — Clean 4-Way Comparison (2026-04-02)
 
@@ -133,6 +153,36 @@ Scout+Graph Opus fastest. Scout Sonnet nearly as fast at lower cost. All found r
 | Repo Size | Speed Winner | Quality Winner |
 |-----------|-------------|---------------|
 | Small (httpx, 60 files) | Scout MCP | Tied |
+| Medium (vscode, 7K files) | Scout MCP | Graph MCP |
+| Large Go (k8s, 16.9K files) | Grep | Graph MCP |
+| Large Rust (rust, 36.8K files) | Scout+Graph | Tied |
+
+### New Case: httpd-001 — First C Language Eval, 5-Way (2026-04-07)
+
+Apache httpd (562 C files, 12,169 graph nodes). Tests C parser enhancements (typedef dedup, enum/union capture). Sequential runs, no concurrency.
+
+| Rank | Variant | Time | Tokens | Tools | GT Secondary (3) | Bonus |
+|------|---------|------|--------|-------|-----------------|-------|
+| 1 | **Scout MCP** | **73s** | **52K** | **19t** | 3/3 | 7 |
+| 2 | Grep | 101s | 57K | 34t | 3/3 | **8** |
+| 3 | Graph MCP | 101s | **50K** | 36t | 3/3 | 5 |
+| 4 | Scout+Graph | 109s | 63K | 31t | 3/3 | 6 |
+| 5 | CodeDB MCP | 157s | 55K | 30t | 3/3 | **8** |
+
+All variants found primary (`server/request.c::ap_process_request_internal`) and all 3 GT secondaries (100%).
+
+**Key findings:**
+- **Scout MCP fastest** (73s, 1.4x faster than Grep) with fewest tool calls (19t) — same pattern as R9 Tier 1.
+- **Graph MCP most token-efficient** (50K) but highest tool count (36t) — no embeddings for httpd forced structural-only navigation via repeated `query_graph` calls.
+- **Grep and CodeDB tied on depth** (8 bonus findings each) but CodeDB 1.5x slower (indexing overhead).
+- **C is grep-friendly**: 34 Grep tool calls vs 43 avg for R9 Tier 2 TS/Go — C function names are globally unique, no namespaces/overloading.
+
+### Cross-Case Pattern: Which Tool Wins by Repo Size (updated)
+
+| Repo Size | Speed Winner | Quality Winner |
+|-----------|-------------|---------------|
+| Small (httpx, 60 files) | Scout MCP | Tied |
+| Medium C (httpd, 562 files) | Scout MCP | Grep / CodeDB (depth) |
 | Medium (vscode, 7K files) | Scout MCP | Graph MCP |
 | Large Go (k8s, 16.9K files) | Grep | Graph MCP |
 | Large Rust (rust, 36.8K files) | Scout+Graph | Tied |

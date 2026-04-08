@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "runs": [
+    {
+      "case": "httpx-002", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 118, "tokens_k": 42, "tool_calls": 23, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern", "test_zstd_empty streaming"],
+      "secondary_score": "3/3"
+    },
+    {
+      "case": "httpx-002", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 39, "tokens_k": 36, "tool_calls": 7, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern"],
+      "secondary_score": "2/3"
+    },
+    {
+      "case": "httpx-002", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 73, "tokens_k": 38, "tool_calls": 14, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern", "test_zstd_empty streaming"],
+      "secondary_score": "3/3"
+    },
+    {
+      "case": "httpx-002", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 213, "tokens_k": 53, "tool_calls": 44, "root_cause_found": true,
+      "secondary_found": ["seen_data flag"],
+      "secondary_score": "1/3"
+    },
+    {
+      "case": "httpx-002", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "R9-rerun",
+      "time_s": 27, "tokens_k": 33, "tool_calls": 5, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern"],
+      "secondary_score": "2/3", "notes": "Post Scout Tier-1 + Graph Tier-1 changes"
+    },
+    {
+      "case": "httpx-002", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-06", "round": "R9-rerun",
+      "time_s": 31, "tokens_k": 36, "tool_calls": 7, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern"],
+      "secondary_score": "2/3", "notes": "Post Tier-1 changes"
+    },
+    {
+      "case": "httpx-002", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "R9-rerun",
+      "time_s": 34, "tokens_k": 37, "tool_calls": 6, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern"],
+      "secondary_score": "2/3", "notes": "Post Tier-1 changes"
+    },
+    {
+      "case": "httpx-002", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "R9-rerun",
+      "time_s": 42, "tokens_k": 41, "tool_calls": 9, "root_cause_found": true,
+      "secondary_found": ["seen_data flag", "BrotliDecoder pattern"],
+      "secondary_score": "2/3", "notes": "New CodeDB build"
+    },
+    {
+      "case": "vscode-003", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "post-tier1",
+      "time_s": 115, "tokens_k": 52, "tool_calls": 16, "root_cause_found": true,
+      "secondary_found": ["_addKeyPress lookupMap", "implies() no negation", "_findCommand reverse"],
+      "secondary_score": "3/4", "notes": "Scout Tier-1 changes (4-tier confidence gating)"
+    },
+    {
+      "case": "vscode-003", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-06", "round": "post-42",
+      "time_s": 133, "tokens_k": 57, "tool_calls": 21, "root_cause_found": true,
+      "secondary_found": ["_addKeyPress lookupMap", "implies() no negation", "_findCommand reverse"],
+      "secondary_score": "3/4", "notes": "Post #42 conditional expansion"
+    },
+    {
+      "case": "vscode-003", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "post-42",
+      "time_s": 140, "tokens_k": 53, "tool_calls": 17, "root_cause_found": true,
+      "secondary_found": ["_addKeyPress lookupMap", "implies() no negation", "_findCommand reverse", "MoreChordsNeeded"],
+      "secondary_score": "4/4", "notes": "Post #42 — best quality, all 4 secondaries"
+    },
+    {
+      "case": "vscode-003", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "post-tier1",
+      "time_s": 235, "tokens_k": 54, "tool_calls": 19, "root_cause_found": true,
+      "secondary_found": ["_addKeyPress lookupMap", "_findCommand reverse", "MoreChordsNeeded"],
+      "secondary_score": "3/4"
+    },
+    {
+      "case": "vscode-003", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-01", "round": "6-way",
+      "time_s": 291, "tokens_k": 54, "tool_calls": 25, "root_cause_found": true,
+      "secondary_found": ["_addKeyPress lookupMap", "implies() no negation"],
+      "secondary_score": "2/4"
+    },
+    {
+      "case": "k8s-004", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-06", "round": "first-run",
+      "time_s": 203, "tokens_k": 99, "tool_calls": 37, "root_cause_found": true,
+      "secondary_found": ["write lock for reads", "FlexVolume prober cycle", "GetNodesToUpdateStatusFor data race"],
+      "notes": "Found pm.mutex + prober.mutex 3-goroutine ABBA deadlock"
+    },
+    {
+      "case": "k8s-004", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "first-run",
+      "time_s": 261, "tokens_k": 84, "tool_calls": 30, "root_cause_found": true,
+      "secondary_found": ["write lock for reads", "attach/detach closure asymmetry"],
+      "notes": "Found lock ordering inversion + most actionable fix (move lookup inside closure)"
+    },
+    {
+      "case": "k8s-004", "variant": "scout_mcp", "model": "opus-4.6", "date": "2026-04-06", "round": "first-run",
+      "time_s": 342, "tokens_k": 120, "tool_calls": 58, "root_cause_found": true,
+      "secondary_found": ["distributed liveness", "informer lag", "MountedByNode stale"],
+      "notes": "Deepest analysis: distributed liveness deadlock between kubelet and controller (not mutex)"
+    },
+    {
+      "case": "k8s-004", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-06", "round": "first-run",
+      "time_s": 401, "tokens_k": 85, "tool_calls": 46, "root_cause_found": true,
+      "secondary_found": ["UpdateNodeStatusForNode inside-loop hazard"],
+      "notes": "Found ASW.Lock + grm.lock ordering inversion"
+    },
+    {
+      "case": "k8s-004", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-06", "round": "first-run",
+      "time_s": 478, "tokens_k": 109, "tool_calls": 67, "root_cause_found": true,
+      "secondary_found": ["write lock for reads", "starvation angle"],
+      "notes": "Found pm.mutex + ASW lock, but slowest variant on 16.9K-file repo"
+    },
+
+    {"case": "k8s-003", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-07", "round": "corrected-prompt",
+      "time_s": 49, "tokens_k": 33, "tool_calls": 6, "root_cause_found": true,
+      "secondary_found": ["error swallowing"],
+      "secondary_score": "1/3", "notes": "Corrected prompt. Fastest run — Go identifiers perfectly greppable."
+    },
+    {"case": "k8s-003", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "corrected-prompt",
+      "time_s": 88, "tokens_k": 42, "tool_calls": 8, "root_cause_found": true,
+      "secondary_found": ["error swallowing", "stale allRSs"],
+      "secondary_score": "2/3", "notes": "Corrected prompt. Scout Tier-1 gating working well."
+    },
+    {"case": "k8s-003", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "corrected-prompt",
+      "time_s": 84, "tokens_k": 43, "tool_calls": 12, "root_cause_found": true,
+      "secondary_found": ["error swallowing", "stale allRSs", "negative clamp"],
+      "secondary_score": "3/3", "notes": "Best quality — found all 3 secondaries including negative clamp edge case."
+    },
+    {"case": "k8s-003", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "corrected-prompt",
+      "time_s": 166, "tokens_k": 47, "tool_calls": 18, "root_cause_found": true,
+      "secondary_found": ["error swallowing", "negative clamp"],
+      "secondary_score": "2/3", "notes": "Corrected prompt."
+    },
+    {"case": "k8s-003", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "corrected-prompt",
+      "time_s": 239, "tokens_k": 67, "tool_calls": 20, "root_cause_found": true,
+      "secondary_found": ["error swallowing", "stale allRSs"],
+      "secondary_score": "2/3", "notes": "Corrected prompt."
+    },
+
+    {"case": "rust-001", "variant": "grep", "model": "opus-4.6", "date": "2026-04-07", "round": "first-run",
+      "time_s": 552, "tokens_k": 93, "tool_calls": 104, "root_cause_found": true,
+      "secondary_found": ["is_closure_fn_mut guard", "session_diagnostics FnMutError struct", "test issue-48238"],
+      "notes": "Opus. Found 5-crate trace: region_errors → is_closure_fn_mut → report_general_error → session_diagnostics."
+    },
+    {"case": "rust-001", "variant": "scout_mcp", "model": "opus-4.6", "date": "2026-04-07", "round": "first-run",
+      "time_s": 539, "tokens_k": 137, "tool_calls": 67, "root_cause_found": true,
+      "secondary_found": ["is_closure_fn_mut guard", "session_diagnostics", "region_name synthetic names"],
+      "notes": "Opus. Traced region_name.rs give_region_a_name producing synthetic '1/'2."
+    },
+    {"case": "rust-001", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "first-run",
+      "time_s": 366, "tokens_k": 80, "tool_calls": 36, "root_cause_found": true,
+      "secondary_found": ["is_closure_fn_mut guard", "region_name synthetic names"],
+      "notes": "Sonnet. Nearly as fast as Opus at lower cost."
+    },
+    {"case": "rust-001", "variant": "graph_mcp", "model": "opus-4.6", "date": "2026-04-07", "round": "first-run",
+      "time_s": 564, "tokens_k": 85, "tool_calls": 68, "root_cause_found": true,
+      "secondary_found": ["is_closure_fn_mut guard", "session_diagnostics", "region_name", "test issue-53432"],
+      "notes": "Opus. Found test file demonstrating confusing error."
+    },
+    {"case": "rust-001", "variant": "scout_graph", "model": "opus-4.6", "date": "2026-04-07", "round": "first-run",
+      "time_s": 345, "tokens_k": 90, "tool_calls": 40, "root_cause_found": true,
+      "secondary_found": ["is_closure_fn_mut guard", "session_diagnostics", "region_name", "test issue-53432", "FnOnce bug! at line 352"],
+      "notes": "Opus. Fastest on rust-001. Found FnOnce exclusion note."
+    },
+    {"case": "httpd-001", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 101, "tokens_k": 57, "tool_calls": 34, "root_cause_found": true,
+      "secondary_found": ["ap_run_handler dispatch", "ap_invoke_handler config.c", "request_rec httpd.h"],
+      "secondary_score": "3/3", "bonus_findings": 8,
+      "notes": "Sequential run. Deepest Grep result: found subrequests, H2 path, EOR bucket, output filter chain, walk_cache_t."
+    },
+    {"case": "httpd-001", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 73, "tokens_k": 52, "tool_calls": 19, "root_cause_found": true,
+      "secondary_found": ["ap_run_handler dispatch", "ap_invoke_handler config.c", "request_rec httpd.h"],
+      "secondary_score": "3/3", "bonus_findings": 7,
+      "notes": "Sequential run. Fastest variant. Found EOR bucket, async suspension, internal redirects, ap_check_pipeline."
+    },
+    {"case": "httpd-001", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 101, "tokens_k": 50, "tool_calls": 36, "root_cause_found": true,
+      "secondary_found": ["ap_run_handler dispatch", "ap_invoke_handler config.c", "request_rec httpd.h"],
+      "secondary_score": "3/3", "bonus_findings": 5,
+      "notes": "Sequential run. No embeddings — hybrid_query empty, forced structural-only navigation. High tool count (36) from graph traversal fallbacks."
+    },
+    {"case": "httpd-001", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 157, "tokens_k": 55, "tool_calls": 30, "root_cause_found": true,
+      "secondary_found": ["ap_run_handler dispatch", "ap_invoke_handler config.c", "request_rec httpd.h"],
+      "secondary_score": "3/3", "bonus_findings": 8,
+      "notes": "Sequential run. Slowest (indexing overhead). Deep analysis: found internal redirects, subrequest path, H2 path, async suspension."
+    },
+    {"case": "httpd-001", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 109, "tokens_k": 63, "tool_calls": 31, "root_cause_found": true,
+      "secondary_found": ["ap_run_handler dispatch", "ap_invoke_handler config.c", "request_rec httpd.h"],
+      "secondary_score": "3/3", "bonus_findings": 6,
+      "notes": "Sequential run. Good breadth but highest token cost (63K). Found EOR bucket, ap_check_pipeline, conn_state_t."
+    },
+
+    {"case": "httpx-001", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 237, "tokens_k": 51, "tool_calls": 30, "root_cause_found": true,
+      "secondary_found": ["cert silently ignored on verify=str", "pragma nocover", "deprecation warning"],
+      "secondary_score": "3/3", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+    {"case": "httpx-003", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 56, "tokens_k": 36, "tool_calls": 9, "root_cause_found": true,
+      "secondary_found": ["_resolve_qop empty qop", "algorithm always emitted", "nc/cnonce unnecessary"],
+      "secondary_score": "3/4", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+    {"case": "fastapi-002", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 267, "tokens_k": 57, "tool_calls": 45, "root_cause_found": true,
+      "secondary_found": ["Json expansion", "second guard", "Query/Header/Cookie", "fix status"],
+      "secondary_score": "4", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+    {"case": "fastapi-003", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 111, "tokens_k": 44, "tool_calls": 26, "root_cause_found": true,
+      "secondary_found": ["_get_multidict_value empty string", "Query/Header same pattern", "missing test"],
+      "secondary_score": "3/3", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+    {"case": "nextjs-004", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 342, "tokens_k": 69, "tool_calls": 45, "root_cause_found": true,
+      "secondary_found": ["refreshReducer fallback", "previousNavigationDidMismatch"],
+      "secondary_score": "2", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+    {"case": "nextjs-005", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 180, "tokens_k": 58, "tool_calls": 43, "root_cause_found": true,
+      "secondary_found": ["replaceRequestBody fragility", "size-limit truncation", "finalize timing"],
+      "secondary_score": "3", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+    {"case": "nextjs-006", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-02", "round": "R9",
+      "time_s": 258, "tokens_k": 76, "tool_calls": 60, "root_cause_found": true,
+      "secondary_found": ["truthy check on cached null", "lru guard missing", "use-cache-wrapper byte hack"],
+      "secondary_score": "3", "notes": "R9 backfill from BENCHMARK_R9_CLEAN.md"
+    },
+
+    {"case": "httpx-001", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 59, "tokens_k": 35, "tool_calls": 9, "root_cause_found": true,
+      "secondary_found": ["verify=str early-return cert drop", "pragma nocover untested"],
+      "secondary_score": "2/3"
+    },
+    {"case": "httpx-001", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 53, "tokens_k": 36, "tool_calls": 12, "root_cause_found": true,
+      "secondary_found": ["verify=str early-return cert drop", "pragma nocover untested"],
+      "secondary_score": "2/3"
+    },
+    {"case": "httpx-001", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 68, "tokens_k": 39, "tool_calls": 12, "root_cause_found": true,
+      "secondary_found": ["verify=str early-return cert drop", "pragma nocover untested"],
+      "secondary_score": "2/3"
+    },
+
+    {"case": "httpx-003", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 61, "tokens_k": 36, "tool_calls": 10, "root_cause_found": true,
+      "secondary_found": ["_resolve_qop empty qop handling", "algorithm field RFC 2069", "test no absence assert"],
+      "secondary_score": "3/4"
+    },
+    {"case": "httpx-003", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 45, "tokens_k": 35, "tool_calls": 8, "root_cause_found": true,
+      "secondary_found": ["algorithm field RFC 2069", "nonce_count unconditional increment"],
+      "secondary_score": "2/4"
+    },
+    {"case": "httpx-003", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 49, "tokens_k": 37, "tool_calls": 7, "root_cause_found": true,
+      "secondary_found": ["nonce_count unconditional increment", "algorithm field RFC 2069", "test no absence assert"],
+      "secondary_score": "3/4"
+    },
+
+    {"case": "fastapi-001", "variant": "grep", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 273, "tokens_k": 90, "tool_calls": 38, "root_cause_found": true,
+      "secondary_found": ["get_flat_dependant extend causes hoisting", "operation_security_dict merge fix"],
+      "notes": "Complex dependency injection tracing. Very deep analysis."
+    },
+    {"case": "fastapi-001", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 365, "tokens_k": 100, "tool_calls": 38, "root_cause_found": true,
+      "secondary_found": ["get_flat_dependant extend hoisting", "skip_repeats scope loss", "tree vs flat extraction"],
+      "notes": "Deepest analysis — traced scope propagation loss through flat/tree mismatch."
+    },
+    {"case": "fastapi-001", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 253, "tokens_k": 68, "tool_calls": 42, "root_cause_found": true,
+      "secondary_found": ["get_flat_dependant extend hoisting", "operation_security_dict merge"],
+      "notes": "High tool count — graph navigation through FastAPI dependency chain."
+    },
+    {"case": "fastapi-001", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 259, "tokens_k": 64, "tool_calls": 39, "root_cause_found": true,
+      "secondary_found": ["get_flat_dependant extend hoisting", "operation_security_dict merge"],
+      "notes": "Similar depth to Graph, slightly more token-efficient."
+    },
+    {"case": "fastapi-001", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 194, "tokens_k": 74, "tool_calls": 33, "root_cause_found": true,
+      "secondary_found": ["get_flat_dependant extend hoisting", "operation_security_dict merge", "test_security files"],
+      "notes": "Fastest MCP variant on fastapi-001."
+    },
+
+    {"case": "fastapi-002", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 322, "tokens_k": 63, "tool_calls": 55, "root_cause_found": true,
+      "secondary_found": ["_is_json_field metadata check", "getlist vs get divergence"],
+      "notes": "High tool count — graph struggled with FastAPI dependency chain."
+    },
+    {"case": "fastapi-002", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 568, "tokens_k": 94, "tool_calls": 69, "root_cause_found": true,
+      "secondary_found": ["_is_json_field metadata check", "annotation assignment vs copy_field_info", "getlist path"],
+      "notes": "Very expensive — CodeDB re-indexing on 1.1K files."
+    },
+    {"case": "fastapi-002", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 721, "tokens_k": 116, "tool_calls": 90, "root_cause_found": true,
+      "secondary_found": ["_is_json_field metadata check", "copy_field_info fix", "Annotated vs non-Annotated divergence"],
+      "notes": "Extremely expensive — both tools drove deep exploration. Deepest analysis but worst efficiency."
+    },
+
+    {"case": "fastapi-003", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 73, "tokens_k": 40, "tool_calls": 20, "root_cause_found": true,
+      "secondary_found": ["_get_multidict_value empty string check", "Query/Header same pattern"],
+      "secondary_score": "2/3"
+    },
+    {"case": "fastapi-003", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 78, "tokens_k": 43, "tool_calls": 20, "root_cause_found": true,
+      "secondary_found": ["_get_multidict_value empty string check", "_annotation_allows_none fix approach"],
+      "secondary_score": "2/3"
+    },
+    {"case": "fastapi-003", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 69, "tokens_k": 52, "tool_calls": 16, "root_cause_found": true,
+      "secondary_found": ["_get_multidict_value empty string check", "_extract_form_body None filter", "no test for empty string"],
+      "secondary_score": "3/3"
+    },
+
+    {"case": "nextjs-004", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 94, "tokens_k": 51, "tool_calls": 23, "root_cause_found": true,
+      "secondary_found": ["inverted condition in dispatchRetryDueToTreeMismatch", "refreshReducer hardcodes replace"],
+      "notes": "Found ppr-navigations.ts:1575 condition inversion."
+    },
+    {"case": "nextjs-004", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 390, "tokens_k": 88, "tool_calls": 48, "root_cause_found": true,
+      "secondary_found": ["React entanglement comment is wrong", "race window between dispatch and reducer"],
+      "notes": "Deep analysis — traced action queue, found the entanglement comment is incorrect."
+    },
+    {"case": "nextjs-004", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 100, "tokens_k": 59, "tool_calls": 23, "root_cause_found": true,
+      "secondary_found": ["inverted ternary branches", "scrollBehavior not threaded through ServerPatchAction"],
+      "notes": "Found secondary: scroll={false} lost on retry. Efficient."
+    },
+
+    {"case": "nextjs-005", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 157, "tokens_k": 63, "tool_calls": 44, "root_cause_found": true,
+      "secondary_found": ["cloneBodyStream drains original", "finalize async race", "req.stream bypasses clonableBody"],
+      "notes": "Found body-streams.ts drain + action-handler.ts direct req.body read."
+    },
+    {"case": "nextjs-005", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 182, "tokens_k": 67, "tool_calls": 46, "root_cause_found": true,
+      "secondary_found": ["cloneBodyStream drain", "finalize race", "req.stream bypass"],
+      "notes": "Similar findings to Graph, slightly higher cost."
+    },
+    {"case": "nextjs-005", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 179, "tokens_k": 69, "tool_calls": 43, "root_cause_found": true,
+      "secondary_found": ["edge middleware missing finalize", "PPR path reads raw req", "action-handler direct req.body"],
+      "notes": "Found edge vs node middleware divergence — edge path never calls finalize()."
+    },
+
+    {"case": "nextjs-006", "variant": "graph_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 132, "tokens_k": 68, "tool_calls": 33, "root_cause_found": true,
+      "secondary_found": ["APP_ROUTE body.length=0", "memory-cache.external.ts calculateSize", "lru-cache throw guard"],
+      "notes": "Clean trace: calculateSize → APP_ROUTE → body.length=0 → Math.max(1,...) fix."
+    },
+    {"case": "nextjs-006", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 231, "tokens_k": 81, "tool_calls": 58, "root_cause_found": true,
+      "secondary_found": ["segment-cache/cache.ts rejectRouteCacheEntry", "setSizeInCacheMap never called", "9 affected call sites"],
+      "notes": "Found client-side LRU bug — different from server-side. Deep: 9 rejection paths identified."
+    },
+    {"case": "nextjs-006", "variant": "scout_graph", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 253, "tokens_k": 86, "tool_calls": 54, "root_cause_found": true,
+      "secondary_found": ["rejectRouteCacheEntry size=0", "lruSize never grows", "lazilyEvictIfNeeded only on access"],
+      "notes": "Found client-side LRU path, traced eviction logic. Expensive (86K tokens)."
+    },
+
+    {"case": "k8s-004", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 657, "tokens_k": 131, "tool_calls": 75, "root_cause_found": true,
+      "secondary_found": ["FindPluginBySpec write lock for reads", "TOCTOU race in unmountDetachDevices", "double detach risk"],
+      "notes": "Extremely expensive (657s, 131K). Found TOCTOU race + write lock perf bug. Deep but costly."
+    },
+    {"case": "rust-001", "variant": "codedb_mcp", "model": "sonnet-4.6", "date": "2026-04-07", "round": "R10",
+      "time_s": 507, "tokens_k": 69, "tool_calls": 43, "root_cause_found": true,
+      "secondary_found": ["is_closure_fn_mut guard too narrow", "session_diagnostics FnMutError struct", "region_name ClosureEnv note exists but unused for Fn"],
+      "notes": "Sonnet (others used Opus). Found is_closure_fn_mut guard, session_diagnostics, region_name."
+    },
+
+    {"case": "httpx-001", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 41, "tokens_k": 36, "tool_calls": 6, "root_cause_found": true,
+      "secondary_found": ["verify=str early-return cert drop", "pragma nocover untested"],
+      "secondary_score": "2/3",
+      "notes": "Post Tier-1 gating. Fastest variant on httpx-001."
+    },
+    {"case": "httpx-003", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 57, "tokens_k": 38, "tool_calls": 8, "root_cause_found": true,
+      "secondary_found": ["_resolve_qop empty qop", "nonce_count unconditional increment"],
+      "secondary_score": "2/4"
+    },
+    {"case": "fastapi-002", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 518, "tokens_k": 109, "tool_calls": 67, "root_cause_found": true,
+      "secondary_found": ["_is_json_field metadata check", "use_annotation vs type_annotation", "copy_field_info fix"],
+      "notes": "Agent over-explored (not Scout's fault — all variants 45-90t on this case)."
+    },
+    {"case": "fastapi-003", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 66, "tokens_k": 48, "tool_calls": 15, "root_cause_found": true,
+      "secondary_found": ["_get_multidict_value empty string", "_extract_form_body None filter", "no test for empty string"],
+      "secondary_score": "3/3"
+    },
+    {"case": "nextjs-004", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 83, "tokens_k": 53, "tool_calls": 19, "root_cause_found": true,
+      "secondary_found": ["inverted condition in dispatchRetryDueToTreeMismatch", "lastCommitted null case"],
+      "notes": "Clean analysis. Found the inverted ternary and the null edge case."
+    },
+    {"case": "nextjs-005", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 134, "tokens_k": 65, "tool_calls": 41, "root_cause_found": true,
+      "secondary_found": ["cloneBodyStream double-consume", "replaceRequestBody timing", "double cloneBodyStream after finalize"],
+      "notes": "Found the double-clone and finalize race paths."
+    },
+    {"case": "nextjs-006", "variant": "scout_mcp", "model": "sonnet-4.6", "date": "2026-04-08", "round": "R10",
+      "time_s": 205, "tokens_k": 80, "tool_calls": 33, "root_cause_found": true,
+      "secondary_found": ["default.ts size=0 for empty body", "require.ts falsy null cache miss", "filesystem.ts falsy null"],
+      "secondary_score": "3/4",
+      "notes": "Found 3 related bugs: size=0 leak, require.ts null miss, filesystem.ts null miss."
+    }
+  ]
+}

@@ -8,51 +8,59 @@ Evaluation and benchmarking infrastructure for code search tools (code-review-gr
 |------|---------|
 | **BENCHMARKS.md** | Master summary — start here |
 | **BENCHMARK_METHODOLOGY.md** | How benchmarks work: setup, prompts, metrics, biases |
-| **BENCHMARK_HISTORY.md** | Consolidated results from all rounds (R1-R6) |
-| **BENCHMARK_R6_EFFICIENT.md** | Latest round: fair 3-way with "be efficient" prompt |
-| **gold-eval-set.json** | 28-case gold eval set with ground truth |
+| **BENCHMARK_R9_CLEAN.md** | Round 9: detailed 5-way comparison with per-case analysis |
+| **cases.json** | 14-case eval set with ground truth |
+| **results.json** | All benchmark runs (75 entries) with time, tokens, tools, quality |
+| **eval-report.py** | Script to generate summary tables from the JSON database |
 | **benchmark-prompts-4way.md** | Prompt templates and case definitions |
-
-### Historical Round Files (archived, referenced from BENCHMARK_HISTORY.md)
-
-| File | Round | Date |
-|------|-------|------|
-| BENCHMARK_2C_RESULTS.md | Pre-1: retrieval eval | 2026-03-25 |
-| NO_MCP_BENCH_RESULTS.md | Pre-1: no-MCP baseline | 2026-03-25 |
-| BENCHMARK_MCP_V1.3_RESULTS.md | R1: MCP 3-way | 2026-03-26 |
-| BENCHMARK_V1.5_FULL_RESULTS.md | R2: MCP v1.5 + PR reviews | 2026-03-27 |
-| BENCHMARK_4WAY_RESULTS.md | R3: 4-way best runs | 2026-03-28 |
-| BENCHMARK_4WAY_STANDARDIZED.md | R3a: standardized prompt | 2026-03-28 |
-| BENCHMARK_4WAY_NATURAL.md | R3b: natural prompt | 2026-03-28 |
-| BENCHMARK_4WAY_QUALITY.md | R3c: Opus quality scoring | 2026-03-28 |
-| BENCHMARK_5WAY_CODEDB.md | R4: 5-way + CodeDB | 2026-04-01 |
-| BENCHMARK_6WAY_SCOUT_MCP.md | R5: 6-way Scout MCP server | 2026-04-01 |
 
 ### Research & Design Docs
 
 | File | Contents |
 |------|----------|
-| AGENT_PATTERN_ANALYSIS.md | Agent tool usage pattern research |
 | V2_ANALYSIS_*.md | v2 design analysis for MCP and Scout |
 | V2_IMPL_SPEC_*.md | v2 implementation specs |
 | V2_PRIORITIES.md | v2 feature priorities |
 | V2_RESEARCH_LOG.md | v2 research log |
 
-## Gold Eval Set
+## Eval Set
 
-28 hand-curated cases from real GitHub issues across 6 repos:
+14 hand-curated cases from real GitHub issues across 7 repos:
 
 | Repo | Language | Scale | Cases |
 |------|----------|-------|-------|
 | httpx | Python | small (60 files) | 3 |
 | fastapi | Python | medium (1.1K files) | 3 |
-| next.js | TS/JS | large (6.4K files) | 11 |
-| vscode | TS | large (7K files) | 4 |
-| kubernetes | Go | mega (16.9K files) | 4 |
-| rust | Rust | mega (36.8K files) | 3 |
+| httpd | C | medium (562 files) | 1 |
+| next.js | TS/JS | large (6.4K files) | 3 |
+| vscode | TS | large (7K files) | 1 |
+| kubernetes | Go | mega (16.9K files) | 2 |
+| rust | Rust | mega (36.8K files) | 1 |
 
-Difficulty: 10 simple, 11 medium, 7 complex.
+Difficulty: 4 simple, 5 medium, 5 complex.
 
-### Known Issues
-- `vscode-001`: Source URL (#236578) points to unrelated PR. GT file unverified.
-- `kubernetes-001`: Source URL (#128855) points to unrelated PR. GT file unverified.
+## Running Benchmarks
+
+Generate summary tables:
+```bash
+python eval/eval-report.py                    # full summary
+python eval/eval-report.py --case httpx-002   # single case
+python eval/eval-report.py --variant graph_mcp # single variant
+python eval/eval-report.py --round R10        # single round
+```
+
+Run a single eval case as a Claude Code subagent:
+```
+Agent(
+  model: "sonnet",
+  mode: "bypassPermissions",
+  prompt: "<base_prompt> + <tool_appendix>"
+)
+```
+
+Metrics come from the agent result metadata: `duration_ms`, `total_tokens`, `tool_uses`.
+
+Rules:
+- **Sequential only** — never run eval agents in parallel (API 529s skew timing)
+- **general-purpose agent type** — not Explore (no MCP access)
+- Store results in results.json, summarize in BENCHMARKS.md
