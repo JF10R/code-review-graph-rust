@@ -321,6 +321,110 @@ Scout+Graph (133s) also recovered from its previous 864s blowup. With Graph retu
 
 **Principle**: Strip structural noise (callers, callees, related files) at high confidence. Keep decision signals (confidence score, action_hint) visible. Both Scout and Graph independently validated this pattern.
 
+## New Case: k8s-004 — Complex Structural Deadlock, 16.9K files (2026-04-06)
+
+First benchmark of k8s-004 (Complex, Go, 16.9K files). Kubelet volume manager deadlock: reconciler detaches a volume while attach/detach controller holds the global volume lock. Ground truth: deadlock chain across 5 files, 2 lock types.
+
+Sequential runs (no concurrency).
+
+### Results
+
+| Variant | Time | Tokens | Tools | Root Cause |
+|---------|------|--------|-------|------------|
+| **Grep** | **203s** | 99K | 37t | YES |
+| Scout MCP | 261s | **84K** | **30t** | YES |
+| Scout MCP (Opus) | 342s | 120K | 58t | YES |
+| Scout+Graph | 401s | 85K | 46t | YES |
+| Graph MCP | 478s | 109K | 67t | YES |
+
+### Quality: Three Different Deadlock Analyses
+
+All three found the root cause but identified **different deadlock mechanisms**:
+
+| Aspect | Grep (Sonnet) | Scout (Sonnet) | Scout (Opus) |
+|--------|---------------|----------------|--------------|
+| Deadlock type | Mutex (pm.mutex + prober.mutex) | Mutex (pm.mutex + pendingOps.lock) | **Distributed liveness** |
+| Key insight | FlexVolume prober 3-goroutine cycle | Attach/detach closure asymmetry | Informer lag + state-based circular wait |
+| Actionability | Good (use RLock) | **Best** (2-line fix: move lookup inside closure) | Good (don't delete from ASW until confirmed) |
+| Secondary findings | Data race in GetNodesToUpdateStatusFor | — | — |
+| Architectural depth | 6 files | 5 files | **8 files, cross-component** |
+
+Opus found the most sophisticated analysis (distributed liveness deadlock between kubelet and controller via stale informer state) at 2x the tool cost of Sonnet. Scout Sonnet found the most actionable fix (attach/detach asymmetry = 2-line closure move).
+
+### Overall Quality Ranking
+
+| Rank | Variant | Quality | Unique Insight |
+|------|---------|---------|---------------|
+| 1 | Scout MCP (Opus) | **A+** | Distributed liveness deadlock, 8-file cross-component trace |
+| 2 | Scout MCP (Sonnet) | **A** | Attach/detach closure asymmetry (most actionable 2-line fix) |
+| 3 | Grep (Sonnet) | **A-** | FlexVolume prober 3-goroutine cycle + data race secondary |
+| 4 | Scout+Graph | **B+** | UpdateNodeStatusForNode inside-loop lock hazard |
+| 5 | Graph MCP | **B+** | Starvation angle (write lock for reads), but less focused |
+
+Every variant found a real deadlock mechanism. No two found the same one — k8s-004 has multiple interacting lock hazards. Opus justified its 2x tool cost with the deepest architecture-level analysis.
+
+### k8s-003 Scout Re-run Attempt (INVALID — wrong prompt)
+
+Attempted to re-run k8s-003 with Scout MCP (Sonnet + Opus) but used an incorrect bug description ("Scheduler scoring plugin returns wrong node scores when multiple plugins use the same state key"). The actual k8s-003 bug is a **deployment controller stall** (GT: `deployment_controller.go` / `rolling.go:reconcileOldReplicaSets`).
+
+All agents spiraled (Sonnet: 1673s/179K/116t, Opus: killed at 80t) searching for a non-existent state key collision. Results discarded — not a tool or model failure, but a prompt error.
+
+**Correct k8s-003 prompt** (for future runs): "Deployment rollout stalls indefinitely when maxUnavailable and maxSurge are both set — reconcileOldReplicaSets in the rolling update controller gets stuck in a loop without making progress"
+
+### k8s-003 Re-run with Corrected Prompt (2026-04-07)
+
+| Rank | Variant | Time | Tokens | Tools | Root Cause | Secondary (3) |
+|------|---------|------|--------|-------|------------|---------------|
+| 1 | **Grep** | **49s** | **33K** | **6t** | YES | 1/3 |
+| 2 | **Graph MCP** | 84s | 43K | 12t | YES | **3/3** |
+| 3 | **Scout MCP** | 88s | 42K | 8t | YES | 2/3 |
+| 4 | Scout+Graph | 166s | 47K | 18t | YES | 2/3 |
+| 5 | CodeDB MCP | 239s | 67K | 20t | YES | 2/3 |
+
+All found root cause (`rolling.go` error swallowing: `return false, nil` instead of `return false, err`). Graph MCP had best quality (3/3: error swallowing + stale allRSs + negative clamp). Grep fastest (49s) — Go identifiers perfectly greppable. Prompt quality was the decisive factor: wrong prompt → 100% failure; correct prompt → 100% success.
+
+## New Case: rust-001 — 5-Crate Compiler Trace, 36.8K files (2026-04-07)
+
+First benchmark of rust-001 (Complex, Rust, 36.8K files). Borrow checker confusing error for closure lifetime mismatch. Ground truth: `region_errors.rs` — `is_closure_fn_mut` guard only matches FnMut, not Fn closures. Source: [rust-lang/rust#130528](https://github.com/rust-lang/rust/issues/130528).
+
+All variants run with Opus (except Scout Sonnet comparison). Sequential runs.
+
+### Results
+
+| Rank | Variant | Model | Time | Tokens | Tools | Root Cause |
+|------|---------|-------|------|--------|-------|------------|
+| 1 | **Scout+Graph** | Opus | **345s** | 90K | **40t** | YES |
+| 2 | **Scout MCP** | Sonnet | 366s | **80K** | 36t | YES |
+| 3 | Scout MCP | Opus | 539s | 137K | 67t | YES |
+| 4 | Grep | Opus | 552s | 93K | 104t | YES |
+| 5 | Graph MCP | Opus | 564s | 85K | 68t | YES |
+
+### Key Findings
+
+- **Scout+Graph Opus fastest** (345s) — combo worked well on this case, no blowup
+- **Scout Sonnet nearly as fast as Opus** (366s vs 539s) at lower cost — Opus didn't add quality
+- **Grep slowest** (552s, 104 tools) — 36.8K files means many grep calls needed to navigate the compiler
+- All variants found the same root cause: `is_closure_fn_mut` at `region_errors.rs:475` gates the clear error message to FnMut only; Fn closures fall through to `report_general_error` with confusing synthetic lifetime names
+
+### Sonnet vs Opus on rust-001
+
+| Model | Scout Time | Scout Tokens | Scout Tools |
+|-------|-----------|-------------|-------------|
+| Sonnet | **366s** | **80K** | **36t** |
+| Opus | 539s | 137K | 67t |
+
+Sonnet was 1.5x faster with 42% fewer tokens. On this case, Opus's deeper reasoning didn't yield better results — both found the same root cause and similar secondaries.
+
+### Why Grep Beats Scout on Kubernetes
+
+
+
+Grep was 1.3x faster than Scout MCP (203s vs 261s), consistent with R9 k8s-003 (Grep 3.7x faster). Gap narrowed thanks to Scout's Tier 1 confidence gating, but:
+
+1. **16.9K files past the MCP crossover point** (~10K) — per-call IPC + enrichment overhead exceeds Grep's higher tool count
+2. **Go's exported identifiers are perfectly greppable** — `FindPluginBySpec`, `DetachVolume` are unique strings; Scout's semantic search adds overhead without discovery value
+3. **Go package structure amplifies enrichment noise** — dense cross-package imports generate more tangential leads per Scout result
+
 ## Environment Notes
 
 - **GPU**: CUDA 13.2 + cuDNN 9.20 on RTX 5070 Ti (NVIDIA). Graph MCP uses CUDA EP for embedding inference with automatic CPU fallback.

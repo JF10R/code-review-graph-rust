@@ -9,7 +9,50 @@ Code search tool benchmarks using Claude Sonnet 4.6 in `bypassPermissions` mode,
 For full methodology, see `BENCHMARK_METHODOLOGY.md`.
 For historical round-by-round details, see `BENCHMARK_HISTORY.md`.
 
-## Latest: Round 9 — Clean 4-Way Comparison (2026-04-02)
+## Latest: Round 10 — Phase 2-3 Validation (2026-04-07)
+
+First standalone Graph MCP benchmark after Phase 2-3 improvements (confidence-weighted RRF, budget="auto" multi-view, TESTED_BY heuristics, risk ranking, scope filtering, git-diff node mapping).
+
+### httpx-001 — Phase 2-3 results
+
+| Metric | R9 Grep | **R10 Scout MCP** | **R10 Graph MCP** | **R10 Scout+Graph** |
+|--------|---------|-------------------|-------------------|---------------------|
+| Time | 237s | **70s** | 85s | 127s |
+| Tokens | 51K | **36K** | 39K | 44K |
+| Tools | 30 | **8** | 16 | 23 |
+| Root cause | YES | YES | YES | YES |
+| Secondaries | 3/3 | 3/3 | 3/3 | 3/3 |
+
+**Key findings:**
+- **Graph MCP standalone is 2.8x faster than Grep** with identical quality (3/3 secondaries)
+- **Single-tool > multi-tool**: Scout alone (70s, 8t) and Graph alone (85s, 16t) both beat Scout+Graph combo (127s, 23t). Two discovery systems = over-exploration.
+- Scout MCP improved vs R9 (70s/8t vs 60s/13t) — fewer tools, comparable speed
+- Graph MCP standalone is **2.8x faster than Grep** — competitive with Scout on small repos, expected to shine on larger repos with structural queries
+- budget="auto" activated multi-view retrieval, correctly identifying `_config.py` at rank #1 on first call
+
+### fastapi-002 — Phase 2-3 results + Opus comparison
+
+| Metric | R9 Grep | R10 Scout | R10 Graph | R10 Scout+Graph | R10 Scout (Opus) |
+|--------|---------|-----------|-----------|-----------------|------------------|
+| Time | **267s** | 466s | 473s | 594s | 429s |
+| Tokens | **57K** | 97K | **73K** | 92K | 96K |
+| Tools | **45** | 52 | 57 | 67 | 52 |
+| Root cause | YES | YES | YES | YES | YES |
+
+### vscode-003 — Phase 2-3 results (Complex, 7K files)
+
+| Metric | R9 Grep | R9 Graph | R10 Graph | R10 Scout | R10 Scout+Graph |
+|--------|---------|----------|-----------|-----------|-----------------|
+| Time | 291s | **140s** | **209s** | 449s | 1,526s |
+| Tokens | 54K | **53K** | **63K** | 88K | 129K |
+| Tools | 25 | **17** | 30 | 31 | 48 |
+| Secondaries | 2/4 | **4/4** | 3-4/4 | 4/4 | 4/4 |
+
+**Key finding: Graph MCP remains fastest MCP tool on complex cases.** R10 Graph (209s) is 1.4x faster than Grep and 2.1x faster than Scout. Scout+Graph took 25 minutes (48 tools, 129K tokens) — extreme over-exploration from two-tool ping-ponging. High variance across runs (R9 Graph 140s vs R10 209s) confirms k=1 is insufficient for significance.
+
+**Key finding: Grep wins on runtime-behavior bugs.** All MCP/Scout agents entered a Sonnet reproduction spiral (25-31 Bash calls testing Pydantic annotation unwrapping). Grep agents found the file faster via simple text search and trusted code reading. Opus was more disciplined (19 Bash vs 25-31) but still reproduced. Graph MCP had the fewest tokens (73K) thanks to terse output, but structural queries didn't help — the bug is in type metadata propagation, not call graph structure.
+
+## Previous: Round 9 — Clean 4-Way Comparison (2026-04-02)
 
 Clean comparison with all tools working: Grep, Scout MCP, Scout+Graph, CodeDB MCP. 3 agents max per batch for accurate timing. See `BENCHMARK_R9_CLEAN.md`.
 
@@ -63,6 +106,37 @@ After Tier 1 improvements + #42 conditional structural expansion (strip callers/
 
 **Key finding: strip noise, keep signal.** Both Scout (4-tier confidence gating) and Graph (#42 conditional expansion) independently proved that stripping structural data at high confidence dramatically improves agent convergence. All three MCP variants now beat Grep by ~2x and cluster at 115-140s. Graph MCP achieved the best quality (4/4 secondary findings) with the fewest tokens (53K).
 
+### New Case: k8s-003 — Corrected Prompt (2026-04-07)
+
+Previous runs with wrong prompt caused 100% failure. Corrected prompt → 100% success:
+
+| Rank | Variant | Time | Tokens | Tools | Secondary (3) |
+|------|---------|------|--------|-------|---------------|
+| 1 | **Grep** | **49s** | **33K** | **6t** | 1/3 |
+| 2 | Graph MCP | 84s | 43K | 12t | **3/3** |
+| 3 | Scout MCP | 88s | 42K | 8t | 2/3 |
+
+Grep wins on kubernetes (16.9K Go files). Graph MCP best quality (3/3 secondaries).
+
+### New Case: rust-001 — 5-Crate Compiler Trace, 36.8K files (2026-04-07)
+
+| Rank | Variant | Model | Time | Tokens | Tools |
+|------|---------|-------|------|--------|-------|
+| 1 | **Scout+Graph** | Opus | **345s** | 90K | **40t** |
+| 2 | Scout MCP | Sonnet | 366s | **80K** | 36t |
+| 3 | Grep | Opus | 552s | 93K | 104t |
+
+Scout+Graph Opus fastest. Scout Sonnet nearly as fast at lower cost. All found root cause (`region_errors.rs:475` — `is_closure_fn_mut` guard). Grep slowest on 36.8K files (104 tool calls).
+
+### Cross-Case Pattern: Which Tool Wins by Repo Size
+
+| Repo Size | Speed Winner | Quality Winner |
+|-----------|-------------|---------------|
+| Small (httpx, 60 files) | Scout MCP | Tied |
+| Medium (vscode, 7K files) | Scout MCP | Graph MCP |
+| Large Go (k8s, 16.9K files) | Grep | Graph MCP |
+| Large Rust (rust, 36.8K files) | Scout+Graph | Tied |
+
 ## Previous: Round 7 — Natural Prompt, New Cases (2026-04-01)
 
 5 new cases with natural v3 prompt (no coaching). See `BENCHMARK_R7_NATURAL.md`.
@@ -106,12 +180,12 @@ All per-case results across tools. Format: `time / tokens / tools`. Bold = faste
 
 #### Time (seconds) — bold = fastest
 
-| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
-|------|-------|------|-----------|-------------|------------|
-| httpx-002 | Simple | 118 | **39** | 73 | 213 |
-| httpx-003 | Medium | 56 | **47** | 67 | 182 |
-| httpx-001 | Simple | 237 | **60** | 71 | 122 |
-| fastapi-003 | Medium | 111 | **96** | 67 | 130 |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP | Graph MCP |
+|------|-------|------|-----------|-------------|------------|-----------|
+| httpx-002 | Simple | 118 | **39** | 73 | 213 | — |
+| httpx-003 | Medium | 56 | **47** | 67 | 182 | — |
+| httpx-001 | Simple | 237 | **60** | 71 (R9) / 127 (R10) | 122 | **85** |
+| fastapi-003 | Medium | 111 | **96** | 67 | 130 | — |
 | nextjs-006 | Medium | 258 | **191** | 257 | — |
 | nextjs-005 | Simple | **180** | 286 | 199 | — |
 | nextjs-004 | Complex | 342 | **108** | 138 | — |
@@ -122,12 +196,12 @@ All per-case results across tools. Format: `time / tokens / tools`. Bold = faste
 
 #### Tokens (K) — bold = most efficient
 
-| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
-|------|-------|------|-----------|-------------|------------|
-| httpx-002 | Simple | 42 | **36** | 38 | 53 |
-| httpx-003 | Medium | 36 | **35** | 36 | 50 |
-| httpx-001 | Simple | 51 | **35** | 36 | 39 |
-| fastapi-003 | Medium | 44 | **38** | 39 | 56 |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP | Graph MCP |
+|------|-------|------|-----------|-------------|------------|-----------|
+| httpx-002 | Simple | 42 | **36** | 38 | 53 | — |
+| httpx-003 | Medium | 36 | **35** | 36 | 50 | — |
+| httpx-001 | Simple | 51 | **35** | 36 | 39 | 39 |
+| fastapi-003 | Medium | 44 | **38** | 39 | 56 | — |
 | nextjs-006 | Medium | **76** | **76** | 81 | — |
 | nextjs-005 | Simple | **58** | 84 | 75 | — |
 | nextjs-004 | Complex | 69 | 56 | **48** | — |
@@ -138,12 +212,12 @@ All per-case results across tools. Format: `time / tokens / tools`. Bold = faste
 
 #### Tool Calls — bold = fewest
 
-| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP |
-|------|-------|------|-----------|-------------|------------|
-| httpx-002 | Simple | 23 | **7** | 14 | 44 |
-| httpx-003 | Medium | 9 | 8 | **10** | 27 |
-| httpx-001 | Simple | 30 | 13 | **10** | 24 |
-| fastapi-003 | Medium | 26 | 23 | **15** | 28 |
+| Case | Diff. | Grep | Scout MCP | Scout+Graph | CodeDB MCP | Graph MCP |
+|------|-------|------|-----------|-------------|------------|-----------|
+| httpx-002 | Simple | 23 | **7** | 14 | 44 | — |
+| httpx-003 | Medium | 9 | 8 | **10** | 27 | — |
+| httpx-001 | Simple | 30 | 13 | **10** | 24 | 16 |
+| fastapi-003 | Medium | 26 | 23 | **15** | 28 | — |
 | nextjs-006 | Medium | 60 | **19** | 31 | — |
 | nextjs-005 | Simple | 43 | 47 | **37** | — |
 | nextjs-004 | Complex | 45 | **21** | 27 | — |
